@@ -1,0 +1,16 @@
+# build artifacts
+build/
+src/*.o
+src/libc/*.o
+src/doomgeneric/*.o
+doomgeneric-master/doomgeneric/*.o
+embed/*.wav.o
+src/embed_list.h
+
+# logs / scratch
+*.log
+build.out
+build.err
+
+# huge runtime music drops (re-add manually if needed)
+music/*.wav
