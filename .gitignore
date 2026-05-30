@@ -12,5 +12,9 @@ src/embed_list.h
 build.out
 build.err
 
+# python (serve.py byte-code)
+__pycache__/
+*.pyc
+
 # huge runtime music drops (re-add manually if needed)
 music/*.wav
