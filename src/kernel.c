@@ -4,6 +4,8 @@
 #include "string.h"
 #include "gdt.h"
 #include "idt.h"
+#include "paging.h"
+#include "fpu.h"
 #include "pic.h"
 #include "pit.h"
 #include "keyboard.h"
@@ -92,8 +94,12 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
     vga_puts("[*] font extract..."); font_init();   vga_puts(" ok\n");
     font_restore();
 
-    vga_puts("[*] gdt..."); gdt_init();        vga_puts(" ok\n");
+    vga_puts("[*] gdt+tss..."); gdt_init();    vga_puts(" ok\n");
     vga_puts("[*] idt..."); idt_init();        vga_puts(" ok\n");
+    vga_puts("[*] paging..."); paging_init();
+    vga_printf(" ok (cr0=0x%x cr4=0x%x)\n", paging_cr0(), paging_cr4());
+    vga_puts("[*] fpu..."); fpu_init();
+    vga_puts(fpu_present() ? " ok\n" : " absent\n");
     vga_puts("[*] pic..."); pic_remap();       vga_puts(" ok\n");
     vga_puts("[*] fs...");  fs_init();         vga_puts(" ok\n");
     vga_puts("[*] kbd...");  kbd_init();       vga_puts(" ok\n");

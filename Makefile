@@ -40,6 +40,8 @@ KERN_SRC := \
     src/vga.c \
     src/gdt.c \
     src/idt.c \
+    src/paging.c \
+    src/fpu.c \
     src/pic.c \
     src/pit.c \
     src/keyboard.c \
