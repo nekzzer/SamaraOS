@@ -35,7 +35,7 @@ static const struct {
     uint32_t width, height, depth;
 } multiboot_header = {
     MB_MAGIC, MB_FLAGS, MB_CHK,
-    0, 1024, 768, 32
+    0, 1920, 1080, 32
 };
 
 /* ---------- boot stack ---------- */
@@ -76,16 +76,21 @@ static void task_blinker(void) {
 void kmain(uint32_t magic, uint32_t mb_info_addr) {
     (void)magic;
 
-    /* Heap lives at 4 MiB, 32 MiB long (room for back buffer + WAD blobs). */
-    heap_init((void*)0x400000, 0x2000000);
+    /* Heap lives at 4 MiB, 64 MiB long. 1920x1080x32 back buffer alone is
+       ~8 MiB; DOOM zone + WAD blobs + browser response buffers take more. */
+    heap_init((void*)0x400000, 0x4000000);
 
     vga_init();
     vga_set_color(VGA_LCYAN, VGA_BLACK);
     vga_puts("=== SamaraOS booting ===\n");
     vga_set_color(VGA_LGREY, VGA_BLACK);
 
-    /* Capture font from VGA plane 2 BEFORE any mode change later on. */
+    /* Capture font from VGA plane 2 BEFORE any mode change later on. The
+       font_init also overlays our CP866 Cyrillic glyphs; we then push them
+       back to plane 2 so the text-mode shell can render Russian right
+       from boot, not just after the desktop has been entered. */
     vga_puts("[*] font extract..."); font_init();   vga_puts(" ok\n");
+    font_restore();
 
     vga_puts("[*] gdt..."); gdt_init();        vga_puts(" ok\n");
     vga_puts("[*] idt..."); idt_init();        vga_puts(" ok\n");
@@ -145,7 +150,7 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
     uint16_t vbe_id = inw(0x01CF);
     if (vbe_id >= 0xB0C0 && vbe_id <= 0xB0CF) {
         vga_set_color(VGA_LGREEN, VGA_BLACK);
-        vga_puts("[*] graphics: Bochs VBE detected (1024x768x32 ready)\n");
+        vga_puts("[*] graphics: Bochs VBE detected (1920x1080x32 ready)\n");
         vga_set_color(VGA_LGREY, VGA_BLACK);
     } else {
         vga_puts("[*] graphics: VBE not detected; mode 13h fallback (320x200)\n");

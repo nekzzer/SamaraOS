@@ -23,6 +23,7 @@
 #include "fat.h"
 #include "snake.h"
 #include "net.h"
+#include "browser.h"
 
 #define LINE_MAX 256
 #define HIST_MAX 16
@@ -598,6 +599,8 @@ static void cmd_help(int argc, char** argv) {
         "audio:   playwav <file>  stopwav  sbinfo   (try: playwav welcome.wav)\n"
         "fat:     fatmount [drv]  fatls  fatload <name> [ram]  playfat <name>\n"
         "net:     ifconfig  ping <ip> [count]  wget <http://ip[:port]/path> [file]\n"
+        "         browser [url]   www [url]    (full web browser in desktop)\n"
+        "i18n:    klayout [ru|en]              (F11 toggles, indicator in taskbar)\n"
         "Line ed: Left/Right Home/End Up/Down history Del ^C ^L ^D\n"
     );
 }
@@ -1331,14 +1334,31 @@ static void cmd_ping(int argc, char** argv) {
     vga_putc('\n');
 }
 
-/* tiny URL parser for "http://a.b.c.d[:port][/path]" — no DNS. */
+/* URL parser for "http://(a.b.c.d|host|localhost|samara)[:port][/path]" — no DNS. */
 static int parse_http_url(const char* url, uint32_t* ip, uint16_t* port, const char** path) {
     const char* p = url;
-    if (strncmp(p, "http://", 7) == 0) p += 7;
+    if ((p[0]|0x20)=='h' && (p[1]|0x20)=='t' && (p[2]|0x20)=='t' &&
+        (p[3]|0x20)=='p' && p[4]==':' && p[5]=='/' && p[6]=='/') p += 7;
     char host[64]; int hn = 0;
     while (*p && *p != ':' && *p != '/' && hn < (int)sizeof(host) - 1) host[hn++] = *p++;
     host[hn] = 0;
-    if (!parse_ipv4(host, ip)) return 0;
+    bool got = parse_ipv4(host, ip);
+    if (!got) {
+        static const struct { const char* name; uint32_t ip; } aliases[] = {
+            {"host", IP4(10,0,2,2)}, {"localhost", IP4(10,0,2,2)},
+            {"gateway", IP4(10,0,2,2)}, {"samara", IP4(10,0,2,15)},
+            {"self", IP4(10,0,2,15)},
+        };
+        for (int i = 0; i < (int)(sizeof(aliases)/sizeof(aliases[0])); i++) {
+            bool eq = true; int j;
+            for (j = 0; aliases[i].name[j]; j++) {
+                char a = host[j] | 0x20;
+                if (a != aliases[i].name[j]) { eq = false; break; }
+            }
+            if (eq && host[j] == 0) { *ip = aliases[i].ip; got = true; break; }
+        }
+    }
+    if (!got) return 0;
     *port = 80;
     if (*p == ':') {
         p++;
@@ -1404,6 +1424,29 @@ static void cmd_wget(int argc, char** argv) {
     }
 }
 
+static void cmd_klayout(int argc, char** argv) {
+    if (argc >= 2) {
+        if (!strcmp(argv[1], "ru") || !strcmp(argv[1], "RU")) kbd_set_ru(true);
+        else if (!strcmp(argv[1], "en") || !strcmp(argv[1], "EN")) kbd_set_ru(false);
+        else { vga_puts("klayout: usage: klayout [ru|en]    (F11 toggles)\n"); return; }
+    } else {
+        kbd_set_ru(!kbd_is_ru());
+    }
+    vga_puts("layout: "); vga_puts(kbd_is_ru() ? "RU\n" : "EN\n");
+}
+
+/* Launches the desktop (if not already) and opens the browser there. */
+static void cmd_browser(int argc, char** argv) {
+    /* If a graphics mode is up and the WM is alive, just nudge browser_open.
+       Otherwise, kick off the desktop which auto-opens it via the start menu. */
+    if (!gfx_ready()) {
+        vga_puts("browser: needs graphical desktop — run 'desktop' first\n");
+        return;
+    }
+    const char* url = (argc >= 2) ? argv[1] : NULL;
+    if (browser_open(url) != 0) vga_puts("browser: failed to open\n");
+}
+
 /* ===================== desktop entry ===================== */
 
 static void cmd_desktop(int argc, char** argv) {
@@ -1425,6 +1468,7 @@ static void cmd_desktop(int argc, char** argv) {
     static const char welcome[] =
         "Welcome to SamaraOS Desktop!\n"
         "\n"
+        "github.com/nekzzer/SamaraOS\n"
         "* Drag windows by their title bar.\n"
         "* Click X (red) to close a window.\n"
         "* Open more from the Start menu.\n"
@@ -1473,6 +1517,8 @@ static cmd_t cmds[] = {
     {"doom-mini", cmd_doom_mini}, {"play", cmd_play},
     {"snake", cmd_snake},
     {"ifconfig", cmd_ifconfig}, {"ping", cmd_ping}, {"wget", cmd_wget},
+    {"browser", cmd_browser}, {"www", cmd_browser},
+    {"klayout", cmd_klayout},
     {"player", cmd_player}, {"music", cmd_player},
     {"paint", cmd_paint}, {"clock", cmd_clock},
     {"playwav", cmd_playwav}, {"stopwav", cmd_stopwav}, {"sbinfo", cmd_sbinfo},

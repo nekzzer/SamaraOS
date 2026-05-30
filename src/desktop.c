@@ -53,7 +53,12 @@ static multiboot_info_t* g_mbi = 0;
 void desktop_install_mbi(multiboot_info_t* mbi) { g_mbi = mbi; }
 
 bool desktop_init_graphics(void) {
-    bool ok = gfx_init_vbe(1024, 768, 32);
+    /* Try 1080p first (QEMU stdvga happily does it with 16 MiB VRAM).
+       Fall back through common modes if the card refuses. */
+    bool ok = gfx_init_vbe(1920, 1080, 32);
+    if (!ok) ok = gfx_init_vbe(1600, 900,  32);
+    if (!ok) ok = gfx_init_vbe(1280, 800,  32);
+    if (!ok) ok = gfx_init_vbe(1024, 768,  32);
     if (!ok && g_mbi) ok = gfx_init(g_mbi);
     if (!ok)          ok = gfx_init_mode13h();
     return ok;

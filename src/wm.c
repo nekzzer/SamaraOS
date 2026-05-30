@@ -11,6 +11,8 @@
 #include "mediaplayer.h"
 #include "paint.h"
 #include "clock.h"
+#include "browser.h"
+#include "net.h"
 
 static bool db_on = false;
 
@@ -45,13 +47,16 @@ static bool start_menu_open = false;
 static bool exit_requested = false;
 static bool need_redraw = true;
 
-static int taskbar_h = 32;
+/* Taller taskbar to feel right on 1080p; legacy modes still fit since
+   gfx_h() is always honoured for positioning. */
+static int taskbar_h = 40;
 static int start_btn_x = 0, start_btn_y = 0, start_btn_w = 80, start_btn_h = 24;
 static int menu_x = 0, menu_y = 0, menu_w = 220, menu_h = 0;
 static int hover_item = -1;
 
 static int prev_mx = -1, prev_my = -1;
 static bool prev_btn = false;
+static int  press_target_idx = -1;     /* window that received the press; fires on_release later */
 
 /* ---- mouse cursor sprite ---- */
 #define CUR_W 12
@@ -238,7 +243,25 @@ static void put_clock(int x, int y, int w, int h) {
     itoa(ss, tmp, 10); for (int i = 0; tmp[i]; i++) buf[p++] = tmp[i];
     buf[p] = 0;
     gfx_rect_fill(x, y, w, h, BAR_BG);
-    gfx_string(x + 6, y + 4, buf, WHITE, BAR_BG, false);
+    gfx_string(x + 6, y + (h - 16) / 2, buf, WHITE, BAR_BG, false);
+}
+
+static void put_netinfo(int x, int y, int w, int h) {
+    gfx_rect_fill(x, y, w, h, BAR_BG);
+    if (!net_ready()) {
+        gfx_string(x + 6, y + (h - 16) / 2, "net: down", GREY, BAR_BG, false);
+        return;
+    }
+    uint32_t ip = net_ip();
+    char buf[24]; int p = 0; char tmp[8];
+    buf[p++] = 'I'; buf[p++] = 'P'; buf[p++] = ':'; buf[p++] = ' ';
+    for (int i = 0; i < 4; i++) {
+        itoa((ip >> (24 - i*8)) & 0xFF, tmp, 10);
+        for (int j = 0; tmp[j]; j++) buf[p++] = tmp[j];
+        if (i < 3) buf[p++] = '.';
+    }
+    buf[p] = 0;
+    gfx_string(x + 6, y + (h - 16) / 2, buf, WHITE, BAR_BG, false);
 }
 
 static void draw_taskbar(void) {
@@ -246,46 +269,62 @@ static void draw_taskbar(void) {
     gfx_rect_fill(0, H - taskbar_h, W, taskbar_h, BAR_BG);
     gfx_rect_fill(0, H - taskbar_h, W, 2, BAR_HI);
 
-    start_btn_x = 4;
+    start_btn_x = 6;
     start_btn_y = H - taskbar_h + 4;
-    start_btn_w = 80;
+    start_btn_w = 96;
     start_btn_h = taskbar_h - 8;
+    int label_y = start_btn_y + (start_btn_h - 16) / 2;
 
     uint32_t bbg = start_menu_open ? BAR_HI : BTN_FACE;
     gfx_rect_fill(start_btn_x, start_btn_y, start_btn_w, start_btn_h, bbg);
     gfx_rect(start_btn_x, start_btn_y, start_btn_w, start_btn_h, WHITE);
     /* a tiny windows-like 4-square logo */
-    int lx = start_btn_x + 6, ly = start_btn_y + 4;
+    int lx = start_btn_x + 8, ly = start_btn_y + (start_btn_h - 14) / 2;
     gfx_rect_fill(lx,     ly,     6, 6, WHITE);
     gfx_rect_fill(lx + 8, ly,     6, 6, WHITE);
     gfx_rect_fill(lx,     ly + 8, 6, 6, WHITE);
     gfx_rect_fill(lx + 8, ly + 8, 6, 6, WHITE);
-    gfx_string(start_btn_x + 26, start_btn_y + 4, "Start", WHITE, bbg, false);
+    gfx_string(start_btn_x + 28, label_y, "Start", WHITE, bbg, false);
 
-    /* window list buttons */
+    /* right-side widgets first so we know where window-button strip ends */
+    int clock_w = 80, net_w = 130, lang_w = 36, gap = 6;
+    int clock_x = W - clock_w - 4;
+    int lang_x  = clock_x - lang_w - gap;
+    int net_x   = lang_x - net_w - gap;
+    put_netinfo(net_x, start_btn_y, net_w, start_btn_h);
+    /* layout indicator: F11 toggles RU/EN */
+    gfx_rect_fill(lang_x, start_btn_y, lang_w, start_btn_h, kbd_is_ru() ? BAR_HI : BTN_FACE);
+    gfx_rect(lang_x, start_btn_y, lang_w, start_btn_h, WHITE);
+    gfx_string(lang_x + 6, start_btn_y + (start_btn_h - 16) / 2,
+               kbd_is_ru() ? "RU" : "EN",
+               WHITE, kbd_is_ru() ? BAR_HI : BTN_FACE, false);
+    put_clock(clock_x, start_btn_y, clock_w, start_btn_h);
+
+    /* window list buttons — fill space between Start and the right-side widgets */
     int idxs[WM_MAX_WINDOWS];
     int n = z_sorted(idxs);
     int wx = start_btn_x + start_btn_w + 8;
+    int strip_right = net_x - gap;
+    (void)lang_x;
     for (int i = 0; i < n; i++) {
         window_t* w = &windows[idxs[i]];
-        int bw = 160;
-        if (wx + bw > W - 90) break;
+        int bw = 200;
+        if (wx + bw > strip_right) break;
         bool fc = (idxs[i] == focused_idx);
         uint32_t bbg2 = fc ? BTN_FOCUS : MENU_BG;
         gfx_rect_fill(wx, start_btn_y, bw, start_btn_h, bbg2);
         gfx_rect(wx, start_btn_y, bw, start_btn_h, GREY);
-        char st[22]; int j = 0;
-        for (; w->title[j] && j < 20; j++) st[j] = w->title[j];
+        char st[26]; int j = 0;
+        for (; w->title[j] && j < 24; j++) st[j] = w->title[j];
         st[j] = 0;
-        gfx_string(wx + 6, start_btn_y + 4, st, WHITE, bbg2, false);
+        gfx_string(wx + 8, label_y, st, WHITE, bbg2, false);
         wx += bw + 4;
     }
-
-    put_clock(W - 84, start_btn_y, 80, start_btn_h);
 }
 
 static const char* start_items[] = {
     "Terminal",
+    "Web Browser",
     "Music Player",
     "Paint",
     "Clock",
@@ -433,16 +472,17 @@ static void start_menu_action(int idx) {
     need_redraw = true;
     int W = gfx_w(), H = gfx_h();
     switch (idx) {
-        case 0: wm_open_terminal(40, 40); break;
-        case 1: mediaplayer_open(); break;
-        case 2: paint_open(); break;
-        case 3: clock_open(); break;
-        case 4: wm_open_info(W/2 - 180, H/2 - 110, 360, 180, "About",  about_text);  break;
-        case 5: wm_open_info(W/2 - 220, H/2 - 110, 440, 180, "Welcome", welcome_text); break;
-        case 6: wm_open_info(W/2 - 200, H/2 - 110, 400, 200, "System Info", wm_sysinfo_text()); break;
-        case 7: while (inb(0x64) & 0x02) {} outb(0x64, 0xFE); break;
-        case 8: outw(0x604, 0x2000); outw(0xB004, 0x2000); break;
-        case 9: exit_requested = true; break;
+        case 0:  wm_open_terminal(40, 40); break;
+        case 1:  browser_open(NULL); break;
+        case 2:  mediaplayer_open(); break;
+        case 3:  paint_open(); break;
+        case 4:  clock_open(); break;
+        case 5:  wm_open_info(W/2 - 180, H/2 - 110, 360, 180, "About",  about_text);  break;
+        case 6:  wm_open_info(W/2 - 220, H/2 - 110, 440, 180, "Welcome", welcome_text); break;
+        case 7:  wm_open_info(W/2 - 200, H/2 - 110, 400, 200, "System Info", wm_sysinfo_text()); break;
+        case 8:  while (inb(0x64) & 0x02) {} outb(0x64, 0xFE); break;
+        case 9:  outw(0x604, 0x2000); outw(0xB004, 0x2000); break;
+        case 10: exit_requested = true; break;
     }
 }
 
@@ -482,8 +522,10 @@ static void on_press(int mx, int my) {
     if (wi >= 0) {
         window_t* w = &windows[wi];
         focus_idx(wi);
+        press_target_idx = wi;
         if (hit_close_button(w, mx, my)) {
             wm_close(w);
+            press_target_idx = -1;
         } else if (hit_title_bar(w, mx, my)) {
             w->dragging = true;
             w->drag_off_x = mx - w->x;
@@ -539,6 +581,17 @@ static void on_release(void) {
             windows[i].dragging = false;
             need_redraw = true;
         }
+    /* Fire on_release on the window that originally caught the press, even if
+       focus has since drifted — apps use this to finish drags or debounce. */
+    if (press_target_idx >= 0) {
+        window_t* w = &windows[press_target_idx];
+        if (w->open && w->type == WIN_APP && w->on_release) {
+            w->on_release(w);
+            w->needs_repaint = true;
+            need_redraw = true;
+        }
+        press_target_idx = -1;
+    }
 }
 
 /* ---- main loop ---- */
@@ -558,7 +611,8 @@ void wm_init(void) {
     db_on = gfx_enable_double_buffer();
 }
 
-static int last_clock_sec = -1;
+static int      last_clock_sec   = -1;
+static uint32_t last_layout_epoch = 0;
 
 /* PIT runs at 100 Hz (10 ms ticks). Targeting 30 ms = ~33 fps fits 3 ticks
    exactly and keeps the hlt-pacer dead-stable without bumping IRQ0 rate. */
@@ -616,6 +670,14 @@ void wm_run(void) {
         int s = (int)(now_ms / 1000);
         if (s != last_clock_sec) {
             last_clock_sec = s;
+            need_redraw = true;
+        }
+
+        /* layout toggle (F11/F12) happens in the keyboard ISR — sample its
+           epoch each frame so the taskbar indicator flips instantly. */
+        uint32_t le = kbd_layout_epoch();
+        if (le != last_layout_epoch) {
+            last_layout_epoch = le;
             need_redraw = true;
         }
 

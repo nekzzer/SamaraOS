@@ -524,7 +524,31 @@ int net_http_get(uint32_t ip, uint16_t port, const char* host, const char* path,
     if (!g_ready) return -1;
     if (tcp_open(ip, port, 4000) != 0) return -2;
 
-    char req[512];
+    /* Synthesise a Host header from the IP literal if the caller didn't give
+       us one — vhost-based servers refuse requests without it. */
+    char host_buf[32];
+    if (!host || !*host) {
+        int p = 0;
+        for (int oct = 0; oct < 4; oct++) {
+            int v = (ip >> (24 - oct*8)) & 0xFF;
+            if (v >= 100) host_buf[p++] = (char)('0' + v / 100);
+            if (v >= 10)  host_buf[p++] = (char)('0' + (v / 10) % 10);
+            host_buf[p++] = (char)('0' + v % 10);
+            if (oct < 3) host_buf[p++] = '.';
+        }
+        if (port != 80) {
+            host_buf[p++] = ':';
+            char tmp[6]; int t = 0;
+            int v = port;
+            if (v == 0) tmp[t++] = '0';
+            while (v) { tmp[t++] = (char)('0' + v % 10); v /= 10; }
+            for (int i = t - 1; i >= 0; i--) host_buf[p++] = tmp[i];
+        }
+        host_buf[p] = 0;
+        host = host_buf;
+    }
+
+    char req[640];
     int n = 0;
     const char* g = "GET ";
     while (*g && n < (int)sizeof(req)) req[n++] = *g++;
@@ -532,18 +556,20 @@ int net_http_get(uint32_t ip, uint16_t port, const char* host, const char* path,
     while (*p && n < (int)sizeof(req)) req[n++] = *p++;
     const char* httpv = " HTTP/1.0\r\n";
     for (const char* q = httpv; *q && n < (int)sizeof(req); q++) req[n++] = *q;
-    if (host) {
-        const char* hh = "Host: ";
-        for (const char* q = hh; *q && n < (int)sizeof(req); q++) req[n++] = *q;
-        for (const char* q = host; *q && n < (int)sizeof(req); q++) req[n++] = *q;
-        const char* cr = "\r\n";
-        for (const char* q = cr; *q && n < (int)sizeof(req); q++) req[n++] = *q;
-    }
-    const char* ua = "User-Agent: samaraos/1\r\nConnection: close\r\n\r\n";
+    const char* hh = "Host: ";
+    for (const char* q = hh; *q && n < (int)sizeof(req); q++) req[n++] = *q;
+    for (const char* q = host; *q && n < (int)sizeof(req); q++) req[n++] = *q;
+    const char* cr = "\r\n";
+    for (const char* q = cr; *q && n < (int)sizeof(req); q++) req[n++] = *q;
+    const char* ua =
+        "User-Agent: samaraos/1\r\n"
+        "Accept: */*\r\n"
+        "Connection: close\r\n\r\n";
     for (const char* q = ua; *q && n < (int)sizeof(req); q++) req[n++] = *q;
 
     if (tcp_send_all(req, n) < 0) { tcp_close_active(); return -3; }
-    int got = tcp_recv_until_close(out, outcap, 6000);
+    /* Idle timeout is now 10s — some hosts take a moment to flush. */
+    int got = tcp_recv_until_close(out, outcap, 10000);
     tcp_close_active();
     return got;
 }

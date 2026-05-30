@@ -34,6 +34,7 @@ struct window {
     void (*on_paint)(window_t*);                              /* called during full redraw */
     void (*on_key)(window_t*, char);
     void (*on_click)(window_t*, int rel_x, int rel_y);        /* click inside client area; NULL ok */
+    void (*on_release)(window_t*);                            /* mouse-up after a press on this window; NULL ok */
     void (*on_tick)(window_t*, uint32_t now_ms);              /* per-frame logic; NULL ok */
     void (*on_close)(window_t*);                              /* fires from wm_close; NULL ok */
     bool needs_repaint;                                       /* set by app to force repaint */

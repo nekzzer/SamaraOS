@@ -66,6 +66,7 @@ KERN_SRC := \
     src/rtl8139.c \
     src/net.c \
     src/snake.c \
+    src/browser.c \
     src/shell.c \
     src/kernel.c
 
@@ -196,18 +197,18 @@ NET_DRIVE := -netdev user,id=n0 -device rtl8139,netdev=n0
 
 run: $(KERNEL)
 	@mkdir -p $(MUSIC_DIR)
-	$(QEMU) -kernel $(KERNEL) -m 64 -vga std -serial stdio $(AUDIO) $(MUSIC_DRIVE) $(NET_DRIVE)
+	$(QEMU) -kernel $(KERNEL) -m 256 -vga std -serial stdio $(AUDIO) $(MUSIC_DRIVE) $(NET_DRIVE)
 
 # Run with DOOM1.WAD attached as the primary disk so 'doom' command works.
 WAD ?= Doom1.WAD
 run-doom: $(KERNEL)
 	@mkdir -p $(MUSIC_DIR)
-	$(QEMU) -kernel $(KERNEL) -m 64 -vga std -serial stdio $(AUDIO) \
+	$(QEMU) -kernel $(KERNEL) -m 256 -vga std -serial stdio $(AUDIO) \
 	    -drive file=$(WAD),format=raw,if=ide,index=0 $(MUSIC_DRIVE) $(NET_DRIVE)
 
 run-debug: $(KERNEL)
 	@mkdir -p $(MUSIC_DIR)
-	$(QEMU) -kernel $(KERNEL) -m 64 -vga std -serial stdio $(AUDIO) $(MUSIC_DRIVE) $(NET_DRIVE) -d int -no-reboot -no-shutdown
+	$(QEMU) -kernel $(KERNEL) -m 256 -vga std -serial stdio $(AUDIO) $(MUSIC_DRIVE) $(NET_DRIVE) -d int -no-reboot -no-shutdown
 
 clean:
 	rm -f $(ALL_OBJ) $(KERNEL)
