@@ -16,6 +16,7 @@ void     gfx_disable_double_buffer(void);     /* frees, restores direct draw */
 void     gfx_target_back(void);               /* subsequent draws -> back buffer */
 void     gfx_target_front(void);              /* subsequent draws -> real FB */
 void     gfx_present(void);                   /* memcpy back -> front */
+void     gfx_present_rect(int x, int y, int w, int h); /* partial back -> front */
 int      gfx_w(void);
 int      gfx_h(void);
 

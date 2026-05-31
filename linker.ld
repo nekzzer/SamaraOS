@@ -31,6 +31,12 @@ SECTIONS
         *(.bss*)
     }
 
+    /* Heap base = first 4 MiB boundary past the end of .bss. The kernel image
+       grew when boot_stack was bumped to 4 MiB; previously the heap was a
+       hard-coded 0x400000 which now collides with boot_stack. */
+    . = ALIGN(4M);
+    _heap_start = .;
+
     /DISCARD/ :
     {
         *(.comment)

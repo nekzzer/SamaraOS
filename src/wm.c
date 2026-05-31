@@ -16,6 +16,11 @@
 
 static bool db_on = false;
 
+/* Pre-rendered desktop gradient. Computed once at wm_init for the current
+   resolution; redraw_full just blits this instead of recomputing 1080 rows. */
+static uint32_t* bg_cache = NULL;
+static int       bg_cache_w = 0, bg_cache_h = 0;
+
 /* Forward decls into shell.c (terminal handlers) */
 extern void wm_terminal_init(window_t* w);
 extern void wm_terminal_handle_key(window_t* w, char c);
@@ -406,8 +411,28 @@ static void draw_window(window_t* w) {
     }
 }
 
+static void build_bg_cache(int W, int H) {
+    if (bg_cache && bg_cache_w == W && bg_cache_h == H) return;
+    if (bg_cache) { kfree(bg_cache); bg_cache = NULL; }
+    bg_cache = (uint32_t*)kmalloc((uint32_t)W * (uint32_t)H * 4);
+    if (!bg_cache) { bg_cache_w = bg_cache_h = 0; return; }
+    bg_cache_w = W; bg_cache_h = H;
+    for (int y = 0; y < H; y++) {
+        uint8_t t = (uint8_t)((y * 64) / H);
+        uint32_t col = RGB(0x14 + t/3, 0x18 + t/3, 0x2E + t/2);
+        uint32_t* row = bg_cache + (uint32_t)y * (uint32_t)W;
+        for (int x = 0; x < W; x++) row[x] = col;
+    }
+}
+
 static void draw_background(void) {
     int W = gfx_w(), H = gfx_h() - taskbar_h;
+    if (!bg_cache || bg_cache_w != W || bg_cache_h != H) build_bg_cache(W, H);
+    if (bg_cache && bg_cache_w == W && bg_cache_h == H) {
+        gfx_blit_argb(0, 0, W, H, bg_cache);
+        return;
+    }
+    /* fallback if alloc failed */
     for (int y = 0; y < H; y++) {
         uint8_t t = (uint8_t)((y * 64) / H);
         uint32_t col = RGB(0x14 + t/3, 0x18 + t/3, 0x2E + t/2);
@@ -614,9 +639,10 @@ void wm_init(void) {
 static int      last_clock_sec   = -1;
 static uint32_t last_layout_epoch = 0;
 
-/* PIT runs at 100 Hz (10 ms ticks). Targeting 30 ms = ~33 fps fits 3 ticks
-   exactly and keeps the hlt-pacer dead-stable without bumping IRQ0 rate. */
-#define FRAME_MS 30
+/* PIT runs at 100 Hz (10 ms ticks). Aim for ~60 fps, but the hlt-pacer
+   only wakes on PIT IRQs so effective cadence is two ticks = ~50 fps when
+   nothing else preempts. Heavy frames just stretch one more tick. */
+#define FRAME_MS 16
 
 void wm_run(void) {
     uint32_t next_frame = pit_uptime_ms();
@@ -685,10 +711,11 @@ void wm_run(void) {
 
         if (need_redraw || cursor_moved) {
             if (db_on) {
-                gfx_target_back();
                 if (need_redraw) {
+                    /* Full path: rebuild back buffer, present everything,
+                       then stamp cursor directly onto the front buffer. */
+                    gfx_target_back();
                     redraw_full();
-                    /* paint app windows on top */
                     int idxs[WM_MAX_WINDOWS]; int n = z_sorted(idxs);
                     for (int i = 0; i < n; i++) {
                         window_t* w = &windows[idxs[i]];
@@ -697,19 +724,24 @@ void wm_run(void) {
                             w->needs_repaint = false;
                         }
                     }
+                    gfx_target_front();
+                    gfx_present();
+                    stamp_cursor_pixels(mx, my);
+                    cur_drawn_x = mx; cur_drawn_y = my;
+                } else {
+                    /* Cursor-only path: ~1 KB of bytes copied instead of 8 MB.
+                       Back buffer stays clean (no cursor on it), so we just
+                       copy back→front at old + new cursor positions and stamp
+                       the cursor sprite directly on the front. */
+                    gfx_target_front();
+                    if (cur_drawn_x >= 0 &&
+                        (cur_drawn_x != mx || cur_drawn_y != my)) {
+                        gfx_present_rect(cur_drawn_x, cur_drawn_y, CUR_W, CUR_H);
+                    }
+                    gfx_present_rect(mx, my, CUR_W, CUR_H);
+                    stamp_cursor_pixels(mx, my);
+                    cur_drawn_x = mx; cur_drawn_y = my;
                 }
-                /* Stamp cursor into the back buffer LAST, then present so the
-                   user never sees a cursorless frame. After present, restore
-                   the under-cursor pixels in the back so the back buffer stays
-                   "clean" (no cursor) for the next paint cycle. */
-                gfx_save_rect(mx, my, CUR_W, CUR_H, cursor_under);
-                stamp_cursor_pixels(mx, my);
-                gfx_target_front();
-                gfx_present();
-                gfx_target_back();
-                gfx_restore_rect(mx, my, CUR_W, CUR_H, cursor_under);
-                gfx_target_front();
-                cur_drawn_x = mx; cur_drawn_y = my;
             } else {
                 /* No double buffer: classic save/restore on the front buffer */
                 hide_cursor();

@@ -40,9 +40,20 @@ static const struct {
     0, 1920, 1080, 32
 };
 
-/* ---------- boot stack ---------- */
-__attribute__((aligned(16)))
-uint8_t boot_stack[524288];   /* 512 KiB — DOOM init goes deep */
+/* ---------- boot stack ----------
+   DOOM's R_RenderBSPNode is deeply recursive (especially when the BSP tree
+   is dense). 4 MiB gives plenty of headroom and, crucially, lets us *detect*
+   overflow via a sentinel check in the PIT IRQ before it corrupts other
+   .bss objects. */
+#define BOOT_STACK_BYTES (4u * 1024u * 1024u)
+__attribute__((aligned(4096)))
+uint8_t boot_stack[BOOT_STACK_BYTES];
+
+/* Sentinel placed at the very bottom of the stack. The PIT handler reads it
+   on every tick and panics on serial if it ever changes — that's how we
+   notice a stack overflow before it scribbles over the page directory. */
+#define BOOT_STACK_GUARD 0xDEADC0DEu
+uint32_t* boot_stack_sentinel = (uint32_t*)boot_stack;
 
 extern void kmain(uint32_t magic, uint32_t mb_info_addr);
 
@@ -51,7 +62,7 @@ extern void kmain(uint32_t magic, uint32_t mb_info_addr);
 __attribute__((naked, section(".text.start"), used))
 void _start(void) {
     __asm__ volatile (
-        "mov $boot_stack + 524288, %esp\n"
+        "mov $boot_stack + 4194304, %esp\n"
         "xor %ebp, %ebp\n"
         "cld\n"
         "push %ebx\n"               /* arg 2: mb_info_addr */
@@ -78,9 +89,15 @@ static void task_blinker(void) {
 void kmain(uint32_t magic, uint32_t mb_info_addr) {
     (void)magic;
 
-    /* Heap lives at 4 MiB, 64 MiB long. 1920x1080x32 back buffer alone is
-       ~8 MiB; DOOM zone + WAD blobs + browser response buffers take more. */
-    heap_init((void*)0x400000, 0x4000000);
+    /* Plant the stack-overflow sentinel at the very bottom of boot_stack. */
+    *boot_stack_sentinel = BOOT_STACK_GUARD;
+
+    /* Heap lives immediately past the end of .bss (linker symbol
+       _heap_start, 4 MiB aligned). 64 MiB long. 1920x1080x32 back buffer
+       alone is ~8 MiB; DOOM zone + WAD blobs + browser response buffers
+       take more. */
+    extern char _heap_start[];
+    heap_init((void*)_heap_start, 0x4000000);
 
     vga_init();
     vga_set_color(VGA_LCYAN, VGA_BLACK);

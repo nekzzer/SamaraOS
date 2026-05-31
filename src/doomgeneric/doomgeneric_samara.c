@@ -133,40 +133,23 @@ void DG_SetWindowTitle(const char* title) {
 }
 
 extern uint8_t* I_VideoBuffer;       /* DOOM 320x200 8-bit indexed */
+extern uint32_t* DG_ScreenBuffer;    /* 640x400 32-bpp BGRX, cmap_to_fb output */
 extern const uint8_t* samara_wad_find_lump(const char* name, uint32_t* out_size);
 
-#define DOOM_W 320
-#define DOOM_H 200
-#define DOOM_SCALE 2
+#define DOOM_FB_W 640
+#define DOOM_FB_H 400
 
 void DG_DrawFrame(void) {
-    if (!g_doom_win || !I_VideoBuffer) return;
+    if (!g_doom_win || !DG_ScreenBuffer) return;
     int cx, cy, cw, ch;
     wm_client_rect(g_doom_win, &cx, &cy, &cw, &ch);
 
-    /* Cache PLAYPAL pointer once */
-    static const uint8_t* g_pal = 0;
-    if (!g_pal) g_pal = samara_wad_find_lump("PLAYPAL", 0);
-    if (!g_pal) return;
+    int dx0 = cx + (cw > DOOM_FB_W ? (cw - DOOM_FB_W) / 2 : 0);
+    int dy0 = cy + (ch > DOOM_FB_H ? (ch - DOOM_FB_H) / 2 : 0);
 
-    int sw = DOOM_W * DOOM_SCALE, sh = DOOM_H * DOOM_SCALE;
-    int dx0 = cx + (cw > sw ? (cw - sw) / 2 : 0);
-    int dy0 = cy + (ch > sh ? (ch - sh) / 2 : 0);
-
-    for (int y = 0; y < DOOM_H; y++) {
-        const uint8_t* row = I_VideoBuffer + y * DOOM_W;
-        for (int x = 0; x < DOOM_W; x++) {
-            uint32_t pi = (uint32_t)row[x] * 3;
-            uint32_t color = RGB(g_pal[pi], g_pal[pi+1], g_pal[pi+2]);
-            int px = dx0 + x * DOOM_SCALE;
-            int py = dy0 + y * DOOM_SCALE;
-            for (int sy = 0; sy < DOOM_SCALE; sy++) {
-                for (int sx = 0; sx < DOOM_SCALE; sx++) {
-                    gfx_pixel(px + sx, py + sy, color);
-                }
-            }
-        }
-    }
+    /* cmap_to_fb wrote rgba8888 in the layout R=offset16 G=8 B=0 — same as our
+       RGB() macro, so a row-wise memcpy via gfx_blit_argb is correct. */
+    gfx_blit_argb(dx0, dy0, DOOM_FB_W, DOOM_FB_H, DG_ScreenBuffer);
 }
 
 /* ---------- WM window glue ---------- */

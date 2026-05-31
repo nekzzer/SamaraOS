@@ -34,7 +34,7 @@ static struct gdt_ptr   gdtp;
 static struct tss32     tss;
 
 extern uint8_t boot_stack[];
-#define BOOT_STACK_TOP ((uint32_t)boot_stack + 524288)
+#define BOOT_STACK_TOP ((uint32_t)boot_stack + (4u * 1024u * 1024u))
 
 static void set_gate(int n, uint32_t base, uint32_t limit, uint8_t access, uint8_t gran) {
     gdt[n].base_lo  = base & 0xFFFF;

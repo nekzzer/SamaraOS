@@ -235,6 +235,23 @@ void gfx_present(void) {
     );
 }
 
+void gfx_present_rect(int x, int y, int w, int h) {
+    if (!back_buf || !real_fb) return;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > fb_w) w = fb_w - x;
+    if (y + h > fb_h) h = fb_h - y;
+    if (w <= 0 || h <= 0) return;
+    int bpp = fb_bpp / 8;
+    if (bpp < 1) bpp = 1;
+    int row_bytes = w * bpp;
+    for (int yy = 0; yy < h; yy++) {
+        memcpy(real_fb  + (y + yy) * fb_pitch_bytes + x * bpp,
+               back_buf + (y + yy) * fb_pitch_bytes + x * bpp,
+               (size_t)row_bytes);
+    }
+}
+
 /* ---------- Drawing primitives ---------- */
 
 static inline void put32(int x, int y, uint32_t c) {
@@ -286,10 +303,20 @@ void gfx_rect_fill(int x, int y, int w, int h, uint32_t c) {
     int y0 = y < 0 ? 0 : y;
     int x1 = x + w; if (x1 > fb_w) x1 = fb_w;
     int y1 = y + h; if (y1 > fb_h) y1 = fb_h;
+    if (x0 >= x1 || y0 >= y1) return;
     if (fb_bpp == 32) {
+        uint32_t span = (uint32_t)(x1 - x0);
         for (int yy = y0; yy < y1; yy++) {
-            uint32_t* row = (uint32_t*)(fb + yy * fb_pitch_bytes);
-            for (int xx = x0; xx < x1; xx++) row[xx] = c;
+            uint32_t* row = (uint32_t*)(fb + yy * fb_pitch_bytes) + x0;
+            uint32_t n = span;
+            void* d = row;
+            __asm__ volatile (
+                "cld\n\t"
+                "rep stosl"
+                : "+D"(d), "+c"(n)
+                : "a"(c)
+                : "memory"
+            );
         }
     } else if (fb_bpp == 8) {
         uint8_t pi = pal_index(c);
@@ -373,7 +400,15 @@ void gfx_string(int x, int y, const char* s, uint32_t fg, uint32_t bg, bool draw
 }
 
 void gfx_save_rect(int x, int y, int w, int h, uint32_t* dst) {
-    if (!fb_ok) return;
+    if (!fb_ok || !dst) return;
+    if (fb_bpp == 32 && x >= 0 && y >= 0 && x + w <= fb_w && y + h <= fb_h) {
+        for (int yy = 0; yy < h; yy++) {
+            memcpy(dst + yy * w,
+                   fb + (y + yy) * fb_pitch_bytes + x * 4,
+                   (size_t)w * 4);
+        }
+        return;
+    }
     for (int yy = 0; yy < h; yy++) {
         for (int xx = 0; xx < w; xx++) {
             int sx = x + xx, sy = y + yy;
@@ -384,7 +419,15 @@ void gfx_save_rect(int x, int y, int w, int h, uint32_t* dst) {
 }
 
 void gfx_restore_rect(int x, int y, int w, int h, const uint32_t* src) {
-    if (!fb_ok) return;
+    if (!fb_ok || !src) return;
+    if (fb_bpp == 32 && x >= 0 && y >= 0 && x + w <= fb_w && y + h <= fb_h) {
+        for (int yy = 0; yy < h; yy++) {
+            memcpy(fb + (y + yy) * fb_pitch_bytes + x * 4,
+                   src + yy * w,
+                   (size_t)w * 4);
+        }
+        return;
+    }
     for (int yy = 0; yy < h; yy++) {
         for (int xx = 0; xx < w; xx++) {
             int sx = x + xx, sy = y + yy;

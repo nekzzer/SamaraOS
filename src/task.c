@@ -6,6 +6,7 @@
 #include "io.h"
 
 extern void pit_tick_inc(void);
+extern void pit_check_stack_guard(uint32_t cur_esp);
 
 static task_t tasks[MAX_TASKS];
 static int    n_tasks = 0;
@@ -89,6 +90,7 @@ static int pick_next(void) {
    returns esp of the task to switch to. */
 uint32_t schedule(uint32_t saved_esp) {
     pit_tick_inc();
+    pit_check_stack_guard(saved_esp);
     pic_send_eoi(0);
 
     if (!started || n_tasks == 0) return saved_esp;
