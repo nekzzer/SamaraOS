@@ -11,6 +11,7 @@
 #include "core/task.h"
 #include "drivers/keyboard.h"
 #include "drivers/mouse.h"
+#include "fs/fs.h"
 #include "gfx/font.h"
 #include "gfx/gfx.h"
 #include "gfx/gfx_term.h"
@@ -80,6 +81,7 @@ static bool layout_changed;
 
 static uint32_t* bg_cache;
 static int bg_w, bg_h;
+static volatile bool bg_dirty;           /* wallpaper changed: rebuild the cache */
 
 /* ---- damage ---- */
 #define MAX_DMG 32
@@ -296,12 +298,74 @@ static int text_w(uif_t f, const char* s) { return uif_width(f, s); }
 
 static const uint8_t bayer4[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
 
-static void build_background(int W, int H) {
-    if (bg_cache && bg_w == W && bg_h == H) return;
-    if (bg_cache) { kfree(bg_cache); bg_cache = NULL; }
-    bg_cache = (uint32_t*)kmalloc((size_t)W * (size_t)H * 4);
+/* ---- wallpaper: uncompressed 24/32-bpp BMP, cover-scaled, dimmed ~15% ---- */
+
+static const char* const wallpaper_paths[] = {
+    "/home/user/wallpaper.bmp", "/mnt/wallpaper.bmp", "/wallpaper.bmp",
+};
+
+static uint32_t rd32(const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
+static uint16_t rd16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+
+static bool load_wallpaper_file(const fs_node_t* n, uint32_t* dst, int W, int H) {
+    if (!n || n->type != FS_FILE || !n->data || n->size < 54) return false;
+    const uint8_t* b = (const uint8_t*)n->data;
+    if (b[0] != 'B' || b[1] != 'M') return false;
+    uint32_t off = rd32(b + 10), comp = rd32(b + 30);
+    int32_t iw = (int32_t)rd32(b + 18), ih = (int32_t)rd32(b + 22);
+    int bpp = rd16(b + 28);
+    bool top_down = ih < 0;
+    if (top_down) ih = -ih;
+    if (iw <= 0 || ih <= 0 || iw > 8192 || ih > 8192) return false;
+    if (bpp != 24 && bpp != 32) return false;
+    if (comp != 0 && !(comp == 3 && bpp == 32)) return false;   /* BI_RGB (or BGRX bitfields) */
+    int bytes = bpp / 8;
+    uint32_t stride = ((uint32_t)iw * bytes + 3) & ~3u;
+    if (off > n->size || stride * (uint32_t)ih > n->size - off) return false;
+
+    /* Cover: scale so the image fills the desk, crop the overflow evenly. */
+    int sw, sh, offx = 0, offy = 0;
+    if ((uint32_t)W * (uint32_t)ih > (uint32_t)H * (uint32_t)iw) {
+        sw = W; sh = (int)((uint32_t)ih * W / (uint32_t)iw); offy = (sh - H) / 2;
+    } else {
+        sh = H; sw = (int)((uint32_t)iw * H / (uint32_t)ih); offx = (sw - W) / 2;
+    }
+    if (sw <= 0 || sh <= 0) return false;
+    int* xs = (int*)kmalloc((size_t)W * sizeof(int));
+    if (!xs) return false;
+    for (int x = 0; x < W; x++) {
+        int sx = (int)((uint32_t)(x + offx) * (uint32_t)iw / (uint32_t)sw);
+        xs[x] = (sx < iw ? sx : iw - 1) * bytes;
+    }
+    for (int y = 0; y < H; y++) {
+        int sy = (int)((uint32_t)(y + offy) * (uint32_t)ih / (uint32_t)sh);
+        if (sy >= ih) sy = ih - 1;
+        const uint8_t* src = b + off + (size_t)(top_down ? sy : ih - 1 - sy) * stride;
+        uint32_t* row = dst + (size_t)y * W;
+        for (int x = 0; x < W; x++) {
+            const uint8_t* p = src + xs[x];
+            row[x] = RGB(p[2] * 217 >> 8, p[1] * 217 >> 8, p[0] * 217 >> 8);
+        }
+    }
+    kfree(xs);
+    return true;
+}
+
+static bool load_wallpaper(uint32_t* dst, int W, int H) {
+    for (unsigned i = 0; i < sizeof(wallpaper_paths) / sizeof(wallpaper_paths[0]); i++)
+        if (load_wallpaper_file(fs_resolve(fs_root(), wallpaper_paths[i]), dst, W, H)) return true;
+    return false;
+}
+
+void wm_invalidate_wallpaper(void) { bg_dirty = true; }
+
+static void build_background(int W, int H, bool force) {
+    if (!force && bg_cache && bg_w == W && bg_h == H) return;
+    if (bg_cache && (bg_w != W || bg_h != H)) { kfree(bg_cache); bg_cache = NULL; }
+    if (!bg_cache) bg_cache = (uint32_t*)kmalloc((size_t)W * (size_t)H * 4);
     if (!bg_cache) { bg_w = bg_h = 0; return; }
     bg_w = W; bg_h = H;
+    if (load_wallpaper(bg_cache, W, H)) return;
 
     int tr = (C_DESK_TOP >> 16) & 0xFF, tg = (C_DESK_TOP >> 8) & 0xFF, tb = C_DESK_TOP & 0xFF;
     int br = (C_DESK_BOT >> 16) & 0xFF, bgc = (C_DESK_BOT >> 8) & 0xFF, bb = C_DESK_BOT & 0xFF;
@@ -535,7 +599,7 @@ static void menu_run(int action) {
     close_menu();
     int W = gfx_w(), H = gfx_h();
     switch (action) {
-        case 0:  wm_open_terminal(80, 80); break;
+        case 0:  wm_open_terminal(120, 64); break;
         case 1:  browser_open(NULL); break;
         case 2:  mediaplayer_open(); break;
         case 3:  paint_open(); break;
@@ -546,6 +610,269 @@ static void menu_run(int action) {
         case 8:  while (inb(0x64) & 0x02) {} outb(0x64, 0xFE); break;
         case 9:  outw(0x604, 0x2000); outw(0xB004, 0x2000); break;
         case 10: exit_requested = true; break;
+    }
+}
+
+/* ========================================================================
+   Desktop icons: a column of tiles on the left — the built-in apps plus
+   whatever sits in /usr/games (*.py -> python, ELF -> run). Click selects,
+   a second click within 400 ms (or Enter) launches.
+   ======================================================================== */
+
+#define ICON_W    76
+#define ICON_H    84
+#define ICON_GAP  6
+#define ICON_MAX  24
+#define ICON_TILE 48
+#define GAMES_DIR "/usr/games"
+
+enum { IG_TERM, IG_WEB, IG_MUSIC, IG_PAINT, IG_CLOCK, IG_PY, IG_ELF };
+
+typedef struct {
+    char label[24];
+    int  glyph;
+    int  action;              /* menu_run() action, or -1: run `cmd` in the terminal */
+    char cmd[80];
+    rect_t r;
+} icon_t;
+
+static icon_t   icons[ICON_MAX];
+static int      n_icons;
+static int      icon_sel = -1, icon_click_idx = -1;
+static uint32_t icon_click_ms;
+static uint32_t icons_sig, next_icon_scan;
+
+static rect_t icons_bounds(void) {
+    rect_t u = R(0, 0, 0, 0);
+    for (int i = 0; i < n_icons; i++) u = i ? r_union(u, icons[i].r) : icons[i].r;
+    return R(u.x0 - 12, u.y0 - 8, u.x1 - u.x0 + 24, u.y1 - u.y0 + 20);   /* + shadows */
+}
+
+static void add_icon(const char* label, int glyph, int action, const char* cmd) {
+    if (n_icons >= ICON_MAX) return;
+    icon_t* ic = &icons[n_icons++];
+    strncpy(ic->label, label, sizeof(ic->label) - 1);
+    ic->label[sizeof(ic->label) - 1] = 0;
+    ic->glyph = glyph;
+    ic->action = action;
+    ic->cmd[0] = 0;
+    if (cmd) { strncpy(ic->cmd, cmd, sizeof(ic->cmd) - 1); ic->cmd[sizeof(ic->cmd) - 1] = 0; }
+}
+
+static bool ends_with(const char* s, const char* suf) {
+    size_t n = strlen(s), m = strlen(suf);
+    return n >= m && !strcmp(s + n - m, suf);
+}
+
+/* Cheap fingerprint of /usr/games so the column is rebuilt only on change. */
+static uint32_t games_sig(void) {
+    uint32_t h = 2166136261u;
+    fs_node_t* d = fs_resolve(fs_root(), GAMES_DIR);
+    if (!d || d->type != FS_DIR) return h;
+    for (fs_node_t* c = d->child; c; c = c->next) {
+        for (const char* p = c->name; *p; p++) h = (h ^ (uint8_t)*p) * 16777619u;
+        h = (h ^ (uint32_t)c->size) * 16777619u;
+    }
+    return h;
+}
+
+static void layout_icons(void) {
+    int x = 16, y = 16, bottom = gfx_h() - TASKBAR_H - 16;
+    for (int i = 0; i < n_icons; i++) {
+        if (y + ICON_H > bottom && y > 16) { y = 16; x += ICON_W + ICON_GAP; }
+        icons[i].r = R(x, y, ICON_W, ICON_H);
+        y += ICON_H + ICON_GAP;
+    }
+}
+
+static void scan_icons(void) {
+    uint32_t sig = games_sig();
+    if (n_icons && sig == icons_sig) return;
+    if (n_icons) damage_rect(icons_bounds());
+    icons_sig = sig;
+    n_icons = 0;
+    add_icon("Terminal", IG_TERM, 0, NULL);
+    add_icon("Browser", IG_WEB, 1, NULL);
+    add_icon("Music", IG_MUSIC, 2, NULL);
+    add_icon("Paint", IG_PAINT, 3, NULL);
+    add_icon("Clock", IG_CLOCK, 4, NULL);
+    int first_game = n_icons;
+    fs_node_t* d = fs_resolve(fs_root(), GAMES_DIR);
+    for (fs_node_t* c = (d && d->type == FS_DIR) ? d->child : NULL; c; c = c->next) {
+        if (c->type != FS_FILE || c->name[0] == '.') continue;
+        char label[24], cmd[80];
+        strncpy(label, c->name, sizeof(label) - 1);
+        label[sizeof(label) - 1] = 0;
+        if (ends_with(c->name, ".py")) {
+            size_t n = strlen(c->name) - 3;
+            if (n < sizeof(label)) label[n] = 0;
+            strcpy(cmd, "python " GAMES_DIR "/");
+            strcat(cmd, c->name);             /* names are < FS_NAME_MAX */
+            add_icon(label, IG_PY, -1, cmd);
+        } else if (c->size >= 4 && c->data && !memcmp(c->data, "\x7F" "ELF", 4)) {
+            strcpy(cmd, GAMES_DIR "/");
+            strcat(cmd, c->name);             /* names are < FS_NAME_MAX */
+            add_icon(label, IG_ELF, -1, cmd);
+        }
+    }
+    for (int i = first_game + 1; i < n_icons; i++) {           /* alphabetical */
+        icon_t v = icons[i];
+        int j = i - 1;
+        while (j >= first_game && strcmp(icons[j].label, v.label) > 0) { icons[j + 1] = icons[j]; j--; }
+        icons[j + 1] = v;
+    }
+    if (icon_sel >= n_icons) icon_sel = -1;
+    icon_click_idx = -1;
+    layout_icons();
+    damage_rect(icons_bounds());
+}
+
+/* Types a command line into the desktop terminal (opening it if needed)
+   and runs it. Refuses while a program already owns the terminal. */
+bool wm_terminal_feed(const char* line) {
+    window_t* t = wm_open_terminal(120, 64);
+    if (!t) return false;
+    if (wm_terminal_busy()) return false;
+    return wm_terminal_submit(t, line);
+}
+
+static void icon_launch(int i) {
+    if (i < 0 || i >= n_icons) return;
+    if (icons[i].action >= 0) menu_run(icons[i].action);
+    else wm_terminal_feed(icons[i].cmd);
+}
+
+static void icon_select(int i) {
+    if (i == icon_sel) return;
+    if (icon_sel >= 0) damage_rect(icons_bounds());
+    icon_sel = i;
+    if (i >= 0) damage_rect(icons_bounds());
+}
+
+/* Click on the bare desktop. */
+static void icon_press(int mx, int my) {
+    int hit = -1;
+    for (int i = 0; i < n_icons; i++) if (r_hit(icons[i].r, mx, my)) { hit = i; break; }
+    uint32_t now = pit_uptime_ms();
+    if (hit >= 0 && hit == icon_click_idx && now - icon_click_ms < 400) {
+        icon_click_idx = -1;
+        icon_launch(hit);
+        return;
+    }
+    icon_click_idx = hit;
+    icon_click_ms = now;
+    icon_select(hit);
+}
+
+/* ---- tile glyphs (48x48 rounded squares) ---- */
+
+static int isqrt_i(int v) { int r = 0; while ((r + 1) * (r + 1) <= v) r++; return r; }
+
+static void thick_line(int x0, int y0, int x1, int y1, int t, uint32_t c) {
+    for (int dy = 0; dy < t; dy++)
+        for (int dx = 0; dx < t; dx++) gfx_line(x0 + dx, y0 + dy, x1 + dx, y1 + dy, c);
+}
+
+static void ring(int cx, int cy, int r, int t, uint32_t c) {
+    for (int k = 0; k < t; k++) gfx_circle(cx, cy, r - k, c);
+}
+
+static void draw_icon_glyph(int g, int x, int y) {
+    const int S = ICON_TILE, cx = x + S / 2, cy = y + S / 2;
+    uint32_t bg;
+    switch (g) {
+        case IG_TERM:  bg = RGB(0x2A, 0x2E, 0x35); break;
+        case IG_WEB:   bg = RGB(0x3E, 0x7C, 0xCF); break;
+        case IG_MUSIC: bg = RGB(0xB0, 0x5E, 0xC8); break;
+        case IG_PAINT: bg = RGB(0x5E, 0x9E, 0x4C); break;
+        case IG_CLOCK: bg = RGB(0x33, 0x37, 0x3F); break;
+        case IG_PY:    bg = RGB(0x30, 0x69, 0x98); break;
+        default:       bg = RGB(0xCF, 0x4A, 0x3E); break;
+    }
+    gfx_shadow(x, y + 2, S, S, 10, 8, 110);
+    gfx_rrect_fill(x, y, S, S, 10, GFX_CORNERS_ALL, bg);
+    gfx_rect_blend(x + 4, y + 1, S - 8, 1, C_WHITE, 40);           /* top sheen */
+
+    switch (g) {
+    case IG_TERM:
+        gfx_rect_fill(x + 6, y + 10, S - 12, 1, RGB(0x40, 0x45, 0x4E));
+        gfx_disc(x + 10, y + 6, 1, C_DANGER);
+        gfx_disc(x + 15, y + 6, 1, C_ACCENT);
+        thick_line(x + 11, y + 18, x + 19, y + 25, 3, C_BAR_TEXT);
+        thick_line(x + 11, y + 32, x + 19, y + 25, 3, C_BAR_TEXT);
+        gfx_rect_fill(x + 23, y + 31, 13, 3, C_ACCENT);
+        break;
+    case IG_WEB: {
+        ring(cx, cy, 16, 2, C_WHITE);
+        gfx_rect_fill(cx - 15, cy - 1, 30, 2, C_WHITE);
+        gfx_rect_fill(cx - 1, cy - 15, 2, 30, C_WHITE);
+        int ch = isqrt_i(256 - 64);
+        gfx_rect_fill(cx - ch + 1, cy - 8, 2 * ch - 2, 1, C_WHITE);
+        gfx_rect_fill(cx - ch + 1, cy + 8, 2 * ch - 2, 1, C_WHITE);
+        for (int dy = -15; dy <= 15; dy++) {                    /* meridian ellipse */
+            int ex = 8 * isqrt_i(225 - dy * dy) / 15;
+            gfx_rect_fill(cx - ex - 1, cy + dy, 2, 1, C_WHITE);
+            gfx_rect_fill(cx + ex, cy + dy, 2, 1, C_WHITE);
+        }
+        break;
+    }
+    case IG_MUSIC:
+        gfx_disc(x + 17, y + 34, 5, C_WHITE);
+        gfx_disc(x + 32, y + 31, 5, C_WHITE);
+        gfx_rect_fill(x + 20, y + 13, 3, 21, C_WHITE);
+        gfx_rect_fill(x + 35, y + 10, 3, 21, C_WHITE);
+        thick_line(x + 20, y + 13, x + 37, y + 10, 4, C_WHITE);
+        break;
+    case IG_PAINT:
+        gfx_disc(cx, cy + 1, 16, RGB(0xEE, 0xEB, 0xE5));
+        gfx_disc(cx + 8, cy + 8, 4, bg);
+        gfx_disc(cx - 8, cy - 5, 3, C_DANGER);
+        gfx_disc(cx, cy - 9, 3, RGB(0xF2, 0xC9, 0x4C));
+        gfx_disc(cx + 8, cy - 4, 3, RGB(0x3E, 0x7C, 0xCF));
+        gfx_disc(cx - 8, cy + 5, 3, RGB(0x2A, 0x2E, 0x35));
+        break;
+    case IG_CLOCK:
+        gfx_disc(cx, cy, 17, RGB(0xEE, 0xEB, 0xE5));
+        for (int k = 0; k < 12; k++) {
+            static const int8_t tx[12] = { 0, 7, 12, 14, 12, 7, 0, -7, -12, -14, -12, -7 };
+            static const int8_t ty[12] = { -14, -12, -7, 0, 7, 12, 14, 12, 7, 0, -7, -12 };
+            gfx_rect_fill(cx + tx[k], cy + ty[k], 1 + (k % 3 == 0), 1 + (k % 3 == 0), C_GLYPH);
+        }
+        thick_line(cx - 1, cy, cx - 1, cy - 11, 2, C_INK);
+        thick_line(cx, cy - 1, cx + 8, cy + 4, 2, C_INK);
+        gfx_disc(cx, cy, 2, C_ACCENT);
+        break;
+    case IG_PY:
+        uif_draw_center(x, y, S, S, UIF_BIG, "Py", RGB(0xF2, 0xC9, 0x4C));
+        gfx_rect_fill(x + 12, y + S - 12, S - 24, 2, RGB(0xF2, 0xC9, 0x4C));
+        break;
+    default:                                                     /* gamepad */
+        gfx_rrect_fill(x + 6, y + 15, S - 12, 19, 8, GFX_CORNERS_ALL, C_WHITE);
+        gfx_rect_fill(x + 12, y + 23, 10, 3, bg);
+        gfx_rect_fill(x + 15, y + 20, 4, 9, bg);
+        gfx_disc(x + 32, y + 22, 2, bg);
+        gfx_disc(x + 36, y + 27, 2, bg);
+        break;
+    }
+}
+
+static void draw_icons(rect_t region) {
+    for (int i = 0; i < n_icons; i++) {
+        icon_t* ic = &icons[i];
+        rect_t r = ic->r;
+        if (!r_overlap(R(r.x0 - 12, r.y0 - 8, ICON_W + 24, ICON_H + 20), region)) continue;
+        if (i == icon_sel) {
+            gfx_rect_blend(r.x0 + 2, r.y0, ICON_W - 4, ICON_H, C_ACCENT, 48);
+            gfx_rect_blend(r.x0 + 2, r.y0, ICON_W - 4, 1, C_ACCENT, 120);
+            gfx_rect_blend(r.x0 + 2, r.y1 - 1, ICON_W - 4, 1, C_ACCENT, 120);
+        }
+        int gx = r.x0 + (ICON_W - ICON_TILE) / 2, gy = r.y0 + 6;
+        draw_icon_glyph(ic->glyph, gx, gy);
+        int ty = gy + ICON_TILE + 6;
+        int tw = uif_width(UIF_SMALL, ic->label), maxw = ICON_W - 6;
+        int tx = tw <= maxw ? r.x0 + (ICON_W - tw) / 2 : r.x0 + 3;
+        uif_draw_fit(tx + 1, ty + 1, UIF_SMALL, ic->label, maxw, C_BLACK);   /* legible on photos */
+        uif_draw_fit(tx, ty, UIF_SMALL, ic->label, maxw, C_BAR_TEXT);
     }
 }
 
@@ -762,6 +1089,9 @@ static void compose(rect_t region) {
     if (region.y0 < desk_h) {
         if (bg_cache) gfx_blit_argb(0, 0, bg_w, bg_h, bg_cache);
         else          gfx_rect_fill(0, 0, gfx_w(), desk_h, C_DESK_TOP);
+        clip_to(r_isect(region, R(0, 0, gfx_w(), desk_h)));
+        draw_icons(region);
+        clip_to(region);
     }
 
     int order[WM_MAX_WINDOWS];
@@ -924,7 +1254,7 @@ static void on_press(int mx, int my) {
     }
 
     int wi = hit_window(mx, my);
-    if (wi < 0) return;
+    if (wi < 0) { icon_press(mx, my); return; }
     window_t* w = &windows[wi];
     set_focus(wi);
     press_target_idx = wi;
@@ -1007,7 +1337,10 @@ static void on_key(char c, uint32_t now) {
         exit_requested = true;
         return;
     }
-    if (!f) return;
+    if (!f) {
+        if (c == '\n' && icon_sel >= 0) icon_launch(icon_sel);
+        return;
+    }
     if (f->type == WIN_TERMINAL) {
         last_key_ms = now;
         wm_terminal_handle_key(f, c);
@@ -1036,6 +1369,11 @@ static void collect_damage(uint32_t now) {
         if (w->on_tick) w->on_tick(w, now);
         if (!w->minimized && (w->animate || w->needs_repaint)) damage_rect(client_of(w));
         w->needs_repaint = false;
+    }
+
+    if ((int32_t)(now - next_icon_scan) >= 0) {
+        next_icon_scan = now + 1500;
+        scan_icons();
     }
 
     if ((int32_t)(now - next_rtc_ms) >= 0) {
@@ -1088,7 +1426,11 @@ void wm_init(void) {
     db_on = gfx_enable_double_buffer();
     if (db_on) gfx_target_back();
     gfx_reset_clip();
-    build_background(gfx_w(), gfx_h() - TASKBAR_H);
+    bg_dirty = false;
+    build_background(gfx_w(), gfx_h() - TASKBAR_H, true);
+    icons_sig = 0;
+    icon_sel = icon_click_idx = -1;
+    scan_icons();
     rtc_poll();
     layout_taskbar();
     gfx_term_set_draw_hook(term_drawn);
@@ -1148,6 +1490,11 @@ void wm_run(void) {
         layout_changed = false;
 
         uwin_wm_frame();
+        if (bg_dirty) {
+            bg_dirty = false;
+            build_background(gfx_w(), gfx_h() - TASKBAR_H, true);
+            damage_all();
+        }
         collect_damage(now);
         prev_mx = mx; prev_my = my;
 

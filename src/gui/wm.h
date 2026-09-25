@@ -65,6 +65,12 @@ window_t* wm_open_app_ex(int x, int y, int w, int h, const char* title,
 void      wm_close(window_t* w);
 window_t* wm_focused(void);
 
+/* Desktop wallpaper (/home/user, /mnt or / wallpaper.bmp) changed: reload
+   it on the next frame (or at the next desktop start). */
+void      wm_invalidate_wallpaper(void);
+/* Type + run a shell command line in the desktop terminal (opens it). */
+bool      wm_terminal_feed(const char* line);
+
 /* For app windows: get the client rectangle (inside title+border). */
 void      wm_client_rect(window_t* w, int* x, int* y, int* cw, int* ch);
 

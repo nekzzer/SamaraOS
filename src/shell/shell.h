@@ -12,5 +12,6 @@ const char* wm_sysinfo_text(void);
 void        wm_terminal_poll(window_t* w);    /* per frame, while open */
 bool        wm_terminal_busy(void);           /* a program owns the keyboard */
 void        wm_terminal_closed(void);         /* window gone: kill its programs */
+bool        wm_terminal_submit(window_t* w, const char* line); /* type + run a command line */
 
 #endif

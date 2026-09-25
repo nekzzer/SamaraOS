@@ -273,6 +273,17 @@ s.close()
 PY
 fi
 
+# samara.h (desktop windows from C) + demos and games. tetris is prebuilt
+# with musl-gcc so the desktop icon works out of the box; the same source
+# builds inside the OS: tcc /usr/src/games/tetris.c -o /usr/bin/tetris
+SAM=$ROOT/userland/samara
+mkdir -p "$OUT/usr/src/samara" "$OUT/usr/src/games" "$OUT/usr/games"
+cp "$SAM/samara.h" "$OUT/usr/include/samara.h"
+cp "$SAM/hello.c" "$SAM/hello.py" "$OUT/usr/src/samara/"
+cp "$SAM/tetris.c" "$SAM/breakout.py" "$OUT/usr/src/games/"
+cp "$SAM/breakout.py" "$OUT/usr/games/breakout.py"
+"$XBIN/i686-linux-musl-gcc" -static -no-pie -O2 -s -I"$SAM" "$SAM/tetris.c" -o "$OUT/usr/games/tetris"
+
 cd "$OUT"
 tar --format=ustar --owner=0 --group=0 -cf "$ROOT/userland/sysroot.tar" usr $( [ -d etc ] && echo etc )
 ls -la "$ROOT/userland/sysroot.tar"

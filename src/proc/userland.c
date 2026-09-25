@@ -123,7 +123,7 @@ int userland_install(void) {
     put_text("/etc/shells", "/bin/sh\n/bin/ash\n");
     put_text("/etc/motd", "BusyBox on SamaraOS. Type 'exit' to return to the SamaraOS shell.\n");
     put_text("/etc/profile",
-             "export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n"
+             "export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/games\n"
              "export PS1='\\u@\\h:\\w\\$ '\n"
              "alias ll='ls -l'\n"
              "alias python=micropython python3=micropython\n");

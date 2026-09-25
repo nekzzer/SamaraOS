@@ -52,6 +52,7 @@ void cmd_nano(int argc, char **argv);
 void cmd_desktop(int argc, char **argv);
 void cmd_bounce(int argc, char **argv);
 void cmd_disk(int argc, char **argv);
+void cmd_wallpaper(int argc, char **argv);
 
 /* commands_apps.c */
 void cmd_doom_mini(int argc, char **argv);

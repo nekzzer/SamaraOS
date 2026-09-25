@@ -393,6 +393,24 @@ void wm_terminal_handle_key(window_t *w, char c) {
   }
 }
 
+/* Types `line` at the prompt (replacing any half-typed input) and runs it,
+   as if the user had entered it. Used by the desktop icons. */
+bool wm_terminal_submit(window_t *w, const char *line) {
+  if (shell_fg_running())
+    return false;
+  g_current_term_window = w;
+  vga_set_cursor(term_prompt_x, term_prompt_y);
+  for (int i = 0; i < term_len; i++)
+    vga_putc(' ');
+  vga_set_cursor(term_prompt_x, term_prompt_y);
+  term_len = term_cur = 0;
+  term_buf[0] = 0;
+  for (const char *p = line; *p; p++)
+    wm_terminal_handle_key(w, *p);
+  wm_terminal_handle_key(w, '\n');
+  return true;
+}
+
 /* Per-frame: feed a running program's output to the terminal and bring the
    prompt back once it exits. */
 void wm_terminal_poll(window_t *w) {
@@ -488,6 +506,7 @@ static cmd_t cmds[] = {{"help", cmd_help},
                        {"edit", cmd_nano},
                        {"neofetch", cmd_neofetch},
                        {"desktop", cmd_desktop},
+                       {"wallpaper", cmd_wallpaper},
                        {"bounce", cmd_bounce},
                        {"disk", cmd_disk},
                        {"doom", cmd_doom},

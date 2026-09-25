@@ -19,7 +19,7 @@
    foreground job and wm_terminal_poll() does the same shuttling per frame. */
 
 static char *const user_env[] = {
-    "PATH=/bin:/sbin:/usr/bin:/usr/sbin",
+    "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/games",
     "HOME=/home/user",
     "USER=root",
     "LOGNAME=root",
@@ -42,7 +42,7 @@ bool shell_find_program(const char *name, char *out, int cap) {
     out[cap - 1] = 0;
     return true;
   }
-  static const char *const path[] = {"/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/"};
+  static const char *const path[] = {"/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/games/"};
   for (unsigned i = 0; i < sizeof(path) / sizeof(path[0]); i++) {
     char full[128];
     strncpy(full, path[i], sizeof(full) - 1);

@@ -1,4 +1,6 @@
 #include "../shell_priv.h"
+#include "core/string.h"
+#include "fs/fs.h"
 #include "apps/mediaplayer.h"
 #include "boot/pit.h"
 #include "drivers/ata.h"
@@ -134,10 +136,11 @@ void cmd_desktop(int argc, char **argv) {
                                 "github.com/nekzzer/SamaraOS\n"
                                 "\n"
                                 "Drag windows by the title bar.\n"
-                                "More programs live under 'samara'\n"
-                                "in the taskbar. Esc: text shell.\n";
-  wm_open_info(40, 40, 440, 200, "Welcome", welcome);
-  wm_open_terminal(80, 80);
+                                "Double-click an icon on the left, or\n"
+                                "open 'samara' in the taskbar. Esc: text\n"
+                                "shell. 'wallpaper file.bmp' sets a wallpaper.\n";
+  wm_open_info(gfx_w() - 500, 60, 440, 220, "Welcome", welcome);
+  wm_open_terminal(120, 64);
 
   wm_run();
 
@@ -154,4 +157,71 @@ void cmd_desktop(int argc, char **argv) {
   vga_set_color(VGA_LCYAN, VGA_BLACK);
   vga_puts("returned from desktop.\n");
   vga_set_color(VGA_LGREY, VGA_BLACK);
+}
+
+/* ===================== wallpaper ===================== */
+
+static const char *const wp_paths[] = {"/home/user/wallpaper.bmp", "/mnt/wallpaper.bmp",
+                                       "/wallpaper.bmp"};
+
+static bool bmp_usable(const fs_node_t *n) {
+  if (!n || n->type != FS_FILE || n->size < 54 || !n->data)
+    return false;
+  const uint8_t *b = (const uint8_t *)n->data;
+  int bpp = b[28] | (b[29] << 8);
+  uint32_t comp = b[30] | (b[31] << 8) | (b[32] << 16) | ((uint32_t)b[33] << 24);
+  return b[0] == 'B' && b[1] == 'M' && (bpp == 24 || bpp == 32) &&
+         (comp == 0 || (comp == 3 && bpp == 32));
+}
+
+/* wallpaper [file.bmp | off]: installs a BMP as the desktop wallpaper
+   (kept on /mnt when the persistent disk is mounted), removes it, or with
+   no argument reloads/shows the current one. */
+void cmd_wallpaper(int argc, char **argv) {
+  fs_node_t *mnt = fs_resolve(fs_root(), "/mnt");
+  bool persist = mnt && mnt->mount_id;
+  const char *dst = persist ? "/mnt/wallpaper.bmp" : "/home/user/wallpaper.bmp";
+
+  if (argc < 2) {
+    for (unsigned i = 0; i < sizeof(wp_paths) / sizeof(wp_paths[0]); i++)
+      if (bmp_usable(fs_resolve(fs_root(), wp_paths[i]))) {
+        vga_printf("wallpaper: %s\n", wp_paths[i]);
+        wm_invalidate_wallpaper();
+        return;
+      }
+    vga_puts("wallpaper: none (usage: wallpaper <file.bmp> | wallpaper off)\n");
+    wm_invalidate_wallpaper();
+    return;
+  }
+  if (!strcmp(argv[1], "off")) {
+    for (unsigned i = 0; i < sizeof(wp_paths) / sizeof(wp_paths[0]); i++)
+      if (fs_resolve(fs_root(), wp_paths[i]))
+        fs_unlink(fs_root(), wp_paths[i]);
+    wm_invalidate_wallpaper();
+    vga_puts("wallpaper: off\n");
+    return;
+  }
+  fs_node_t *src = fs_resolve(cwd, argv[1]);
+  if (!src || src->type != FS_FILE) {
+    vga_printf("wallpaper: %s: no such file\n", argv[1]);
+    return;
+  }
+  if (!bmp_usable(src)) {
+    vga_puts("wallpaper: need an uncompressed 24/32-bit BMP\n");
+    return;
+  }
+  fs_node_t *d = fs_resolve(fs_root(), dst);
+  if (d != src) {
+    if (!d)
+      d = fs_create(fs_root(), dst, FS_FILE);
+    if (!d || fs_write(d, src->data, src->size) < 0) {
+      vga_printf("wallpaper: cannot write %s\n", dst);
+      return;
+    }
+  }
+  /* /home/user wins the lookup: drop a stale copy there. */
+  if (persist && fs_resolve(fs_root(), wp_paths[0]) && fs_resolve(fs_root(), wp_paths[0]) != src)
+    fs_unlink(fs_root(), wp_paths[0]);
+  wm_invalidate_wallpaper();
+  vga_printf("wallpaper: %s -> %s\n", argv[1], dst);
 }
