@@ -1,4 +1,4 @@
-#include "../types.h"
+#include "../core/types.h"
 
 /* signal — no-op */
 typedef void (*__sighandler_t)(int);

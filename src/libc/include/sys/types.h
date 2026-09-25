@@ -1,7 +1,7 @@
 #ifndef _LIBC_SYS_TYPES_H
 #define _LIBC_SYS_TYPES_H
 
-#include "../../../types.h"
+#include "../../../core/types.h"
 
 typedef int32_t off_t;
 typedef int     mode_t;

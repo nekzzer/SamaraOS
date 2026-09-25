@@ -1,7 +1,7 @@
 #ifndef _LIBC_STDLIB_H
 #define _LIBC_STDLIB_H
 
-#include "../../types.h"
+#include "../../core/types.h"
 
 #define RAND_MAX 0x7fffffff
 #define EXIT_SUCCESS 0

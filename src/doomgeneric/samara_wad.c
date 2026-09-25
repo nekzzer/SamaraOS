@@ -1,10 +1,10 @@
 /* Loads Doom1.WAD from ATA disk into kernel heap once, then registers it
    with the libc-shim so DOOM's fopen("doom1.wad") returns it. */
 
-#include "../types.h"
-#include "../heap.h"
-#include "../ata.h"
-#include "../string.h"
+#include "../core/types.h"
+#include "../core/heap.h"
+#include "../drivers/ata.h"
+#include "../core/string.h"
 
 extern void libc_set_wad(const uint8_t* buf, size_t sz, const char* name);
 extern int  printf(const char* fmt, ...);

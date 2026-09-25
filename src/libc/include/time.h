@@ -1,7 +1,7 @@
 #ifndef _LIBC_TIME_H
 #define _LIBC_TIME_H
 
-#include "../../types.h"
+#include "../../core/types.h"
 
 typedef int32_t  time_t;
 typedef int32_t  clock_t;

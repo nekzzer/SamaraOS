@@ -1,7 +1,7 @@
 #ifndef SAMARA_DOOMGENERIC_H
 #define SAMARA_DOOMGENERIC_H
 
-#include "../types.h"
+#include "../core/types.h"
 
 /* High-level entry: load WAD, init libc-shim FILE backing, open WM window
    and run doomgeneric_Create + tick loop. Caller must already be in a graphics

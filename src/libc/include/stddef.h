@@ -1,7 +1,7 @@
 #ifndef _LIBC_STDDEF_H
 #define _LIBC_STDDEF_H
 
-#include "../../types.h"
+#include "../../core/types.h"
 
 #ifndef NULL
 #define NULL ((void*)0)

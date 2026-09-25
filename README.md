@@ -143,3 +143,18 @@ timer, файлы, multitasking.
 - Пользовательский режим (ring 3) и сисколлы
 - ELF-загрузчик чтобы апы были отдельными бинарниками
 - Сеть (RTL8139)
+
+## Шрифты десктопа
+
+Интерфейс рисуется сглаженным **Golos Text** (Paratype, OFL), терминал —
+**DejaVu Sans Mono** в ячейках 8×16 (псевдографика остаётся VGA-битмапом).
+TrueType-растеризатора в ядре нет: глифы заранее запекаются в альфа-атласы
+по кодам CP866 скриптом `tools/mkfont.py` → `src/gfx/uifont_data.h`
+(файл закоммичен, Pillow нужен только для перегенерации). API — `gfx/uifont.h`,
+палитра для приложений — `gui/theme.h`.
+
+## MicroPython
+
+`userland/build-micropython.sh` собирает unix-порт MicroPython статически под
+i686-musl, `userland/build-sysroot.sh` кладёт его в `/usr/bin/micropython`.
+В шелле: `python [file.py]`, демо в `/usr/src/py`.

@@ -1,5 +1,5 @@
 /* Extra string functions on top of src/string.c (memset/memcpy/etc. live there) */
-#include "../types.h"
+#include "../core/types.h"
 
 /* declared in src/libc/include/string.h, src/string.h provides core ones */
 size_t strlen(const char* s);

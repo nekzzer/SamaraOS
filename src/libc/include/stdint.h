@@ -1,7 +1,7 @@
 #ifndef _LIBC_STDINT_H
 #define _LIBC_STDINT_H
 
-#include "../../types.h"
+#include "../../core/types.h"
 
 typedef int32_t  intptr_t;
 typedef uint32_t uintptr_t;

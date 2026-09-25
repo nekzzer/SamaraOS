@@ -1,7 +1,7 @@
 #ifndef _LIBC_STRING_H
 #define _LIBC_STRING_H
 
-#include "../../types.h"
+#include "../../core/types.h"
 
 void*  memset(void* dst, int v, size_t n);
 void*  memcpy(void* dst, const void* src, size_t n);

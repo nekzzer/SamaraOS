@@ -3,15 +3,15 @@
    - samara_doom_launch() opens a WM window, calls doomgeneric_Create, then
      drives doomgeneric_Tick() from on_paint. */
 
-#include "../types.h"
-#include "../io.h"
-#include "../heap.h"
-#include "../string.h"
-#include "../gfx.h"
-#include "../wm.h"
-#include "../keyboard.h"
-#include "../pit.h"
-#include "../ata.h"
+#include "../core/types.h"
+#include "../core/io.h"
+#include "../core/heap.h"
+#include "../core/string.h"
+#include "../gfx/gfx.h"
+#include "../gui/wm.h"
+#include "../drivers/keyboard.h"
+#include "../boot/pit.h"
+#include "../drivers/ata.h"
 
 #include "doomgeneric_samara.h"
 #include "../../doomgeneric-master/doomgeneric/doomkeys.h"

@@ -1,7 +1,7 @@
 #ifndef _LIBC_UNISTD_H
 #define _LIBC_UNISTD_H
 
-#include "../../types.h"
+#include "../../core/types.h"
 
 #define STDIN_FILENO  0
 #define STDOUT_FILENO 1

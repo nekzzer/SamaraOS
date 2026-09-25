@@ -1,18 +1,20 @@
 # SamaraOS Makefile
-# Toolchain: i686-elf-gcc at C:\cross\bin
-# Run target: qemu-system-i386 (UCRT64)
+# Toolchain: i686-elf-gcc, built repo-locally by toolchain/build-cross.sh
+# into toolchain/cross/ (see that script to reproduce on another machine).
+# Run target: system qemu-system-i386.
 
-CROSS    ?= /c/cross/bin/i686-elf-
+MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+CROSS    ?= $(MAKEFILE_DIR)toolchain/cross/bin/i686-elf-
 CC       := $(CROSS)gcc
 LD       := $(CROSS)ld
 OBJCOPY  := $(CROSS)objcopy
 
-QEMU     ?= /c/msys64/ucrt64/bin/qemu-system-i386.exe
+QEMU     ?= qemu-system-i386
 
 # Wire the PC speaker (PIT channel 2) to a real audio backend. Without these
 # flags QEMU silently drops the speaker output even though the OS programs it.
-# dsound = Windows DirectSound (no extra deps). Override with AUDIO= if needed.
-AUDIO    ?= -audiodev sdl,id=snd0 -machine pcspk-audiodev=snd0 -device sb16,audiodev=snd0
+# pa = PulseAudio (Linux). Override with AUDIO= for another backend/host.
+AUDIO    ?= -audiodev pa,id=snd0 -machine pcspk-audiodev=snd0 -device sb16,audiodev=snd0
 
 KCFLAGS  := -m32 -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
             -nostdlib -mno-red-zone \
@@ -35,42 +37,68 @@ LDFLAGS  := -m elf_i386 -nostdlib -T linker.ld
 LIBGCC   := $(shell $(CC) -m32 -print-libgcc-file-name)
 
 # ---------- Kernel sources ----------
+# Organized by subsystem: core/ (heap, task, string, kernel entry), boot/
+# (gdt, idt, paging, pic, pit, fpu, libgcc div/mod helpers), drivers/
+# (device I/O), net/ (protocol stack), fs/ (filesystem), gfx/ (framebuffer,
+# font, terminal), gui/ (desktop, window manager), apps/ (programs), shell/
+# (command interpreter + shell/commands/ builtins).
+
+# Shell builtins, split out of shell.c into one file per command group.
+SHELL_CMD_SRC := $(wildcard src/shell/commands/*.c)
+
 KERN_SRC := \
-    src/string.c \
-    src/vga.c \
-    src/gdt.c \
-    src/idt.c \
-    src/paging.c \
-    src/fpu.c \
-    src/pic.c \
-    src/pit.c \
-    src/keyboard.c \
-    src/mouse.c \
-    src/heap.c \
-    src/task.c \
-    src/fs.c \
-    src/font.c \
-    src/gfx.c \
-    src/gfx_term.c \
-    src/desktop.c \
-    src/wm.c \
-    src/ata.c \
-    src/doom.c \
-    src/mediaplayer.c \
-    src/paint.c \
-    src/clock.c \
-    src/sb16.c \
-    src/wav.c \
-    src/synth.c \
-    src/embed.c \
-    src/fat.c \
-    src/pci.c \
-    src/rtl8139.c \
-    src/net.c \
-    src/snake.c \
-    src/browser.c \
-    src/shell.c \
-    src/kernel.c
+    src/core/string.c \
+    src/drivers/vga.c \
+    src/boot/gdt.c \
+    src/boot/idt.c \
+    src/boot/paging.c \
+    src/boot/fpu.c \
+    src/boot/pic.c \
+    src/boot/pit.c \
+    src/drivers/keyboard.c \
+    src/drivers/mouse.c \
+    src/drivers/input.c \
+    src/drivers/fbdev.c \
+    src/core/heap.c \
+    src/core/task.c \
+    src/core/vmm.c \
+    src/core/clock.c \
+    src/proc/tty.c \
+    src/proc/file.c \
+    src/proc/proc.c \
+    src/proc/syscall.c \
+    src/proc/userland.c \
+    src/proc/procfs.c \
+    src/proc/signal.c \
+    src/fs/fs.c \
+    src/gfx/font.c \
+    src/gfx/gfx.c \
+    src/gfx/gfx_term.c \
+    src/gfx/uifont.c \
+    src/gui/desktop.c \
+    src/gui/wm.c \
+    src/drivers/ata.c \
+    src/drivers/ahci.c \
+    src/apps/doom.c \
+    src/apps/mediaplayer.c \
+    src/apps/paint.c \
+    src/apps/clock.c \
+    src/drivers/sb16.c \
+    src/apps/wav.c \
+    src/apps/synth.c \
+    src/apps/embed.c \
+    src/fs/fat.c \
+    src/fs/fatfs.c \
+    src/drivers/pci.c \
+    src/drivers/rtl8139.c \
+    src/net/net.c \
+    src/net/sock.c \
+    src/apps/snake.c \
+    src/apps/browser.c \
+    $(SHELL_CMD_SRC) \
+    src/shell/shell.c \
+    src/boot/libgcc_div.c \
+    src/core/kernel.c
 
 # ---------- libc-shim sources ----------
 LIBC_SRC := \
@@ -134,14 +162,20 @@ LIBC_OBJ  := $(LIBC_SRC:.c=.o) $(LIBC_ASM:.S=.o)
 DGEN_LOC_OBJ := $(DGEN_LOCAL:.c=.o)
 DGEN_OBJ  := $(DGEN_SRC:.c=.o)
 
-ALL_OBJ := $(KERN_OBJ) $(LIBC_OBJ) $(DGEN_LOC_OBJ) $(DGEN_OBJ) $(EMBED_OBJS)
+# Userland: a static i686 busybox (musl) + its applet list, and the TCC +
+# musl sysroot tarball (userland/build-sysroot.sh), linked into the kernel
+# image and unpacked into the ramfs at boot (src/proc/userland.c).
+USERLAND_BINS := userland/busybox userland/busybox.applets userland/sysroot.tar
+USERLAND_OBJS := $(addsuffix .bin.o,$(USERLAND_BINS))
+
+ALL_OBJ := $(KERN_OBJ) $(LIBC_OBJ) $(DGEN_LOC_OBJ) $(DGEN_OBJ) $(EMBED_OBJS) $(USERLAND_OBJS)
 
 KERNEL := build/samara.elf
 
 all: $(KERNEL)
 
-# Auto-generated list of EMBED(name, sym) pairs included from src/embed.c
-src/embed_list.h: $(EMBED_WAVS) Makefile
+# Auto-generated list of EMBED(name, sym) pairs included from src/apps/embed.c
+src/apps/embed_list.h: $(EMBED_WAVS) Makefile
 	@printf '/* auto-generated, see embed dir */\n' > $@
 	@for f in $(EMBED_WAVS); do                                                  \
 	  base=$$(basename "$$f");                                                   \
@@ -153,8 +187,15 @@ src/embed_list.h: $(EMBED_WAVS) Makefile
 embed/%.wav.o: embed/%.wav
 	$(OBJCOPY) -I binary -O elf32-i386 -B i386 $< $@
 
+# Symbols come out as _binary_userland_busybox_start etc.
+userland/%.bin.o: userland/%
+	$(OBJCOPY) -I binary -O elf32-i386 -B i386 --rename-section .data=.rodata,alloc,load,readonly,data,contents $< $@
+
+# Font atlases baked by tools/mkfont.py (committed, regenerate on demand)
+src/gfx/uifont.o: src/gfx/uifont_data.h src/gfx/uifont.h
+
 # embed.c includes the generated header
-src/embed.o: src/embed_list.h
+src/apps/embed.o: src/apps/embed_list.h
 
 build:
 	@mkdir -p build
@@ -197,9 +238,20 @@ MUSIC_DRIVE := -drive file=fat:$(MUSIC_DIR),format=raw,if=ide,index=2,snapshot=o
 # DNS at 10.0.2.3 is exposed but our stack doesn't use it (numeric IPs only).
 NET_DRIVE := -netdev user,id=n0 -device rtl8139,netdev=n0
 
-run: $(KERNEL)
+# Persistent 64 MiB FAT32 disk on AHCI: SamaraOS mounts it at /mnt and
+# writes changes back, so files there survive reboots. Created on first run;
+# on the host: `mdir -i disk.img ::` / `mcopy -i disk.img ::file .`
+DISK_IMG ?= disk.img
+DISK_DRIVE := -device ahci,id=ahci -drive id=sata0,file=$(DISK_IMG),format=raw,if=none \
+              -device ide-hd,drive=sata0,bus=ahci.0
+
+$(DISK_IMG):
+	truncate -s 64M $@
+	mkfs.fat -F 32 -n SAMARA $@ >/dev/null
+
+run: $(KERNEL) $(DISK_IMG)
 	@mkdir -p $(MUSIC_DIR)
-	$(QEMU) -kernel $(KERNEL) -m 256 -vga std -serial stdio $(AUDIO) $(MUSIC_DRIVE) $(NET_DRIVE)
+	$(QEMU) -kernel $(KERNEL) -m 256 -vga std -serial stdio $(AUDIO) $(MUSIC_DRIVE) $(NET_DRIVE) $(DISK_DRIVE)
 
 # Run with DOOM1.WAD attached as the primary disk so 'doom' command works.
 WAD ?= Doom1.WAD
@@ -212,8 +264,35 @@ run-debug: $(KERNEL)
 	@mkdir -p $(MUSIC_DIR)
 	$(QEMU) -kernel $(KERNEL) -m 256 -vga std -serial stdio $(AUDIO) $(MUSIC_DRIVE) $(NET_DRIVE) -d int -no-reboot -no-shutdown
 
+# Real, portable boot image: a GRUB rescue ISO carrying the multiboot kernel.
+# Boots on any x86 PC/VM from CD/USB, not just via QEMU's -kernel shortcut.
+ISO := build/samara.iso
+
+$(ISO): $(KERNEL) iso/grub.cfg
+	@mkdir -p build/isodir/boot/grub
+	cp $(KERNEL) build/isodir/boot/samara.elf
+	cp iso/grub.cfg build/isodir/boot/grub/grub.cfg
+	grub-mkrescue -o $(ISO) build/isodir
+
+iso: $(ISO)
+
+# Boots the ISO exactly as a real PC/VM would (BIOS -> GRUB -> multiboot),
+# instead of QEMU's -kernel shortcut which skips the bootloader entirely.
+run-iso: $(ISO)
+	@mkdir -p $(MUSIC_DIR)
+	$(QEMU) -cdrom $(ISO) -boot d -m 256 -vga std -serial stdio $(AUDIO) \
+	    -drive file=fat:$(MUSIC_DIR),format=raw,if=ide,index=3,snapshot=on $(NET_DRIVE)
+
+# Same as run-doom but the WAD sits on a SATA disk behind an AHCI controller
+# (exercises src/drivers/ahci.c; shows up as /dev/sda, disk index 4).
+run-sata: $(KERNEL)
+	@mkdir -p $(MUSIC_DIR)
+	$(QEMU) -kernel $(KERNEL) -m 256 -vga std -serial stdio $(AUDIO) \
+	    -device ahci,id=ahci -drive id=sata0,file=$(WAD),format=raw,if=none \
+	    -device ide-hd,drive=sata0,bus=ahci.0 $(MUSIC_DRIVE) $(NET_DRIVE)
+
 clean:
 	rm -f $(ALL_OBJ) $(KERNEL)
 	rm -rf build
 
-.PHONY: all run run-doom run-debug clean build
+.PHONY: all run run-doom run-sata run-debug iso run-iso clean build

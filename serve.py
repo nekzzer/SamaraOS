@@ -19,9 +19,11 @@ Run on the host:
 """
 
 import http.server
+import os
 import socketserver
 import sys
 
+WWW_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "www")
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
 
 HOME_PAGE = b"""<!doctype html>
@@ -84,6 +86,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_www(self, path):
+        # files from www/ next to this script, e.g. wget http://host:8080/calc
+        name = os.path.basename(path)
+        full = os.path.join(WWW_DIR, name)
+        if not name or not os.path.isfile(full):
+            return False
+        with open(full, "rb") as f:
+            self._send(f.read(), ctype="application/octet-stream")
+        return True
+
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
@@ -99,6 +111,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 ).encode("utf-8")
             body += BIG_PAGE_TAIL
             self._send(body)
+        elif self._send_www(path):
+            pass
         else:
             self._send(b"<h1>404</h1><p>not found: " + path.encode() + b"</p>", code=404)
 

@@ -1,6 +1,6 @@
-#include "../types.h"
-#include "../heap.h"
-#include "../string.h"
+#include "../core/types.h"
+#include "../core/heap.h"
+#include "../core/string.h"
 
 extern void doomgen_panic(const char* msg) __attribute__((noreturn));
 

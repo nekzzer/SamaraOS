@@ -1,7 +1,7 @@
 #ifndef _LIBC_STDIO_H
 #define _LIBC_STDIO_H
 
-#include "../../types.h"
+#include "../../core/types.h"
 #include "stdarg.h"
 
 #define EOF (-1)

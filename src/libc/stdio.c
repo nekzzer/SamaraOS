@@ -1,7 +1,7 @@
-#include "../types.h"
-#include "../io.h"
-#include "../heap.h"
-#include "../string.h"
+#include "../core/types.h"
+#include "../core/io.h"
+#include "../core/heap.h"
+#include "../core/string.h"
 #include <stdarg.h>
 
 /* ---- FILE shim: in-memory only ---- */
