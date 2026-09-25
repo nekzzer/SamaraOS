@@ -28,4 +28,7 @@ uint32_t kbd_layout_epoch(void);
 void kbd_ignore_scancode(uint8_t sc);   /* drop a (broken) key's scancode */
 void kbd_unignore_all(void);
 
+/* Currently held keys, one bit per Linux key code (KEY_A = 30, ...). */
+void kbd_key_bits(uint8_t out[32]);
+
 #endif

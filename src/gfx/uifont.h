@@ -34,6 +34,14 @@ void uif_draw_center(int x, int y, int w, int h, uif_t f, const char* s, uint32_
 /* Word-wrapped paragraph; '\n' breaks lines. Returns the y after the text. */
 int  uif_draw_wrap(int x, int y, int max_w, int line_h, uif_t f, const char* s, uint32_t color);
 
+/* Render into a plain XRGB buffer (user windows). font may be UIF_MONO for
+   the 8x16 terminal face. Returns the pen x after the text. */
+#define UIF_MONO 16
+int  uif_draw_mem(uint32_t* buf, int bw, int bh, int x, int y, int font,
+                  const char* s, uint32_t color);
+int  uif_width_any(int font, const char* s);
+int  uif_height_any(int font);
+
 /* Terminal cell (8x16) from the anti-aliased mono font; falls back to the
    VGA bitmap for box drawing and control glyphs. */
 void uif_mono_cell(int x, int y, uint8_t c, uint32_t fg, uint32_t bg);

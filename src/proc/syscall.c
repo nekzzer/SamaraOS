@@ -3,6 +3,7 @@
    binaries such as busybox actually need is implemented; everything else
    answers -ENOSYS, which musl and busybox handle gracefully. */
 
+#include "gui/uwin.h"
 #include "proc/proc.h"
 #include "proc/file.h"
 #include "drivers/fbdev.h"
@@ -1277,6 +1278,7 @@ static int32_t dispatch(regs_t* r) {
             return do_poll((pollfd_t*)a, b, to);
         }
         case 158: task_yield(); return 0;
+        case SYS_SAMARA: return uwin_syscall(a, b, c, d);           /* desktop windows */
         case 162: case 267: {                                        /* nanosleep / clock_nanosleep */
             const uint32_t* ts = (const uint32_t*)(r->eax == 162 ? a : c);
             UCHK(ts, 8);

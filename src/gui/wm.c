@@ -19,6 +19,7 @@
 #include "shell/shell.h"
 
 #include "gui/theme.h"
+#include "gui/uwin.h"
 
 /* ========================================================================
    Geometry. The client-rect contract (4px sides, WM_TITLE_H+2 top, 4px
@@ -1146,6 +1147,7 @@ void wm_run(void) {
         if (!button && (moved || layout_changed)) update_hover(mx, my);
         layout_changed = false;
 
+        uwin_wm_frame();
         collect_damage(now);
         prev_mx = mx; prev_my = my;
 
@@ -1182,6 +1184,7 @@ void wm_run(void) {
         first_frame_done = true;
     }
 
+    uwin_wm_exit();
     if (terminal_idx >= 0) wm_terminal_closed();
     gfx_term_set_draw_hook(NULL);
     if (db_on) { gfx_disable_double_buffer(); db_on = false; }

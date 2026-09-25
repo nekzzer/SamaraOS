@@ -77,6 +77,7 @@ KERN_SRC := \
     src/gfx/uifont.c \
     src/gui/desktop.c \
     src/gui/wm.c \
+    src/gui/uwin.c \
     src/drivers/ata.c \
     src/drivers/ahci.c \
     src/apps/doom.c \

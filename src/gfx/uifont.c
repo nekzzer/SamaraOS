@@ -94,6 +94,65 @@ int uif_draw_wrap(int x, int y, int max_w, int line_h, uif_t f, const char* s, u
     return y;
 }
 
+static inline uint32_t mixc(uint32_t d, uint32_t s, uint32_t a) {
+    uint32_t na = 256 - a;
+    uint32_t rb = (((s & 0xFF00FF) * a + (d & 0xFF00FF) * na) >> 8) & 0xFF00FF;
+    uint32_t g  = (((s & 0x00FF00) * a + (d & 0x00FF00) * na) >> 8) & 0x00FF00;
+    return rb | g;
+}
+
+static void mask_mem(uint32_t* buf, int bw, int bh, int x, int y, int w, int h,
+                     const uint8_t* a, uint32_t c) {
+    for (int r = 0; r < h; r++) {
+        int py = y + r;
+        if ((unsigned)py >= (unsigned)bh) continue;
+        uint32_t* row = buf + py * bw;
+        for (int k = 0; k < w; k++) {
+            int px = x + k;
+            uint32_t al = a[r * w + k];
+            if (!al || (unsigned)px >= (unsigned)bw) continue;
+            row[px] = al == 255 ? c : mixc(row[px], c, al + (al >> 7));
+        }
+    }
+}
+
+int uif_draw_mem(uint32_t* buf, int bw, int bh, int x, int y, int font,
+                 const char* s, uint32_t color) {
+    if (font == UIF_MONO) {
+        for (; *s; s++, x += UIF_MONO_W) {
+            uint8_t c = (uint8_t)*s;
+            if (uif_mono_have[c]) {
+                mask_mem(buf, bw, bh, x, y, UIF_MONO_W, UIF_MONO_H,
+                         uif_mono_px + (uint32_t)c * UIF_MONO_W * UIF_MONO_H, color);
+                continue;
+            }
+            const uint8_t* g = font_glyph(c);
+            for (int r = 0; r < FONT_H; r++)
+                for (int b = 0; b < FONT_W; b++)
+                    if ((g[r] & (0x80 >> b)) && (unsigned)(x + b) < (unsigned)bw &&
+                        (unsigned)(y + r) < (unsigned)bh)
+                        buf[(y + r) * bw + x + b] = color;
+        }
+        return x;
+    }
+    const uif_face_t* fc = face((uif_t)font);
+    int pen = x << 6;
+    for (; *s; s++) {
+        const uif_glyph_t* g = glyph(fc, (uint8_t)*s);
+        if (g->w)
+            mask_mem(buf, bw, bh, ((pen + 32) >> 6) + g->x, y + g->y, g->w, g->h,
+                     fc->px + g->off, color);
+        pen += g->adv;
+    }
+    return (pen + 32) >> 6;
+}
+
+int uif_width_any(int font, const char* s) {
+    return font == UIF_MONO ? (int)strlen(s) * UIF_MONO_W : uif_width((uif_t)font, s);
+}
+
+int uif_height_any(int font) { return font == UIF_MONO ? UIF_MONO_H : uif_height((uif_t)font); }
+
 void uif_mono_cell(int x, int y, uint8_t c, uint32_t fg, uint32_t bg) {
     if (!uif_mono_have[c]) { gfx_glyph(x, y, (char)c, fg, bg, true); return; }
     gfx_rect_fill(x, y, UIF_MONO_W, UIF_MONO_H, bg);

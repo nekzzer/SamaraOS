@@ -1,3 +1,4 @@
+#include "gui/uwin.h"
 #include "proc/proc.h"
 #include "proc/file.h"
 #include "proc/tty.h"
@@ -404,6 +405,7 @@ static void free_or_zombify(proc_t* p) {
 /* Release everything of a process that is not running right now, or of the
    current one right before it switches away for good. */
 static void teardown(proc_t* p, int status) {
+    uwin_proc_exit(p->pid);
     for (int i = 0; i < MAX_FDS; i++) {
         if (p->fds[i]) { file_close(p->fds[i]); p->fds[i] = NULL; }
     }

@@ -46,6 +46,12 @@ static const unsigned char scancode_ru_upper[128] = {
 static uint8_t ignored[IGNORE_MAX];
 static int     n_ignored;
 
+static volatile uint8_t keybits[32];
+
+void kbd_key_bits(uint8_t out[32]) {
+    for (int i = 0; i < 32; i++) out[i] = keybits[i];
+}
+
 void kbd_ignore_scancode(uint8_t sc) {
     for (int i = 0; i < n_ignored; i++) if (ignored[i] == sc) return;
     if (n_ignored < IGNORE_MAX) ignored[n_ignored++] = sc;
@@ -93,6 +99,15 @@ static void kbd_isr(struct interrupt_frame* f) {
     sc &= 0x7F;
 
     if (!ext && is_ignored(sc)) { pic_send_eoi(1); return; }
+
+    /* Held-key bitmap by Linux key code, for games (see gui/uwin.c). */
+    {
+        uint16_t lk = input_linux_key(sc, ext);
+        if (lk && lk < 256) {
+            if (released) keybits[lk >> 3] &= (uint8_t)~(1u << (lk & 7));
+            else          keybits[lk >> 3] |= (uint8_t)(1u << (lk & 7));
+        }
+    }
 
     /* /dev/input owns the keyboard: raw make/break events, no characters. */
     if (input_grabbed()) {
