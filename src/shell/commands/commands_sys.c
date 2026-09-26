@@ -512,7 +512,7 @@ static void nf_info_line(int i) {
     }
     return;
   case 12:
-    nf_field("Keyboard", kbd_is_ru() ? "ru (F11 toggles)" : "en (F11 toggles)");
+    nf_field("Keyboard", kbd_is_ru() ? "ru (Alt+Shift)" : "en (Alt+Shift)");
     return;
   case 14:
   case 15:

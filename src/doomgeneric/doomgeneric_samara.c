@@ -139,17 +139,37 @@ extern const uint8_t* samara_wad_find_lump(const char* name, uint32_t* out_size)
 #define DOOM_FB_W 640
 #define DOOM_FB_H 400
 
+/* Integer-scaled into the (resizable) window, letterboxed in black:
+   maximized / F11 fullscreen gets a 2x or 3x picture. */
+static uint32_t dg_row[DOOM_FB_W * 3];
+
 void DG_DrawFrame(void) {
     if (!g_doom_win || !DG_ScreenBuffer) return;
     int cx, cy, cw, ch;
     wm_client_rect(g_doom_win, &cx, &cy, &cw, &ch);
 
-    int dx0 = cx + (cw > DOOM_FB_W ? (cw - DOOM_FB_W) / 2 : 0);
-    int dy0 = cy + (ch > DOOM_FB_H ? (ch - DOOM_FB_H) / 2 : 0);
+    int s = cw / DOOM_FB_W, t = ch / DOOM_FB_H;
+    if (t < s) s = t;
+    if (s > 3) s = 3;
+    if (s < 1) s = 1;
+    int iw = DOOM_FB_W * s, ih = DOOM_FB_H * s;
+    int dx0 = cx + (cw > iw ? (cw - iw) / 2 : 0);
+    int dy0 = cy + (ch > ih ? (ch - ih) / 2 : 0);
+
+    if (dy0 > cy)           gfx_rect_fill(cx, cy, cw, dy0 - cy, 0);
+    if (dy0 + ih < cy + ch) gfx_rect_fill(cx, dy0 + ih, cw, cy + ch - dy0 - ih, 0);
+    if (dx0 > cx)           gfx_rect_fill(cx, dy0, dx0 - cx, ih, 0);
+    if (dx0 + iw < cx + cw) gfx_rect_fill(dx0 + iw, dy0, cx + cw - dx0 - iw, ih, 0);
 
     /* cmap_to_fb wrote rgba8888 in the layout R=offset16 G=8 B=0 — same as our
        RGB() macro, so a row-wise memcpy via gfx_blit_argb is correct. */
-    gfx_blit_argb(dx0, dy0, DOOM_FB_W, DOOM_FB_H, DG_ScreenBuffer);
+    if (s == 1) { gfx_blit_argb(dx0, dy0, DOOM_FB_W, DOOM_FB_H, DG_ScreenBuffer); return; }
+    for (int y = 0; y < DOOM_FB_H; y++) {
+        const uint32_t* src = (const uint32_t*)DG_ScreenBuffer + y * DOOM_FB_W;
+        for (int x = 0; x < DOOM_FB_W; x++)
+            for (int k = 0; k < s; k++) dg_row[x * s + k] = src[x];
+        for (int k = 0; k < s; k++) gfx_blit_argb(dx0, dy0 + y * s + k, iw, 1, dg_row);
+    }
 }
 
 /* ---------- WM window glue ---------- */
@@ -235,6 +255,10 @@ int samara_doom_launch(void) {
     g_doom_initialized = 0;
     g_doom_win = wm_open_app(20, 30, DOOMGENERIC_RESX + 4, DOOMGENERIC_RESY + 28,
                              "DOOM", doom_paint, doom_key, 0);
+    if (g_doom_win) {
+        g_doom_win->min_w = g_doom_win->w;              /* shrinking would crop */
+        g_doom_win->min_h = g_doom_win->h;
+    }
     if (!g_doom_win) {
         const char* m = "doom: no WM slot";
         for (int i = 0; m[i]; i++) g_status[i] = m[i];

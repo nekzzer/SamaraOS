@@ -45,7 +45,7 @@ static fs_node_t* proc_root;
 
 static fs_node_t* ensure(fs_node_t* dir, const char* name, fs_type_t type, uint16_t mode) {
     fs_node_t* n = fs_child(dir, name);
-    if (n && n->type != type) { fs_detach(n); if (n->refs > 0) n->unlinked = true; else { if (n->data) kfree(n->data); kfree(n); } n = NULL; }
+    if (n && n->type != type) { fs_detach(n); if (n->refs > 0) n->unlinked = true; else { fs_data_free(n); kfree(n); } n = NULL; }
     if (!n) {
         n = fs_create(dir, name, type);
         if (!n) return NULL;
@@ -65,7 +65,7 @@ static void remove_tree(fs_node_t* n) {
     while (n->child) remove_tree(n->child);
     fs_detach(n);
     if (n->refs > 0) { n->unlinked = true; return; }
-    if (n->data) kfree(n->data);
+    fs_data_free(n);
     kfree(n);
 }
 

@@ -911,6 +911,26 @@ static int do_fetch(const char* url) {
     return n;
 }
 
+
+/* The parsed document stays in resp_buf (CP866 already), so a window
+   resize can re-flow it at the new width without refetching. */
+static int laid_off, laid_len, laid_w;
+static uint32_t relayout_since;
+
+/* Derive view_w from the live window size — content_rect is only valid
+   once br_paint has run at least once, and the first navigate happens
+   during browser_open before any paint. */
+static int live_view_w(void) {
+    int view_w = 800;
+    if (g_browser_win) {
+        int cx, cy, cw, ch;
+        wm_client_rect(g_browser_win, &cx, &cy, &cw, &ch);
+        view_w = cw - 8 - 24 - 14;     /* scrollbar + margins */
+    }
+    if (view_w < 240) view_w = 240;
+    return view_w;
+}
+
 static void browser_navigate(const char* url, bool push_history) {
     if (!url || !*url) return;
     if (push_history && cur_url[0]) {
@@ -928,7 +948,7 @@ static void browser_navigate(const char* url, bool push_history) {
     edit_cur = edit_len;
 
     int n = do_fetch(url);
-    if (n <= 0) { n_runs = 0; n_links = 0; doc_height = 0; scroll_y = 0; return; }
+    if (n <= 0) { n_runs = 0; n_links = 0; doc_height = 0; scroll_y = 0; laid_len = 0; return; }
 
     /* Find the body (skip headers up to \r\n\r\n) */
     int body_off = 0;
@@ -954,21 +974,15 @@ static void browser_navigate(const char* url, bool push_history) {
         }
     }
 
-    /* Derive view_w from the live window size — content_rect is only valid
-       once br_paint has run at least once, and the first navigate happens
-       during browser_open before any paint. */
-    int view_w = 800;
-    if (g_browser_win) {
-        int cx, cy, cw, ch;
-        wm_client_rect(g_browser_win, &cx, &cy, &cw, &ch);
-        view_w = cw - 8 - 24 - 14;     /* scrollbar + margins */
-    }
-    if (view_w < 240) view_w = 240;
-
+    int view_w = live_view_w();
     char page_title[96];
     parse_html((const char*)(resp_buf + body_off), body_len, view_w,
                page_title, sizeof(page_title));
     scroll_y = 0;
+    laid_off = body_off;
+    laid_len = body_len;
+    laid_w = view_w;
+    relayout_since = 0;
 
     if (g_browser_win) {
         const char* base = "Browser - ";
@@ -1153,7 +1167,35 @@ static void br_paint(window_t* w) {
     draw_chrome(w);
 }
 
+static void clamp_scroll(window_t* w);
+
+/* Re-flow once the width has been stable for a moment (not on every
+   pixel of a drag), keeping the reading position proportionally. */
+static void relayout_if_resized(window_t* w, uint32_t now) {
+    if (laid_len <= 0) return;
+    int vw = live_view_w();
+    if (vw == laid_w) { relayout_since = 0; return; }
+    if (!relayout_since) { relayout_since = now | 1; return; }
+    if (now - relayout_since < 150) return;
+    int old_h = doc_height;
+    char title[96];
+    parse_html((const char*)(resp_buf + laid_off), laid_len, vw, title, sizeof(title));
+    if (old_h > 0) scroll_y = (int)((int64_t)scroll_y * doc_height / old_h);
+    laid_w = vw;
+    relayout_since = 0;
+    hover_link = -1;
+    clamp_scroll(w);
+    w->needs_repaint = true;
+}
+
+static void br_scroll(window_t* w, int dz) {
+    scroll_y += dz * SCROLL_STEP * 3;
+    clamp_scroll(w);
+    w->needs_repaint = true;
+}
+
 static void br_tick(window_t* w, uint32_t now) {
+    relayout_if_resized(w, now);
     if (url_focused && (now / 500) != (blink_ms / 500)) {
         w->needs_repaint = true;
     }
@@ -1358,6 +1400,9 @@ int browser_open(const char* url) {
     if (!g_browser_win) return -1;
     g_browser_win->on_release = br_release;
     g_browser_win->on_close   = br_close;
+    g_browser_win->on_scroll  = br_scroll;
+    g_browser_win->min_w = 480;
+    g_browser_win->min_h = 240;
 
     set_status("ready - type http://host:8080/ then Enter (or click Home)", NULL);
     /* prefill URL bar with the default home so user just hits Enter */

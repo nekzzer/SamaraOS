@@ -10,8 +10,10 @@
 static volatile int mx = 320, my = 200;
 static volatile int mxmax = 80 * 8 - 1, mymax = 25 * 16 - 1;
 static volatile uint8_t btn = 0;
-static volatile uint8_t pkt[3];
+static volatile uint8_t pkt[4];
 static volatile int pkt_idx = 0;
+static int pkt_len = 3;                  /* 4 with an IntelliMouse wheel */
+static volatile int wheel_acc;           /* notches, > 0 = towards the user */
 
 static volatile uint16_t saved_cell = 0;
 static volatile int saved_x = -1, saved_y = -1;
@@ -60,6 +62,29 @@ static void mouse_cmd(uint8_t cmd) {
     mouse_wait_read();  inb(0x60);   /* ACK */
 }
 
+static void mouse_cmd_arg(uint8_t cmd, uint8_t arg) {
+    mouse_cmd(cmd);
+    mouse_cmd(arg);
+}
+
+/* Returns the device ID (0 = plain PS/2, 3 = wheel, 4 = 5-button). */
+static uint8_t mouse_get_id(void) {
+    mouse_cmd(0xF2);
+    mouse_wait_read();
+    return inb(0x60);
+}
+
+int mouse_wheel_take(void) {
+    uint32_t f;
+    __asm__ volatile ("pushf; pop %0; cli" : "=r"(f) :: "memory");
+    int v = wheel_acc;
+    wheel_acc = 0;
+    if (f & 0x200) __asm__ volatile ("sti" ::: "memory");
+    return v;
+}
+
+bool mouse_has_wheel(void) { return pkt_len == 4; }
+
 void mouse_hide_cursor(void) {
     if (cursor_visible && saved_x >= 0) {
         vga_set_cell(saved_x, saved_y, saved_cell);
@@ -103,8 +128,14 @@ static void mouse_isr(struct interrupt_frame* f) {
     if (pkt_idx == 0 && !(v & 0x08)) { pic_send_eoi(12); return; } /* sync */
 
     pkt[pkt_idx++] = v;
-    if (pkt_idx < 3) { pic_send_eoi(12); return; }
+    if (pkt_idx < pkt_len) { pic_send_eoi(12); return; }
     pkt_idx = 0;
+
+    int dz = 0;
+    if (pkt_len == 4) {
+        dz = (int8_t)pkt[3];
+        if (dz > 7 || dz < -8) dz = 0;           /* not a wheel byte: resync noise */
+    }
 
     uint8_t flags = pkt[0];
     int dx = pkt[1];
@@ -117,6 +148,7 @@ static void mouse_isr(struct interrupt_frame* f) {
     if (input_grabbed()) {
         if (dx) input_push(IEV_REL, IEV_REL_X, dx);
         if (dy) input_push(IEV_REL, IEV_REL_Y, -dy);
+        if (dz) input_push(IEV_REL, IEV_REL_WHEEL, -dz);   /* evdev: + = up */
         for (int i = 0; i < 3; i++)
             if ((newbtn ^ btn) & (1 << i))
                 input_push(IEV_KEY, (uint16_t)(0x110 + i), (newbtn >> i) & 1);
@@ -125,6 +157,7 @@ static void mouse_isr(struct interrupt_frame* f) {
         return;
     }
     btn = newbtn;
+    wheel_acc += dz;
     mx += dx;
     my -= dy;          /* invert Y to screen coords */
 
@@ -146,8 +179,14 @@ void mouse_init(void) {
     status &= ~0x20;
     mouse_wait_write(); outb(0x64, 0x60);
     mouse_wait_write(); outb(0x60, status);
-    /* defaults + enable streaming */
+    /* defaults, then the IntelliMouse knock (sample rate 200, 100, 80):
+       a wheel mouse answers with ID 3 and sends 4-byte packets. */
     mouse_cmd(0xF6);
+    mouse_cmd_arg(0xF3, 200);
+    mouse_cmd_arg(0xF3, 100);
+    mouse_cmd_arg(0xF3, 80);
+    pkt_len = mouse_get_id() == 3 ? 4 : 3;
+    mouse_cmd_arg(0xF3, 100);
     mouse_cmd(0xF4);
 
     idt_set_gate(0x2C, mouse_isr, 0x08, 0x8E);

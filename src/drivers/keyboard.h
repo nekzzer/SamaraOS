@@ -25,6 +25,9 @@ void kbd_set_ru(bool ru);
 /* Monotonically increases on every RU/EN toggle — callers (the WM) sample
    this each frame to know they should redraw the layout indicator. */
 uint32_t kbd_layout_epoch(void);
+/* F11 presses since the last call (the WM's fullscreen toggle). */
+int  kbd_f11_take(void);
+bool kbd_ctrl_held(void);             /* Ctrl is down (font size keys) */
 void kbd_ignore_scancode(uint8_t sc);   /* drop a (broken) key's scancode */
 void kbd_unignore_all(void);
 

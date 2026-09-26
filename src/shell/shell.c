@@ -1,6 +1,10 @@
 #include "shell.h"
 #include "commands.h"
 #include "shell_priv.h"
+#include "complete.h"
+#include "drivers/mouse.h"
+#include "gui/desktop.h"
+#include "proc/tty.h"
 
 #include "core/heap.h"
 #include "core/string.h"
@@ -41,17 +45,77 @@ static void hist_push(const char *line) {
     hist_count++;
 }
 
+/* ---- colour gradients (true colour in the desktop terminal, nearest of
+   the 16 VGA colours on the text screen) ---- */
+
+static uint32_t mix_rgb(uint32_t a, uint32_t b, int t, int n) {   /* t/n of the way a->b */
+  if (n <= 0)
+    return a;
+  uint32_t r = 0;
+  for (int sh = 0; sh <= 16; sh += 8) {
+    int ca = (int)((a >> sh) & 255), cb = (int)((b >> sh) & 255);
+    r |= (uint32_t)(ca + (cb - ca) * t / n) << sh;
+  }
+  return r;
+}
+
+/* colour of position i of n along stops[0..k-1] */
+static uint32_t grad_at(const uint32_t *stops, int k, int i, int n) {
+  if (n <= 1 || k == 1)
+    return stops[0];
+  int span = (n - 1) * (k - 1);
+  int pos = i * (k - 1) * 1000 / (n - 1);                /* 0..(k-1)*1000 */
+  int seg = pos / 1000;
+  if (seg >= k - 1)
+    return stops[k - 1];
+  (void)span;
+  return mix_rgb(stops[seg], stops[seg + 1], pos % 1000, 1000);
+}
+
+static uint32_t term_bg(void) { return gfx_term_color(0); }
+
+static void grad_puts(const char *s, const uint32_t *stops, int k) {
+  int n = (int)strlen(s);
+  for (int i = 0; i < n; i++) {
+    vga_set_rgb(grad_at(stops, k, i, n), term_bg());
+    vga_putc(s[i]);
+  }
+  vga_set_color(VGA_LGREY, VGA_BLACK);
+}
+
+static const uint32_t G_SUNSET[] = {0xFF6A88, 0xFF9A5A, 0xFFD36E};   /* pink -> orange -> gold */
+static const uint32_t G_SEA[] = {0x6EE7D2, 0x8FB8F0, 0xB79CF2};      /* aqua -> sky -> lavender */
+
+/* Block-letter "SAMARA OS" (CP866 half blocks), a horizontal gradient. */
+static void banner(void) {
+  static const char *const logo[] = {
+      "\xdc\xdf\xdf\xdf \xdc\xdf\xdf\xdc \xdb\xdc \xdc\xdb \xdc\xdf\xdf\xdc \xdb\xdf\xdf\xdc \xdc\xdf\xdf\xdc    \xdc\xdf\xdf\xdc \xdc\xdf\xdf\xdf",
+      " \xdf\xdf\xdc \xdb\xdf\xdf\xdb \xdb \xdf \xdb \xdb\xdf\xdf\xdb \xdb\xdf\xdb  \xdb\xdf\xdf\xdb    \xdb  \xdb  \xdf\xdf\xdc",
+      "\xdf\xdf\xdf  \xdf  \xdf \xdf   \xdf \xdf  \xdf \xdf  \xdf \xdf  \xdf     \xdf\xdf  \xdf\xdf\xdf",
+  };
+  static const uint32_t stops[] = {0xFF5E8A, 0xFF8A5B, 0xFFC857, 0x9BE38B, 0x5CC8F0};
+  const int w = 44;
+  for (int r = 0; r < 3; r++) {
+    vga_putc(' ');
+    for (int i = 0; logo[r][i]; i++) {
+      vga_set_rgb(grad_at(stops, 5, i, w), term_bg());
+      vga_putc(logo[r][i]);
+    }
+    vga_putc('\n');
+  }
+  vga_set_color(VGA_LGREY, VGA_BLACK);
+}
+
 static void prompt(void) {
   char path[256];
   fs_path(cwd, path, sizeof(path));
-  vga_set_color(VGA_LGREEN, VGA_BLACK);
-  vga_puts("user@samara");
-  vga_set_color(VGA_LGREY, VGA_BLACK);
+  grad_puts("user@samara", G_SUNSET, 3);
+  vga_set_color(VGA_DGREY, VGA_BLACK);
   vga_putc(':');
-  vga_set_color(VGA_LBLUE, VGA_BLACK);
-  vga_puts(path);
-  vga_set_color(VGA_LGREY, VGA_BLACK);
+  grad_puts(path, G_SEA, 3);
+  vga_set_rgb(0xFFD36E, term_bg());
   vga_puts("$ ");
+  vga_set_color(VGA_LGREY, VGA_BLACK);
 }
 
 static void redraw_tail(char *buf, int len, int cur, int prompt_x,
@@ -63,6 +127,37 @@ static void redraw_tail(char *buf, int len, int cur, int prompt_x,
   vga_set_cursor(prompt_x + cur, prompt_y);
 }
 
+static bool font_key(char c) {
+  return kbd_ctrl_held() && (c == '=' || c == '+' || c == '-');
+}
+
+/* Next key for the console shell. Meanwhile the wheel moves through the
+   scrollback and Ctrl +/- change the font size (the grid is rebuilt, *py
+   follows the prompt line). */
+static char console_getc(int *py) {
+  for (;;) {
+    if (kbd_has_key()) {
+      char c = kbd_trygetc();
+      if (vga_is_gfx() && console_is_gfx() && font_key(c)) {
+        *py -= console_font_step(c == '-' ? -1 : 1);
+        if (*py < 0)
+          *py = 0;
+        continue;
+      }
+      if (gfx_term_scrolled())
+        gfx_term_view_scroll(-(1 << 20));
+      return c;
+    }
+    int dz = mouse_wheel_take();
+    if (dz && vga_is_gfx())
+      gfx_term_view_scroll(-dz * 3);
+    extern volatile int cpu_idle;
+    cpu_idle = 1;
+    __asm__ volatile("sti; hlt");
+    cpu_idle = 0;
+  }
+}
+
 static void readline(char *buf, int cap) {
   int len = 0, cur = 0;
   int hist_idx = 0;
@@ -71,7 +166,28 @@ static void readline(char *buf, int cap) {
   buf[0] = 0;
 
   while (1) {
-    char c = kbd_getc();
+    char c = console_getc(&prompt_y);
+
+    if (c == '\t') {
+      int from;
+      int r = shell_complete(buf, &len, &cur, cap, &from);
+      if (r == SC_EDIT) {
+        vga_set_cursor(prompt_x + from, prompt_y);
+        for (int i = from; i < len; i++)
+          vga_putc(buf[i]);
+        vga_set_cursor(prompt_x + cur, prompt_y);
+      } else if (r == SC_LIST) {
+        vga_set_cursor(prompt_x + len, prompt_y);
+        vga_putc('\n');
+        shell_complete_print_list();
+        prompt();
+        vga_get_cursor(&prompt_x, &prompt_y);
+        vga_puts(buf);
+        vga_set_cursor(prompt_x + cur, prompt_y);
+      }
+      continue;
+    }
+    shell_complete_reset();
 
     if (c == '\n') {
       buf[len] = 0;
@@ -246,25 +362,74 @@ static void term_show_prompt(void) {
 
 void wm_terminal_init(window_t *w) {
   vga_use_gfx_term(w->term_x, w->term_y);
+  gfx_term_show_cursor(false);        /* the desktop draws its own caret */
   vga_clear();
-  vga_set_color(VGA_LCYAN, VGA_BLACK);
-  vga_puts("SamaraOS Terminal\n");
+  vga_putc('\n');
+  banner();
   vga_set_color(VGA_DGREY, VGA_BLACK);
-  vga_puts("'help' for commands. 'exit' or X closes this window. Esc exits "
-           "desktop.\n\n");
+  vga_puts("\n 'help' for commands  \xfa  Tab completes  \xfa  wheel scrolls back  \xfa  F11 fullscreen\n\n");
   vga_set_color(VGA_LGREY, VGA_BLACK);
   g_in_wm_terminal = true;
   g_current_term_window = w;
   term_show_prompt();
 }
 
+/* The window's grid changed size: follow the prompt if the content moved
+   up, and tell the foreground program (SIGWINCH). */
+void wm_terminal_resized(window_t *w, int cols, int rows) {
+  (void)w;
+  if (cols > TERM_MAX_COLS)
+    cols = TERM_MAX_COLS;
+  if (rows > TERM_MAX_ROWS)
+    rows = TERM_MAX_ROWS;
+  if (cols == gfx_term_cols() && rows == gfx_term_rows())
+    return;
+  int shift = gfx_term_resize(cols, rows);
+  term_prompt_y -= shift;
+  if (term_prompt_y < 0)
+    term_prompt_y = 0;
+  tty_resized();
+}
+
+/* Mouse wheel over the terminal: full-screen programs (nano, less, vi)
+   get scroll keys, otherwise move through the scrollback. */
+void wm_terminal_wheel(window_t *w, int dz) {
+  (void)w;
+  if (shell_fg_running() && !gfx_term_scrolled() && tty_wheel(dz))
+    return;
+  gfx_term_view_scroll(-dz * 3);
+}
+
 void wm_terminal_handle_key(window_t *w, char c) {
   g_current_term_window = w;
+  if (gfx_term_scrolled())
+    gfx_term_view_scroll(-(1 << 20));   /* typing returns to the live screen */
 
   if (shell_fg_running()) {         /* keys belong to the running program */
     shell_fg_key(c);
     return;
   }
+
+  if (c == '\t') {
+    int from;
+    int r = shell_complete(term_buf, &term_len, &term_cur, LINE_MAX, &from);
+    if (r == SC_EDIT) {
+      vga_set_cursor(term_prompt_x + from, term_prompt_y);
+      for (int i = from; i < term_len; i++)
+        vga_putc(term_buf[i]);
+      vga_set_cursor(term_prompt_x + term_cur, term_prompt_y);
+    } else if (r == SC_LIST) {
+      vga_set_cursor(term_prompt_x + term_len, term_prompt_y);
+      vga_putc('\n');
+      shell_complete_print_list();
+      prompt();
+      vga_get_cursor(&term_prompt_x, &term_prompt_y);
+      vga_puts(term_buf);
+      vga_set_cursor(term_prompt_x + term_cur, term_prompt_y);
+    }
+    return;
+  }
+  shell_complete_reset();
 
   if (c == '\n') {
     term_buf[term_len] = 0;
@@ -539,9 +704,27 @@ static cmd_t cmds[] = {{"help", cmd_help},
                        {"kbdignore", cmd_kbdignore},
                        {NULL, NULL}};
 
+const char *shell_builtin_name(int i) {
+  return i >= 0 && i < (int)(sizeof(cmds) / sizeof(cmds[0])) ? cmds[i].name : NULL;
+}
+
 static void execute(char *line) {
   char *argv[16];
   int argc = split(line, argv, 16);
+  if (!argc)
+    return;
+  /* trailing `&` (or `prog&`): run the program in the background */
+  bool bg = false;
+  if (!strcmp(argv[argc - 1], "&")) {
+    bg = true;
+    argv[--argc] = NULL;
+  } else {
+    size_t n = strlen(argv[argc - 1]);
+    if (n > 1 && argv[argc - 1][n - 1] == '&') {
+      bg = true;
+      argv[argc - 1][n - 1] = 0;
+    }
+  }
   if (!argc)
     return;
   procfs_refresh();                 /* builtins like `cat /proc/meminfo` */
@@ -554,7 +737,13 @@ static void execute(char *line) {
   /* Not a builtin: try a ring-3 program from /bin, /usr/bin, ... */
   char path[128];
   if (shell_find_program(argv[0], path, sizeof(path))) {
-    shell_exec_program(path, argc, argv);
+    if (bg) {
+      int pid = shell_spawn_background(path, argc, argv);
+      if (pid > 0)
+        vga_printf("[%d] %s\n", pid, argv[0]);
+    } else {
+      shell_exec_program(path, argc, argv);
+    }
     return;
   }
   vga_puts(argv[0]);
@@ -573,8 +762,10 @@ void shell_run(void) {
   if (!cwd)
     cwd = fs_root();
 
-  vga_set_color(VGA_LCYAN, VGA_BLACK);
-  vga_puts("\nSamaraOS shell. Type 'help' or 'desktop'.\n\n");
+  vga_putc('\n');
+  banner();
+  vga_set_color(VGA_DGREY, VGA_BLACK);
+  vga_puts("\n Type 'help' or 'desktop'.\n\n");
   vga_set_color(VGA_LGREY, VGA_BLACK);
 
   char line[LINE_MAX];

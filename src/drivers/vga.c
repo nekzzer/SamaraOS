@@ -2,6 +2,7 @@
 #include "core/io.h"
 #include "core/string.h"
 #include "gfx/gfx_term.h"
+#include "gfx/termfont.h"
 #include <stdarg.h>
 
 static volatile uint16_t* const VRAM = (uint16_t*)0xB8000;
@@ -85,6 +86,42 @@ void vga_set_color(uint8_t fg, uint8_t bg) {
     else text_set_color(fg, bg);
 }
 
+/* True colour where the console can show it (the desktop terminal); the
+   VGA text screen gets the nearest of its 16 colours. */
+void vga_set_rgb(uint32_t fg, uint32_t bg) {
+    if (mode == CM_GFX) { gfx_term_set_rgb(fg, bg); return; }
+    static const uint32_t pal[16] = {
+        0x000000, 0x0000AA, 0x00AA00, 0x00AAAA, 0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
+        0x555555, 0x5555FF, 0x55FF55, 0x55FFFF, 0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF };
+    uint8_t best[2];
+    uint32_t want[2] = { fg, bg };
+    for (int k = 0; k < 2; k++) {
+        int bi = 0; uint32_t bd = 0xFFFFFFFF;
+        for (int i = 0; i < 16; i++) {
+            int dr = (int)((want[k] >> 16) & 255) - (int)((pal[i] >> 16) & 255);
+            int dg = (int)((want[k] >> 8) & 255) - (int)((pal[i] >> 8) & 255);
+            int db = (int)(want[k] & 255) - (int)(pal[i] & 255);
+            uint32_t d = (uint32_t)(dr * dr * 3 + dg * dg * 4 + db * db * 2);
+            if (d < bd) { bd = d; bi = i; }
+        }
+        best[k] = (uint8_t)bi;
+    }
+    text_set_color(best[0], best[1]);
+}
+
+/* Unicode output: the graphical console shows it as is, the VGA text
+   screen gets the CP866 equivalent (or '?'). */
+void vga_putu(uint32_t cp) {
+    if (mode == CM_GFX) { gfx_term_putu(cp); return; }
+    int c = cp < 0x80 ? (int)cp : uni_to_cp866(cp);
+    text_putc((char)(c < 0 ? '?' : c));
+}
+
+void vga_set_attr(uint8_t at)       { if (mode == CM_GFX) gfx_term_set_attr(at); }
+void vga_alt_screen(bool on)        { if (mode == CM_GFX) gfx_term_alt(on); }
+void vga_cursor_visible(bool on)    { if (mode == CM_GFX) gfx_term_cursor_visible(on); }
+bool vga_is_gfx(void)               { return mode == CM_GFX; }
+
 void vga_clear(void) {
     if (mode == CM_GFX) gfx_term_clear();
     else text_clear();
@@ -125,10 +162,10 @@ void vga_set_cell(int x, int y, uint16_t c) {
 /* Blank [x0, x1) on row y in the current colour without moving the cursor
    (ANSI erase-in-line/display). */
 void vga_erase(int x0, int y, int x1) {
+    if (mode == CM_GFX) { gfx_term_erase(x0, y, x1); return; }
     if (x0 < 0) x0 = 0;
     if (x1 > VGA_WIDTH) x1 = VGA_WIDTH;
     if (y < 0 || y >= VGA_HEIGHT || x0 >= x1) return;
-    if (mode == CM_GFX) { gfx_term_erase(x0, y, x1); return; }
     for (int x = x0; x < x1; x++) VRAM[y * VGA_WIDTH + x] = cell(' ', cur_color);
 }
 
@@ -174,6 +211,9 @@ void vga_init(void) {
     text_set_color(VGA_LGREY, VGA_BLACK);
     text_clear();
 }
+
+int vga_cols(void) { return mode == CM_GFX ? gfx_term_cols() : VGA_WIDTH; }
+int vga_rows(void) { return mode == CM_GFX ? gfx_term_rows() : VGA_HEIGHT; }
 
 void vga_use_text(void)               { mode = CM_TEXT; }
 void vga_use_gfx_term(int px, int py) { gfx_term_init(px, py); mode = CM_GFX; }

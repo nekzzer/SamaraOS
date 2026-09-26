@@ -188,7 +188,7 @@ static int load_entry(vol_t* v, fs_node_t* dir, const char* name, const uint8_t*
         uint32_t len;
         uint8_t* d = read_chain(v, first, size, &len);
         if (!d) return -ENOMEM;
-        n->data = (char*)kmalloc(size + 1);
+        n->data = (char*)kmalloc_big(size + 1);
         if (!n->data) { kfree(d); return -ENOMEM; }
         memcpy(n->data, d, size < len ? size : len);
         kfree(d);
@@ -629,7 +629,7 @@ static void free_tree(fs_node_t* n) {
         free_tree(c);
         fs_detach(c);
         if (c->refs > 0) c->unlinked = true;
-        else { if (c->data) kfree(c->data); kfree(c); }
+        else { fs_data_free(c); kfree(c); }
     }
 }
 

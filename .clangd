@@ -1,0 +1,10 @@
+# clangd: flags come from compile_commands.json (make compile_commands.json)
+Diagnostics:
+  UnusedIncludes: None
+  MissingIncludes: None
+---
+# third-party code: don't flood the problems list
+If:
+  PathMatch: (doomgeneric-master|quakegeneric-master|toolchain)/.*
+Diagnostics:
+  Suppress: "*"

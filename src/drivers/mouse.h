@@ -10,5 +10,9 @@ void mouse_set_text_cursor(bool enabled);
 void mouse_set_range(int max_x, int max_y);
 void mouse_get_range(int* max_x, int* max_y);
 void mouse_set_pos(int x, int y);
+/* Wheel notches since the last call (> 0 = rolled towards the user, i.e.
+   scroll down), then resets. 0 without an IntelliMouse wheel. */
+int  mouse_wheel_take(void);
+bool mouse_has_wheel(void);
 
 #endif

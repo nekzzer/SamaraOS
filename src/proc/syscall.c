@@ -5,6 +5,7 @@
 
 #include "gui/uwin.h"
 #include "proc/proc.h"
+#include "proc/pty.h"
 #include "proc/file.h"
 #include "drivers/fbdev.h"
 #include "proc/tty.h"
@@ -65,6 +66,7 @@
 #define S_IFREG  0100000
 
 bool g_strace;                          /* `strace on` in the kernel shell */
+int  g_strace_pid;                      /* only this pid ("strace=N" on the cmdline), 0 = all */
 
 /* ---------------- serial ---------------- */
 
@@ -184,7 +186,7 @@ static void fill_stat_node(kstat64_t* st, fs_node_t* n) {
     st->st_dev = vol ? (8u << 8) | (uint32_t)vol : 1;            /* distinct per volume (df) */
     st->st_ino = st->st_ino32 = ((uint32_t)n >> 4) & 0x0FFFFFFF;
     st->st_nlink = n->type == FS_DIR ? 2 : 1;
-    if (n->dev >= FS_DEV_DISK) {
+    if (FS_DEV_IS_DISK(n->dev)) {
         int idx = n->dev - FS_DEV_DISK;
         st->st_mode = 0060000 | (n->mode & 07777);            /* S_IFBLK */
         st->st_rdev = idx >= DISK_AHCI_BASE ? ((8u << 8) | (uint32_t)(idx - DISK_AHCI_BASE) * 16)
@@ -192,7 +194,10 @@ static void fill_stat_node(kstat64_t* st, fs_node_t* n) {
         st->st_size = (int64_t)ata_drive_sectors(idx) * 512;
     } else if (n->dev) {
         st->st_mode = S_IFCHR | (n->mode & 07777);
-        st->st_rdev = n->dev == FS_DEV_TTY ? (5u << 8) : ((1u << 8) | n->dev);
+        st->st_rdev = n->dev == FS_DEV_TTY  ? (5u << 8) :
+                      n->dev == FS_DEV_PTMX ? ((5u << 8) | 2) :
+                      FS_DEV_IS_PTS(n->dev) ? ((136u << 8) | (uint32_t)(n->dev - FS_DEV_PTS)) :
+                                              ((1u << 8) | n->dev);
     } else if (n->type == FS_DIR) {
         st->st_mode = S_IFDIR | (n->mode & 07777);
         st->st_size = 4096;
@@ -207,6 +212,10 @@ static void fill_stat_node(kstat64_t* st, fs_node_t* n) {
 
 static void fill_stat_file(kstat64_t* st, file_t* f) {
     if (f->type == F_NODE) { fill_stat_node(st, f->node); return; }
+    /* a pty is the same file as its /dev node (ttyname compares st_ino) */
+    fs_node_t* dn = f->type == F_PTS ? pty_node(f->pty) :
+                    f->type == F_PTM ? fs_resolve(fs_root(), "/dev/ptmx") : NULL;
+    if (dn) { fill_stat_node(st, dn); return; }
     memset(st, 0, sizeof(*st));
     st->st_dev = 1;
     st->st_ino = st->st_ino32 = ((uint32_t)f >> 4) & 0x0FFFFFFF;
@@ -216,6 +225,50 @@ static void fill_stat_file(kstat64_t* st, file_t* f) {
     else if (f->type == F_SOCKET) st->st_mode = 0140000 | 0777;          /* S_IFSOCK */
     else { st->st_mode = S_IFCHR | 0666; st->st_rdev = f->type == F_TTY ? (5u << 8) : (1u << 8) | 3; }
     st->st_atime = st->st_mtime = st->st_ctime = clock_epoch();
+}
+
+/* readlink: the ramfs has no symlinks, but /proc/self/fd/N names what an
+   fd refers to (musl's ttyname() relies on it; ssh servers use ttyname). */
+static int do_readlink(const char* path, char* buf, uint32_t n) {
+    UCHK(path, 1);
+    UCHK(buf, n);
+    const char* p = path;
+    if (strncmp(p, "/proc/", 6)) return -EINVAL;
+    p += 6;
+    if (!strncmp(p, "self/", 5)) p += 5;
+    else {
+        int pid = 0;
+        while (*p >= '0' && *p <= '9') pid = pid * 10 + (*p++ - '0');
+        if (*p++ != '/' || pid != me()->pid) return -EINVAL;
+    }
+    if (strncmp(p, "fd/", 3)) return -EINVAL;
+    p += 3;
+    int fd = 0;
+    if (*p < '0' || *p > '9') return -ENOENT;
+    while (*p >= '0' && *p <= '9') fd = fd * 10 + (*p++ - '0');
+    if (*p) return -ENOENT;
+    file_t* f = getf(fd);
+    if (!f) return -ENOENT;
+    char out[160];
+    switch (f->type) {
+        case F_NODE: fs_path(f->node, out, sizeof(out)); break;
+        case F_PTS: {
+            fs_node_t* dn = pty_node(f->pty);
+            if (dn) fs_path(dn, out, sizeof(out)); else strcpy(out, "/dev/pts/?");
+            break;
+        }
+        case F_PTM:  strcpy(out, "/dev/ptmx"); break;
+        case F_TTY:  strcpy(out, "/dev/tty"); break;
+        case F_NULL: strcpy(out, "/dev/null"); break;
+        case F_ZERO: strcpy(out, "/dev/zero"); break;
+        case F_RANDOM: strcpy(out, "/dev/urandom"); break;
+        case F_SOCKET: strcpy(out, "socket:[1]"); break;
+        default:     strcpy(out, "pipe:[1]"); break;
+    }
+    uint32_t l = strlen(out);
+    if (l > n) l = n;
+    memcpy(buf, out, l);
+    return (int)l;
 }
 
 /* ---------------- file syscalls ---------------- */
@@ -352,7 +405,7 @@ static int do_unlink(int dirfd, const char* path, int flags) {
     if (!parent) return -EBUSY;
     fs_detach(n);
     if (n->refs > 0) n->unlinked = true;
-    else { if (n->data) kfree(n->data); kfree(n); }
+    else { fs_data_free(n); kfree(n); }
     return 0;
 }
 
@@ -470,6 +523,7 @@ static int do_ioctl(int fd, uint32_t req, uint32_t arg) {
         else if (f->type == F_NODE && f->node->type == FS_FILE && f->off < f->node->size)
             n = (int)(f->node->size - f->off);
         else if (f->type == F_TTY) n = tty_readable() ? 1 : 0;
+        else if (f->type == F_PTM || f->type == F_PTS) n = pty_pending(f->pty, f->type == F_PTM);
         *(int*)arg = n;
         return 0;
     }
@@ -499,6 +553,7 @@ static int do_ioctl(int fd, uint32_t req, uint32_t arg) {
         if (req == 0x1268) { UCHK((void*)arg, 4); *(int*)arg = 512; return 0; }   /* BLKSSZGET */
         return -ENOTTY;
     }
+    if (f->type == F_PTM || f->type == F_PTS) return pty_ioctl(f->pty, f->type == F_PTM, req, arg);
     if (f->type != F_TTY) return -ENOTTY;
     switch (req) {
         case 0x5401: {                                        /* TCGETS */
@@ -685,8 +740,9 @@ static int do_select(int n, uint32_t* rd, uint32_t* wr, uint32_t* ex, int timeou
     if (rd) UCHK(rd, words * 4);
     if (wr) UCHK(wr, words * 4);
     if (ex) UCHK(ex, words * 4);
-    uint32_t want_r[2] = {0}, want_w[2] = {0};
-    for (uint32_t i = 0; i < words && i < 2; i++) {
+#define FDW (MAX_FDS / 32)
+    uint32_t want_r[FDW] = {0}, want_w[FDW] = {0};
+    for (uint32_t i = 0; i < words && i < FDW; i++) {
         if (rd) want_r[i] = rd[i];
         if (wr) want_w[i] = wr[i];
     }
@@ -694,7 +750,7 @@ static int do_select(int n, uint32_t* rd, uint32_t* wr, uint32_t* ex, int timeou
     for (;;) {
         net_poll();
         int ready = 0;
-        uint32_t got_r[2] = {0}, got_w[2] = {0};
+        uint32_t got_r[FDW] = {0}, got_w[FDW] = {0};
         for (int fd = 0; fd < n; fd++) {
             uint32_t bit = 1u << (fd & 31);
             bool wr_ = want_w[fd >> 5] & bit, rd_ = want_r[fd >> 5] & bit;
@@ -706,7 +762,7 @@ static int do_select(int n, uint32_t* rd, uint32_t* wr, uint32_t* ex, int timeou
         }
         if (ready || timeout_ms == 0 ||
             (timeout_ms > 0 && pit_uptime_ms() - start >= (uint32_t)timeout_ms)) {
-            for (uint32_t i = 0; i < words && i < 2; i++) {
+            for (uint32_t i = 0; i < words && i < FDW; i++) {
                 if (rd) rd[i] = got_r[i];
                 if (wr) wr[i] = got_w[i];
                 if (ex) ex[i] = 0;
@@ -1095,7 +1151,7 @@ static int32_t dispatch(regs_t* r) {
             UCHK((void*)a, 1);
             fs_node_t* src = lookup(AT_FDCWD, (const char*)a, &err);
             if (!src) return err;
-            if (src->dev < FS_DEV_DISK) return -15;                  /* ENOTBLK */
+            if (!FS_DEV_IS_DISK(src->dev)) return -15;                  /* ENOTBLK */
             fs_node_t* dst = lookup(AT_FDCWD, (const char*)b, &err);
             if (!dst) return err;
             return fatfs_mount(src->dev - FS_DEV_DISK, dst);
@@ -1104,7 +1160,7 @@ static int32_t dispatch(regs_t* r) {
             UCHK((void*)a, 1);
             n = lookup(AT_FDCWD, (const char*)a, &err);
             if (!n) return err;
-            if (n->dev >= FS_DEV_DISK) return -EINVAL;              /* give the mount point */
+            if (FS_DEV_IS_DISK(n->dev)) return -EINVAL;              /* give the mount point */
             for (int i = 0; i < proc_count(); i++) {
                 proc_t* q = proc_at(i);
                 for (fs_node_t* w = q ? q->cwd : NULL; w; w = w->parent)
@@ -1165,7 +1221,7 @@ static int32_t dispatch(regs_t* r) {
         case 65:  return p->pgid;
         case 132: { proc_t* t = a ? proc_by_pid((int)a) : p; return t ? t->pgid : -ESRCH; }
         case 147: { proc_t* t = a ? proc_by_pid((int)a) : p; return t ? t->sid : -ESRCH; }
-        case 66:  p->sid = p->pgid = p->pid; return p->pid;
+        case 66:  p->sid = p->pgid = p->pid; p->ctty = -1; return p->pid;   /* setsid: no terminal */
         case 60:  { int old = p->umask; p->umask = (int)(a & 0777); return old; }
         case 174: case 67:                                           /* rt_sigaction / sigaction */
             if (b) UCHK((void*)b, 20);
@@ -1220,7 +1276,9 @@ static int32_t dispatch(regs_t* r) {
             if (b) { UCHK((void*)b, 8); memset((void*)b, 0, 8); }
             return 0;
         }
-        case 85: case 305: return -EINVAL;                           /* readlink: no symlinks */
+        case 85:  return do_readlink((const char*)a, (char*)b, c);
+        case 305: return do_readlink((const char*)b, (char*)c, d);   /* readlinkat (absolute) */
+        case 80: case 205: return 0;                                 /* getgroups: none */
         case 90: {                                                   /* old mmap(struct*) */
             UCHK((void*)a, 24);
             uint32_t* m = (uint32_t*)a;
@@ -1407,7 +1465,20 @@ void syscall_dispatch(regs_t* r) {
     uint32_t nr = r->eax;
     proc_check_alarm(proc_current(), false);
     int32_t ret = dispatch(r);
-    if (g_strace) {
+    if (g_strace && g_strace_pid && proc_current() && proc_current()->pid == g_strace_pid) {
+        /* buffered: record now, print when the process exits (timing stays intact) */
+        static struct { int32_t nr, a, b, c, ret; } rec[4096];
+        static int nrec;
+        if (nrec < 4096) { rec[nrec].nr = (int32_t)nr; rec[nrec].a = (int32_t)r->ebx;
+                           rec[nrec].b = (int32_t)r->ecx; rec[nrec].c = (int32_t)r->edx; rec[nrec++].ret = ret; }
+        if (nr == 1 || nr == 252) {                                  /* exit: print the log */
+            for (int i = 0; i < nrec; i++) {
+                klog("[st] "); klog_num(rec[i].nr); klog("("); klog_num(rec[i].a); klog(", ");
+                klog_num(rec[i].b); klog(", "); klog_num(rec[i].c); klog(") = "); klog_num(rec[i].ret); klog("\r\n");
+            }
+            nrec = 0;
+        }
+    } else if (g_strace && !g_strace_pid) {
         proc_t* p = proc_current();
         klog("[strace] "); klog_num(p ? p->pid : 0);
         klog(" "); klog_num((int32_t)nr);

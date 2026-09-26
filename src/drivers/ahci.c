@@ -3,6 +3,7 @@
 #include "core/heap.h"
 #include "core/string.h"
 #include "core/io.h"
+#include "core/vmm.h"
 
 /* AHCI 1.x SATA driver: polled DMA, one command slot per port.
 
@@ -145,7 +146,7 @@ static int issue(ahci_disk_t* d, uint8_t cmd, uint64_t lba, uint16_t count,
     cmd_table_t* t = d->tbl;
     memset(t->cfis, 0, sizeof(t->cfis));
     if (bytes) {
-        t->prd[0].dba = (uint32_t)buf;
+        t->prd[0].dba = V2P(buf);           /* big-arena buffers live in the direct map */
         t->prd[0].dbau = 0;
         t->prd[0].rsv = 0;
         t->prd[0].dbc = (bytes - 1) | (1u << 31);
@@ -284,14 +285,15 @@ uint32_t ahci_sectors(int i) { return ahci_present(i) ? disks[i].sectors : 0; }
 const char* ahci_model(int i) { return ahci_present(i) ? disks[i].model : ""; }
 int  ahci_port(int i) { return ahci_present(i) ? disks[i].port : -1; }
 
-/* Controller DMA wants word-aligned buffers; bounce anything else. */
+/* Controller DMA wants word-aligned, physically contiguous buffers (kernel
+   identity or direct-map memory); bounce anything else. */
 static int xfer(int i, uint32_t lba, int count, void* buf, bool write) {
     if (!ahci_present(i) || count <= 0) return -1;
     ahci_disk_t* d = &disks[i];
     if (lba + (uint32_t)count > d->sectors || lba + (uint32_t)count < lba) return -1;
     uint8_t* p = (uint8_t*)buf;
     uint8_t* bounce = NULL;
-    if ((uint32_t)p & 1) {
+    if (((uint32_t)p & 1) || !dma_ok(p)) {
         bounce = (uint8_t*)kmalloc(MAX_SECTORS_PER_CMD * 512);   /* 8-byte aligned */
         if (!bounce) return -1;
     }

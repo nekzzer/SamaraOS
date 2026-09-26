@@ -4,12 +4,16 @@
 #include "core/task.h"
 #include "core/vmm.h"
 #include "drivers/keyboard.h"
+#include "drivers/mouse.h"
 #include "drivers/ata.h"
 #include "drivers/ahci.h"
 #include "drivers/vga.h"
 #include "fs/fs.h"
 #include "proc/proc.h"
 #include "proc/tty.h"
+#include "gui/uwin.h"
+#include "gfx/gfx_term.h"
+#include "gui/desktop.h"
 
 /* Running ring-3 programs (busybox et al.) from the SamaraOS shell.
 
@@ -19,12 +23,14 @@
    foreground job and wm_terminal_poll() does the same shuttling per frame. */
 
 static char *const user_env[] = {
-    "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/games",
+    "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/games:/opt/gcc/bin",
     "HOME=/home/user",
     "USER=root",
     "LOGNAME=root",
     "SHELL=/bin/sh",
     "TERM=linux",
+    "COLORTERM=truecolor",
+    "ENV=/etc/shrc",                  /* interactive sh: gradient prompt, colours */
     "PS1=\\u@\\h:\\w\\$ ",
     NULL,
 };
@@ -42,7 +48,7 @@ bool shell_find_program(const char *name, char *out, int cap) {
     out[cap - 1] = 0;
     return true;
   }
-  static const char *const path[] = {"/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/games/"};
+  static const char *const path[] = {"/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/games/", "/opt/gcc/bin/"};
   for (unsigned i = 0; i < sizeof(path) / sizeof(path[0]); i++) {
     char full[128];
     strncpy(full, path[i], sizeof(full) - 1);
@@ -106,14 +112,70 @@ int shell_exec_program(const char *path, int argc, char **argv) {
     fg_pid = pid;
     return 0;
   }
+  mouse_wheel_take();               /* drop notches rolled before the start */
   while (proc_alive(pid)) {
     tty_pump();
-    while (kbd_has_key())
-      tty_key(kbd_trygetc());
+    while (kbd_has_key()) {
+      char k = kbd_trygetc();
+      if (vga_is_gfx() && console_is_gfx() && kbd_ctrl_held() && (k == '=' || k == '+' || k == '-')) {
+        console_font_step(k == '-' ? -1 : 1);     /* Ctrl +/-: font size, SIGWINCH */
+        tty_resized();
+        continue;
+      }
+      tty_key(k);
+    }
+    int dz = mouse_wheel_take();
+    if (dz && !tty_wheel(dz) && vga_is_gfx())
+      gfx_term_view_scroll(-dz * 3);            /* line output: the scrollback */
     task_yield();
   }
   finish(pid);
   return 0;
+}
+
+/* Background launch: own session, stdio on /dev/null, freed on exit.
+   The terminal (if any) stays free. */
+int shell_spawn_background(const char *path, int argc, char **argv) {
+  char *args[32];
+  int n = 0;
+  for (int i = 0; i < argc && n < 31; i++)
+    args[n++] = argv[i];
+  args[n] = NULL;
+  int pid = proc_spawn_detached(path, args, user_env);
+  if (pid < 0)
+    vga_printf("%s: cannot execute (error %d)\n", argv[0], -pid);
+  return pid;
+}
+
+/* A command line for a desktop icon: "prog args..." run in the background,
+   never through the terminal. Returns pid or < 0. */
+int shell_launch_detached(const char *line) {
+  char copy[160];
+  strncpy(copy, line, sizeof(copy) - 1);
+  copy[sizeof(copy) - 1] = 0;
+  char *argv[16];
+  int argc = 0;
+  for (char *p = copy; *p && argc < 15;) {
+    while (*p == ' ')
+      *p++ = 0;
+    if (!*p)
+      break;
+    argv[argc++] = p;
+    while (*p && *p != ' ')
+      p++;
+  }
+  argv[argc] = NULL;
+  if (!argc)
+    return -2;
+  if (!strcmp(argv[0], "python") || !strcmp(argv[0], "python3"))
+    argv[0] = "micropython";              /* the shell builtins' alias */
+  char path[128];
+  if (!shell_find_program(argv[0], path, sizeof(path)))
+    return -2;
+  char *args[17];
+  for (int i = 0; i <= argc; i++)
+    args[i] = argv[i];
+  return proc_spawn_detached(path, args, user_env);
 }
 
 /* ---- desktop terminal hooks (called from shell.c / wm.c) ---- */
@@ -127,8 +189,29 @@ bool shell_fg_poll(void) {
   if (!fg_pid)
     return false;
   tty_pump();
-  if (proc_alive(fg_pid))
-    return false;
+  if (proc_alive(fg_pid)) {
+    /* It opened its own desktop window (a game, a GUI tool): let it live
+       there on its own and give the terminal back. */
+    if (!uwin_pid_has_window(fg_pid))
+      return false;
+    while (tty_has_output())
+      tty_pump();
+    proc_t *p = proc_by_pid(fg_pid);
+    char name[32] = "program";
+    if (p)
+      strncpy(name, p->name, sizeof(name) - 1);
+    name[sizeof(name) - 1] = 0;
+    proc_detach(fg_pid);
+    int x, y;
+    vga_get_cursor(&x, &y);
+    if (x != 0)
+      vga_putc('\n');
+    vga_set_color(VGA_DGREY, VGA_BLACK);
+    vga_printf("[%s: running in its own window]\n", name);
+    vga_set_color(VGA_LGREY, VGA_BLACK);
+    fg_pid = 0;
+    return true;
+  }
   finish(fg_pid);
   fg_pid = 0;
   return true;
@@ -137,8 +220,10 @@ bool shell_fg_poll(void) {
 void shell_fg_abandon(void) {
   if (!fg_pid)
     return;
-  proc_kill_all();
-  proc_reap(fg_pid);
+  /* Only the terminal's own job: games and apps started from icons or
+     detached into their windows keep running. */
+  proc_kill_session(fg_pid);
+  proc_detach(fg_pid);              /* freed as soon as it is gone */
   fg_pid = 0;
 }
 

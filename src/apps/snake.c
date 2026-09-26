@@ -116,8 +116,11 @@ static void on_paint(window_t* w) {
     info[n] = 0;
     gfx_string(cx + 8, cy + 6, info, COL_TEXT, 0, false);
 
-    int gx = cx + BORDER;
-    int gy = cy + HDR_H;
+    /* Grid centred in whatever room the (resizable) window gives it. */
+    int gx = cx + (cw - GRID_W * CELL) / 2;
+    int gy = cy + HDR_H + (ch - HDR_H - BORDER - 24 - GRID_H * CELL) / 2;
+    if (gx < cx + BORDER) gx = cx + BORDER;
+    if (gy < cy + HDR_H) gy = cy + HDR_H;
 
     /* grid backdrop */
     gfx_rect_fill(gx - 2, gy - 2, GRID_W * CELL + 4, GRID_H * CELL + 4, COL_GRID);
@@ -188,5 +191,8 @@ int snake_open(void) {
                             on_paint, on_key, NULL, on_tick, true, NULL);
     if (!g_win) return -1;
     g_win->on_close = on_close;
+    g_win->min_w = w;
+    g_win->min_h = h;
+    g_win->opaque = true;                     /* on_paint fills the client */
     return 0;
 }

@@ -18,6 +18,26 @@
 #define USER_STACK_TOP   0x40000000u
 #define USER_STACK_MAX   (8u * 1024u * 1024u)   /* grows on demand */
 
+/* Direct map: physical [0, DMAP_SIZE) is also mapped at DMAP_BASE in every
+   address space (kernel PDEs), so the kernel can reach any RAM frame -
+   including the ones behind the user window - while a process is current.
+   All frame contents are touched through P2V(). */
+#define DMAP_BASE        0x40000000u
+#define DMAP_SIZE        0x40000000u            /* 1 GiB of RAM */
+#define P2V(p)           ((void*)((uint32_t)(p) + DMAP_BASE))
+/* Physical address of a kernel buffer, for DMA: direct-map addresses (big
+   heap arena, module data) translate back; the rest of kernel space below
+   USER_BASE is identity-mapped. User addresses have no single physical
+   address - bounce those. */
+static inline uint32_t V2P(const void* v) {
+    uint32_t a = (uint32_t)v;
+    return (a >= DMAP_BASE && a < DMAP_BASE + DMAP_SIZE) ? a - DMAP_BASE : a;
+}
+static inline bool dma_ok(const void* v) {
+    uint32_t a = (uint32_t)v;
+    return a < USER_BASE || (a >= DMAP_BASE && a < DMAP_BASE + DMAP_SIZE);
+}
+
 #define PTE_P  0x001u
 #define PTE_RW 0x002u
 #define PTE_US 0x004u

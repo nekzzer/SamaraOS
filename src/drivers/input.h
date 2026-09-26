@@ -12,6 +12,7 @@
 #define IEV_REL 2
 #define IEV_REL_X 0
 #define IEV_REL_Y 1
+#define IEV_REL_WHEEL 8
 
 void input_open(void);
 void input_close(void);

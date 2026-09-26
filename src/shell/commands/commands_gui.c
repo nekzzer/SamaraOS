@@ -1,5 +1,6 @@
 #include "../shell_priv.h"
 #include "core/string.h"
+#include "gui/uwin.h"
 #include "fs/fs.h"
 #include "apps/mediaplayer.h"
 #include "boot/pit.h"
@@ -87,7 +88,7 @@ static void bounce_key(window_t *w, char c) {
 void cmd_bounce(int argc, char **argv) {
   (void)argc;
   (void)argv;
-  if (!gfx_ready()) {
+  if (!uwin_wm_running()) {             /* graphics alone is the console now */
     vga_puts("bounce: enter 'desktop' first\n");
     return;
   }
@@ -148,12 +149,16 @@ void cmd_desktop(int argc, char **argv) {
   mediaplayer_force_stop();
   g_in_wm_terminal = false;
   g_current_term_window = NULL;
-  vga_use_text();
-  vga_set_text_mode_3();
-  font_restore();
-  mouse_set_text_cursor(true);
-  mouse_set_range(prev_max_x, prev_max_y);
-  vga_init();
+  if (console_is_gfx()) {             /* back to the graphical console */
+    console_gfx_start();
+  } else {
+    vga_use_text();
+    vga_set_text_mode_3();
+    font_restore();
+    mouse_set_text_cursor(true);
+    mouse_set_range(prev_max_x, prev_max_y);
+    vga_init();
+  }
   vga_set_color(VGA_LCYAN, VGA_BLACK);
   vga_puts("returned from desktop.\n");
   vga_set_color(VGA_LGREY, VGA_BLACK);

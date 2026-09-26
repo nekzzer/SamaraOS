@@ -40,6 +40,12 @@ int  uif_draw_wrap(int x, int y, int max_w, int line_h, uif_t f, const char* s, 
 int  uif_draw_mem(uint32_t* buf, int bw, int bh, int x, int y, int font,
                   const char* s, uint32_t color);
 int  uif_width_any(int font, const char* s);
+/* Text of a user window shown at `scale` x (font as for uif_draw_mem, x/y in
+   screen pixels): same layout as at 1x times scale, glyphs resampled from
+   the large master atlases - smooth at any scale. Returns the pen x. */
+int  uif_draw_scaled(int x, int y, int font, const char* s, uint32_t color, int scale);
+/* One 8x16 terminal-face cell (what gfx_string draws with). */
+void uif_mono_char(int x, int y, uint8_t c, uint32_t fg, uint32_t bg, bool draw_bg);
 int  uif_height_any(int font);
 
 /* Terminal cell (8x16) from the anti-aliased mono font; falls back to the

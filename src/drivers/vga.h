@@ -16,7 +16,17 @@ void vga_init(void);
 void vga_set_text_mode_3(void);   /* program VGA back to standard 80x25 text mode */
 void vga_use_text(void);          /* route subsequent vga_* output to VGA text VRAM */
 void vga_use_gfx_term(int px, int py); /* route output to gfx_term grid at framebuffer (px,py) */
+/* Size of the active console: 80x25 in text mode, the (resizable) desktop
+   terminal grid otherwise. */
+int  vga_cols(void);
+int  vga_rows(void);
 void vga_clear(void);
+void vga_set_rgb(uint32_t fg, uint32_t bg);          /* 0xRRGGBB (true colour) */
+void vga_putu(uint32_t cp);                          /* Unicode code point */
+void vga_set_attr(uint8_t at);                       /* TF_* (graphical console) */
+void vga_alt_screen(bool on);
+void vga_cursor_visible(bool on);
+bool vga_is_gfx(void);
 void vga_set_color(uint8_t fg, uint8_t bg);
 void vga_putc(char c);
 void vga_puts(const char* s);

@@ -37,12 +37,15 @@ enum {
 };
 
 /* ---- events ---- */
-enum { SM_EV_NONE, SM_EV_KEY, SM_EV_MOUSE_DOWN, SM_EV_MOUSE_UP, SM_EV_MOUSE_MOVE, SM_EV_CLOSE };
+enum { SM_EV_NONE, SM_EV_KEY, SM_EV_MOUSE_DOWN, SM_EV_MOUSE_UP, SM_EV_MOUSE_MOVE, SM_EV_CLOSE,
+       SM_EV_WHEEL };
 
 typedef struct { int32_t type, a, b, c; } SmEvent;
 /* SM_EV_KEY:        a = character (CP866; specials below)
    SM_EV_MOUSE_*:    a = x, b = y (window pixels, scale already divided), c = button
-   SM_EV_CLOSE:      the user clicked the window's close button */
+   SM_EV_CLOSE:      the user clicked the window's close button
+   SM_EV_WHEEL:      a = notches (> 0 = scrolled down / towards the user),
+                     b, c = pointer x, y in window pixels */
 
 /* Characters delivered by SM_EV_KEY (kernel drivers/keyboard.h) */
 #define SM_CH_UP     0x81

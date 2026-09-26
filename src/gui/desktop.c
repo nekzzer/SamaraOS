@@ -1,4 +1,9 @@
 #include "gui/desktop.h"
+#include "gfx/termfont.h"
+#include "gfx/gfx_term.h"
+#include "drivers/vga.h"
+#include "drivers/mouse.h"
+#include "core/string.h"
 #include "gfx/gfx.h"
 #include "drivers/mouse.h"
 #include "drivers/keyboard.h"
@@ -52,7 +57,25 @@ static multiboot_info_t* g_mbi = 0;
 
 void desktop_install_mbi(multiboot_info_t* mbi) { g_mbi = mbi; }
 
+/* "video=WxH" on the kernel command line picks the resolution (QEMU shows
+   it 1:1 when it fits the host screen - no blurry scaling). */
+static bool video_param(int* w, int* h) {
+    extern const char* kernel_cmdline(void);
+    const char* k = strstr(kernel_cmdline(), "video=");
+    if (!k) return false;
+    k += 6;
+    int a = 0, b = 0;
+    while (*k >= '0' && *k <= '9') a = a * 10 + (*k++ - '0');
+    if (*k++ != 'x') return false;
+    while (*k >= '0' && *k <= '9') b = b * 10 + (*k++ - '0');
+    if (a < 640 || b < 400 || a > 4096 || b > 2160) return false;
+    *w = a; *h = b;
+    return true;
+}
+
 bool desktop_init_graphics(void) {
+    int vw, vh;
+    if (video_param(&vw, &vh) && gfx_init_vbe(vw, vh, 32)) return true;
     /* Try 1080p first (QEMU stdvga happily does it with 16 MiB VRAM).
        Fall back through common modes if the card refuses. */
     bool ok = gfx_init_vbe(1920, 1080, 32);
@@ -261,4 +284,58 @@ int desktop_run(void) {
 
         for (volatile int i = 0; i < 50000; i++) { __asm__ volatile (""); }
     }
+}
+
+
+/* ======================================================================
+   Graphical console: the SamaraOS shell full screen on the framebuffer,
+   with the desktop terminal's engine (true colour, anti-aliased Unicode
+   font in several sizes) instead of the 16-colour VGA text mode.
+   ====================================================================== */
+
+static bool con_gfx;
+static int  con_font = -1;
+
+bool console_is_gfx(void) { return con_gfx; }
+
+/* Grid for the current font, centred on the screen. Returns lines the
+   content moved up (the cursor row stays visible). */
+static int con_layout(void) {
+    int cw = termfont_cw(), ch = termfont_ch();
+    int cols = gfx_w() / cw, rows = gfx_h() / ch;
+    if (cols > TERM_MAX_COLS) cols = TERM_MAX_COLS;
+    if (rows > TERM_MAX_ROWS) rows = TERM_MAX_ROWS;
+    int shift = gfx_term_resize(cols, rows);
+    int ox = (gfx_w() - cols * cw) / 2, oy = (gfx_h() - rows * ch) / 2;
+    gfx_reset_clip();
+    gfx_rect_fill(0, 0, gfx_w(), gfx_h(), gfx_term_color(0));
+    gfx_term_repos(ox, oy);
+    return shift;
+}
+
+bool console_gfx_start(void) {
+    if (!desktop_init_graphics()) return false;
+    gfx_reset_clip();
+    mouse_set_text_cursor(false);
+    if (con_font < 0) con_font = gfx_w() >= 1600 ? 1 : 0;         /* 10x20 on big screens */
+    termfont_set(con_font);
+    int cw = termfont_cw(), ch = termfont_ch();
+    int cols = gfx_w() / cw, rows = gfx_h() / ch;
+    if (cols > TERM_MAX_COLS) cols = TERM_MAX_COLS;
+    if (rows > TERM_MAX_ROWS) rows = TERM_MAX_ROWS;
+    gfx_term_resize(cols, rows);
+    gfx_rect_fill(0, 0, gfx_w(), gfx_h(), gfx_term_color(0));
+    vga_use_gfx_term((gfx_w() - cols * cw) / 2, (gfx_h() - rows * ch) / 2);
+    gfx_term_show_cursor(true);
+    con_gfx = true;
+    return true;
+}
+
+/* Ctrl +/-: next/previous font size. Returns lines the content moved up. */
+int console_font_step(int d) {
+    int n = termfont_get() + d;
+    if (n < 0 || n >= termfont_sizes()) return 0;
+    termfont_set(n);
+    if (con_gfx && vga_is_gfx()) con_font = n;
+    return con_layout();
 }

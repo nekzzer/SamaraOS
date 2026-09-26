@@ -66,6 +66,7 @@ static bool is_ignored(uint8_t sc) {
 
 static volatile bool     ru_layout = false;
 static volatile uint32_t ru_epoch  = 0;
+static volatile uint32_t f11_count = 0;     /* F11 presses: the WM toggles fullscreen */
 
 static volatile char  buf[KEY_BUF_SIZE];
 static volatile int   head = 0, tail = 0;
@@ -117,6 +118,7 @@ static void kbd_isr(struct interrupt_frame* f) {
                 case 0x1D: ctrl = !released; break;
                 case 0x38: alt = !released; break;
             }
+            if (sc == 0x57 && !released) f11_count++;
             if (sc == 0x10 && !released && ctrl && alt) {      /* Ctrl+Alt+Q: escape hatch */
                 input_release_grab();
                 fbdev_force_release();
@@ -156,9 +158,14 @@ static void kbd_isr(struct interrupt_frame* f) {
     }
 
     switch (sc) {
-        case 0x2A: case 0x36: shift = !released; pic_send_eoi(1); return;
+        /* Alt+Shift (either order) toggles RU/EN, fired on the second key. */
+        case 0x2A: case 0x36:
+            if (!released && !shift && alt) { ru_layout = !ru_layout; ru_epoch++; }
+            shift = !released; pic_send_eoi(1); return;
         case 0x1D: ctrl  = !released; pic_send_eoi(1); return;
-        case 0x38: alt   = !released; pic_send_eoi(1); return;
+        case 0x38:
+            if (!released && !alt && shift) { ru_layout = !ru_layout; ru_epoch++; }
+            alt   = !released; pic_send_eoi(1); return;
         case 0x3A: if (!released) caps = !caps; pic_send_eoi(1); return;
     }
 
@@ -169,14 +176,14 @@ static void kbd_isr(struct interrupt_frame* f) {
         pic_send_eoi(1);
         return;
     }
-    /* F11 (0x57) and F12 (0x58) both toggle RU/EN. We bind two keys in case
-       the host OS / hypervisor swallows one of them. */
-    if (sc == 0x57 || sc == 0x58) {
-        ru_layout = !ru_layout;
-        ru_epoch++;
+    /* F11: fullscreen toggle for the WM. Not a buffer code - everything
+       above 0x80 is also CP866 Cyrillic - so it is counted on the side. */
+    if (sc == 0x57) {
+        f11_count++;
         pic_send_eoi(1);
         return;
     }
+    if (sc == 0x58) { pic_send_eoi(1); return; }        /* F12: unused */
 
     /* base char */
     bool letter_case_up = shift ^ caps;
@@ -232,3 +239,12 @@ char kbd_getc(void) {
 bool     kbd_is_ru(void)         { return ru_layout; }
 void     kbd_set_ru(bool ru)     { if (ru != ru_layout) { ru_layout = ru; ru_epoch++; } }
 uint32_t kbd_layout_epoch(void)  { return ru_epoch; }
+
+bool kbd_ctrl_held(void) { return ctrl; }
+
+int kbd_f11_take(void) {
+    static uint32_t seen;
+    int n = (int)(f11_count - seen);
+    seen = f11_count;
+    return n;
+}

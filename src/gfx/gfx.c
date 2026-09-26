@@ -1,4 +1,5 @@
 #include "gfx/gfx.h"
+#include "gfx/uifont.h"
 #include "gfx/font.h"
 #include "core/string.h"
 #include "core/io.h"
@@ -430,12 +431,18 @@ void gfx_glyph(int x, int y, char c, uint32_t fg, uint32_t bg, bool draw_bg) {
     }
 }
 
+/* 8x16 text in the anti-aliased terminal face (DejaVu Sans Mono); box
+   drawing and anything the face lacks falls back to the VGA bitmap. */
 void gfx_string(int x, int y, const char* s, uint32_t fg, uint32_t bg, bool draw_bg) {
     while (*s) {
-        gfx_glyph(x, y, *s, fg, bg, draw_bg);
+        uif_mono_char(x, y, (uint8_t)*s, fg, bg, draw_bg);
         x += FONT_W;
         s++;
     }
+}
+
+void gfx_get_clip(int* x, int* y, int* w, int* h) {
+    *x = clip_x0; *y = clip_y0; *w = clip_x1 - clip_x0; *h = clip_y1 - clip_y0;
 }
 
 void gfx_save_rect(int x, int y, int w, int h, uint32_t* dst) {

@@ -44,6 +44,7 @@ void     gfx_blit_argb(int dst_x, int dst_y, int src_w, int src_h, const uint32_
 /* Clip box honoured by every drawing primitive above and below. */
 void     gfx_set_clip(int x, int y, int w, int h);
 void     gfx_reset_clip(void);
+void     gfx_get_clip(int* x, int* y, int* w, int* h);
 
 /* Alpha is 0..255. Non-32bpp modes degrade to opaque-or-nothing. */
 void     gfx_blend_pixel(int x, int y, uint32_t c, int alpha);

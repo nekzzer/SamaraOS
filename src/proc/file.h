@@ -5,7 +5,8 @@
 
 /* Open file descriptions, shared between fds after dup()/fork(). */
 
-typedef enum { F_NODE = 1, F_TTY, F_PIPE_R, F_PIPE_W, F_NULL, F_ZERO, F_RANDOM, F_DISK, F_SOCKET, F_FB, F_INPUT } ftype_t;
+typedef enum { F_NODE = 1, F_TTY, F_PIPE_R, F_PIPE_W, F_NULL, F_ZERO, F_RANDOM, F_DISK, F_SOCKET, F_FB, F_INPUT,
+               F_PTM, F_PTS } ftype_t;             /* pty master / slave */
 
 #define PIPE_SZ 8192
 
@@ -24,6 +25,7 @@ typedef struct file {
     pipe_t*    pipe;
     int        disk;        /* F_DISK: ata index */
     struct sock* sock;      /* F_SOCKET */
+    int        pty;         /* F_PTM / F_PTS: pair index */
 } file_t;
 
 file_t* file_new(ftype_t type, int flags);

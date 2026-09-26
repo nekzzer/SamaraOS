@@ -1,6 +1,9 @@
 #include "../shell_priv.h"
 #include "core/string.h"
+#include "core/task.h"
 #include "drivers/keyboard.h"
+#include "drivers/mouse.h"
+#include "gfx/gfx_term.h"
 #include "drivers/vga.h"
 #include "fs/fs.h"
 
@@ -61,7 +64,7 @@ static void e_set_msg(const char *m) {
 static void e_render(void) {
   int cur_line = e_line_of(ecur);
   int cur_col = e_col_of(ecur);
-  int rows = VGA_HEIGHT - 2;
+  int rows = vga_rows() - 2;
 
   if (cur_line < etop)
     etop = cur_line;
@@ -72,20 +75,20 @@ static void e_render(void) {
 
   vga_set_color(VGA_BLACK, VGA_LCYAN);
   vga_set_cursor(0, 0);
-  char hdr[VGA_WIDTH + 1];
-  for (int i = 0; i < VGA_WIDTH; i++)
+  char hdr[TERM_MAX_COLS + 1];
+  for (int i = 0; i < vga_cols(); i++)
     hdr[i] = ' ';
   const char *p = " SamaraOS nano 0.2   ";
   int hp = 0;
   for (; p[hp]; hp++)
     hdr[hp] = p[hp];
-  for (int i = 0; ename[i] && hp < VGA_WIDTH; i++, hp++)
+  for (int i = 0; ename[i] && hp < vga_cols(); i++, hp++)
     hdr[hp] = ename[i];
-  if (edirty && hp < VGA_WIDTH - 4) {
+  if (edirty && hp < vga_cols() - 4) {
     hdr[hp++] = ' ';
     hdr[hp++] = '*';
   }
-  for (int i = 0; i < VGA_WIDTH; i++)
+  for (int i = 0; i < vga_cols(); i++)
     vga_putc(hdr[i]);
 
   vga_set_color(VGA_LGREY, VGA_BLACK);
@@ -97,7 +100,7 @@ static void e_render(void) {
 
   for (int row = 1; row <= rows; row++) {
     vga_set_cursor(0, row);
-    for (int i = 0; i < VGA_WIDTH; i++)
+    for (int i = 0; i < vga_cols(); i++)
       vga_putc(' ');
     vga_set_cursor(0, row);
     if (off >= elen && line + (row - 1) > 0) {
@@ -108,7 +111,7 @@ static void e_render(void) {
     }
     int col = 0;
     while (off < elen && ebuf[off] != '\n') {
-      if (col < VGA_WIDTH)
+      if (col < vga_cols())
         vga_putc(ebuf[off]);
       off++;
       col++;
@@ -117,10 +120,10 @@ static void e_render(void) {
       off++;
   }
 
-  vga_set_cursor(0, VGA_HEIGHT - 1);
+  vga_set_cursor(0, vga_rows() - 1);
   vga_set_color(VGA_BLACK, VGA_LGREY);
-  char st[VGA_WIDTH + 1];
-  for (int i = 0; i < VGA_WIDTH; i++)
+  char st[TERM_MAX_COLS + 1];
+  for (int i = 0; i < vga_cols(); i++)
     st[i] = ' ';
   const char *sc = " ^S Save   ^X Exit   ^Q Quit ";
   int sp = 0;
@@ -150,10 +153,10 @@ static void e_render(void) {
     info[ip++] = tmp[i];
   info[ip++] = ' ';
   info[ip] = 0;
-  int istart = VGA_WIDTH - ip;
+  int istart = vga_cols() - ip;
   if (istart < sp + 1)
     istart = sp + 1;
-  for (int i = 0; info[i] && istart + i < VGA_WIDTH; i++)
+  for (int i = 0; info[i] && istart + i < vga_cols(); i++)
     st[istart + i] = info[i];
 
   if (emsg_ticks > 0) {
@@ -165,14 +168,14 @@ static void e_render(void) {
       st[mstart + i] = emsg[i];
     emsg_ticks = 0;
   }
-  for (int i = 0; i < VGA_WIDTH; i++)
+  for (int i = 0; i < vga_cols(); i++)
     vga_putc(st[i]);
   vga_set_color(VGA_LGREY, VGA_BLACK);
 
   int sx = cur_col;
   int sy = (cur_line - etop) + 1;
-  if (sx >= VGA_WIDTH)
-    sx = VGA_WIDTH - 1;
+  if (sx >= vga_cols())
+    sx = vga_cols() - 1;
   if (sy < 1)
     sy = 1;
   if (sy > rows)
@@ -209,6 +212,25 @@ static void e_delete(void) {
   edirty = 1;
 }
 
+/* Mouse wheel: move the view 3 lines per notch, dragging the cursor along
+   only when it would fall off screen. */
+static void e_wheel(int dz) {
+  int rows = vga_rows() - 2;
+  int max_top = e_total_lines() - rows;
+  if (max_top < 0)
+    max_top = 0;
+  etop += dz * 3;
+  if (etop > max_top)
+    etop = max_top;
+  if (etop < 0)
+    etop = 0;
+  int line = e_line_of(ecur);
+  if (line < etop)
+    ecur = e_offset_of(etop, edesired_col);
+  else if (line >= etop + rows)
+    ecur = e_offset_of(etop + rows - 1, edesired_col);
+}
+
 void cmd_nano(int argc, char **argv) {
   if (argc < 2) {
     vga_puts("nano: missing file\n");
@@ -242,8 +264,17 @@ void cmd_nano(int argc, char **argv) {
   vga_clear();
   e_render();
 
+  mouse_wheel_take();
   while (1) {
-    char c = kbd_getc();
+    int dz = 0;
+    while (!kbd_has_key() && !(dz = mouse_wheel_take()))
+      task_yield();
+    if (dz) {
+      e_wheel(dz);
+      e_render();
+      continue;
+    }
+    char c = kbd_trygetc();
     if (c == 17) {
       vga_clear();
       return;
@@ -301,12 +332,12 @@ void cmd_nano(int argc, char **argv) {
       ecur = off;
       edesired_col = e_col_of(ecur);
     } else if (c == (char)K_PGUP) {
-      int line = e_line_of(ecur) - (VGA_HEIGHT - 4);
+      int line = e_line_of(ecur) - (vga_rows() - 4);
       if (line < 0)
         line = 0;
       ecur = e_offset_of(line, edesired_col);
     } else if (c == (char)K_PGDN) {
-      int line = e_line_of(ecur) + (VGA_HEIGHT - 4);
+      int line = e_line_of(ecur) + (vga_rows() - 4);
       int total = e_total_lines();
       if (line > total - 1)
         line = total - 1;

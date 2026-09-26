@@ -20,7 +20,8 @@ enum {
     SM_OP_FONT_H,        /* ecx = font                       -> line height      */
 };
 
-enum { SM_EV_NONE, SM_EV_KEY, SM_EV_MOUSE_DOWN, SM_EV_MOUSE_UP, SM_EV_MOUSE_MOVE, SM_EV_CLOSE };
+enum { SM_EV_NONE, SM_EV_KEY, SM_EV_MOUSE_DOWN, SM_EV_MOUSE_UP, SM_EV_MOUSE_MOVE, SM_EV_CLOSE,
+       SM_EV_WHEEL };
 
 typedef struct { int32_t w, h, scale, flags; uint32_t title; } sm_open_t;
 typedef struct { int32_t type, a, b, c; } sm_event_t;
@@ -34,5 +35,6 @@ void    uwin_proc_exit(int pid);       /* from process teardown */
 void    uwin_wm_frame(void);           /* once per WM frame: create/close windows */
 void    uwin_wm_exit(void);            /* WM shutting down: all windows closed */
 bool    uwin_wm_running(void);
+bool    uwin_pid_has_window(int pid);  /* process has an open desktop window */
 
 #endif

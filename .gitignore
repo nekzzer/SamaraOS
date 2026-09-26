@@ -41,3 +41,7 @@ userland/*.bin.o
 # quake port: kept out of the repo
 quake/
 quakegeneric-master/
+
+# clangd index / generated compile db
+.cache/
+compile_commands.json

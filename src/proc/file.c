@@ -1,4 +1,6 @@
 #include "proc/file.h"
+#include "proc/pty.h"
+#include "proc/proc.h"
 #include "proc/tty.h"
 #include "proc/proc.h"
 #include "core/heap.h"
@@ -32,9 +34,31 @@ file_t* file_new(ftype_t type, int flags) {
     return f;
 }
 
+static file_t* open_pty_slave(int i, int flags) {
+    if (pty_slave_open(i, flags) < 0) return NULL;
+    file_t* f = file_new(F_PTS, flags);
+    if (!f) { pty_slave_close(i); return NULL; }
+    f->pty = i;
+    return f;
+}
+
 file_t* file_open_node(fs_node_t* n, int flags) {
     static const ftype_t dev_type[] = { 0, F_NULL, F_ZERO, F_TTY, F_RANDOM, F_FB, F_INPUT };
-    if (n->dev >= FS_DEV_DISK) {
+    if (n->dev == FS_DEV_PTMX) {                               /* new pty pair */
+        int i = pty_alloc();
+        if (i < 0) return NULL;
+        file_t* f = file_new(F_PTM, flags);
+        if (!f) { pty_master_close(i); return NULL; }
+        f->pty = i;
+        return f;
+    }
+    if (FS_DEV_IS_PTS(n->dev)) return open_pty_slave(n->dev - FS_DEV_PTS, flags);
+    if (n->dev == FS_DEV_TTY) {                                /* /dev/tty: the process's terminal */
+        proc_t* me = proc_current();
+        if (me && me->ctty > 0) return open_pty_slave(me->ctty - 1, flags | 0x100);
+        if (me && me->ctty < 0) return NULL;                  /* no terminal (setsid, daemons) */
+    }
+    if (FS_DEV_IS_DISK(n->dev)) {
         file_t* f = file_new(F_DISK, flags);
         if (f) f->disk = n->dev - FS_DEV_DISK;
         return f;
@@ -62,6 +86,8 @@ void file_close(file_t* f) {
     if (f->type == F_SOCKET && f->sock) sock_close(f->sock);
     if (f->type == F_FB) fbdev_close();
     if (f->type == F_INPUT) input_close();
+    if (f->type == F_PTM) pty_master_close(f->pty);
+    if (f->type == F_PTS) pty_slave_close(f->pty);
     if (f->pipe) {
         if (f->type == F_PIPE_R) f->pipe->readers--;
         else                     f->pipe->writers--;
@@ -84,14 +110,20 @@ int pipe_create(file_t** rd, file_t** wr) {
 
 /* ---------------- ramfs data ---------------- */
 
+/* Room for `need` bytes of owned, writable contents (borrowed boot-archive
+   data is copied here first). */
 static int node_reserve(fs_node_t* n, uint32_t need) {
     if (n->cap >= need + 1) return 0;
     uint32_t cap = n->cap ? n->cap : 64;
+    if (cap < n->size + 1) cap = n->size + 1;
     while (cap < need + 1) cap = cap < (1u << 20) ? cap * 2 : cap + cap / 4;   /* big files: gentle growth */
-    char* nb = (char*)kmalloc(cap);
+    char* nb = (char*)kmalloc_big(cap);
     if (!nb) return -ENOMEM;
-    if (n->data) { memcpy(nb, n->data, n->size); kfree(n->data); }
+    if (n->data) memcpy(nb, n->data, n->size);
+    uint32_t size = n->size;
+    fs_data_free(n);
     n->data = nb;
+    n->size = size;
     n->cap = cap;
     return 0;
 }
@@ -111,6 +143,7 @@ int node_write_at(fs_node_t* n, uint32_t off, const char* buf, uint32_t len) {
 
 int node_truncate(fs_node_t* n, uint32_t len) {
     if (n->type != FS_FILE) return -EISDIR;
+    if (n->data && !n->cap && node_reserve(n, n->size) < 0) return -ENOMEM;   /* borrowed */
     if (len > n->size) {
         if (node_reserve(n, len) < 0) return -ENOMEM;
         memset(n->data + n->size, 0, len - n->size);
@@ -171,6 +204,8 @@ bool file_readable(file_t* f) {
         case F_PIPE_W: return false;
         case F_SOCKET: return sock_readable(f->sock);
         case F_INPUT:  return input_pending();
+        case F_PTM:    return pty_readable(f->pty, true);
+        case F_PTS:    return pty_readable(f->pty, false);
         default:       return true;
     }
 }
@@ -178,6 +213,7 @@ bool file_readable(file_t* f) {
 bool file_writable(file_t* f) {
     if (f->type == F_PIPE_W) return f->pipe->count < PIPE_SZ || f->pipe->readers <= 0;
     if (f->type == F_SOCKET) return sock_writable(f->sock);
+    if (f->type == F_PTM || f->type == F_PTS) return pty_writable(f->pty, f->type == F_PTM);
     return f->type != F_PIPE_R;
 }
 
@@ -187,6 +223,8 @@ int file_read(file_t* f, char* buf, uint32_t n) {
         case F_ZERO: memset(buf, 0, n); return (int)n;
         case F_RANDOM: for (uint32_t i = 0; i < n; i++) buf[i] = (char)rnd8(); return (int)n;
         case F_TTY:  return tty_read(buf, (int)n, (f->flags & O_NONBLOCK) != 0);
+        case F_PTM: case F_PTS:
+            return pty_read(f->pty, f->type == F_PTM, buf, (int)n, (f->flags & O_NONBLOCK) != 0);
         case F_DISK: return disk_rw(f, buf, n, false);
         case F_FB:   return -EBADF;
         case F_INPUT: return input_read(buf, n, (f->flags & O_NONBLOCK) != 0);
@@ -226,6 +264,8 @@ int file_write(file_t* f, const char* buf, uint32_t n) {
     switch (f->type) {
         case F_NULL: case F_ZERO: case F_RANDOM: return (int)n;
         case F_TTY:  return tty_write(buf, (int)n);
+        case F_PTM: case F_PTS:
+            return pty_write(f->pty, f->type == F_PTM, buf, (int)n, (f->flags & O_NONBLOCK) != 0);
         case F_DISK: return disk_rw(f, (char*)buf, n, true);
         case F_INPUT: return -EBADF;
         case F_FB: {

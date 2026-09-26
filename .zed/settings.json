@@ -1,0 +1,20 @@
+// Project settings for SamaraOS
+{
+  "lsp": {
+    "clangd": {
+      "binary": {
+        "arguments": [
+          "--background-index",
+          "--header-insertion=never",
+          "--query-driver=**/toolchain/cross/bin/i686-elf-*,**/toolchain/musl/i686-linux-musl-cross/bin/i686-linux-musl-*"
+        ]
+      }
+    }
+  },
+  "languages": {
+    // no .clang-format in the tree: don't let clangd reformat files on save
+    "C": { "format_on_save": "off" },
+    "C++": { "format_on_save": "off" }
+  },
+  "file_scan_exclusions": ["**/.git", "**/*.o", "toolchain/**", "build/**"]
+}

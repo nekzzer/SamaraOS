@@ -4,6 +4,8 @@
 #include "core/task.h"
 #include "drivers/keyboard.h"
 #include "drivers/vga.h"
+#include "gfx/gfx_term.h"
+#include "gfx/termfont.h"
 #include "boot/pit.h"
 #include "core/io.h"
 
@@ -20,6 +22,8 @@ static char     out_buf[OUT_SZ];
 static volatile int out_head, out_tail;
 static ktermios_t tio;
 static int      fg_pgrp;
+static int      reader_pid;                 /* last process blocked in read() */
+static bool     fullscreen;                 /* raw mode + cursor addressing seen */
 
 /* ---------------- rings ---------------- */
 
@@ -66,6 +70,8 @@ void tty_reset(void) {
     tio.c_cc[VEOF] = 4;
     tio.c_cc[VMIN] = 1;
     tio.c_cc[VTIME] = 0;
+    fullscreen = false;
+    reader_pid = 0;
     render_reset();
     irq_restore(f);
 }
@@ -81,6 +87,7 @@ void tty_set_termios(const ktermios_t* t) {
     uint32_t f = irq_save();
     bool was_canon = tio.c_lflag & TTY_ICANON;
     tio = *t;
+    if (was_canon != !!(tio.c_lflag & TTY_ICANON)) fullscreen = false;
     /* Leaving canonical mode hands any half-typed line to the reader. */
     if (was_canon && !(tio.c_lflag & TTY_ICANON)) {
         for (int i = 0; i < line_len; i++) in_push(line[i]);
@@ -90,7 +97,7 @@ void tty_set_termios(const ktermios_t* t) {
 }
 int  tty_fg_pgrp(void) { return fg_pgrp; }
 void tty_set_fg_pgrp(int pgrp) { fg_pgrp = pgrp; }
-void tty_winsize(int* rows, int* cols) { *rows = VGA_HEIGHT; *cols = VGA_WIDTH; }
+void tty_winsize(int* rows, int* cols) { *rows = vga_rows(); *cols = vga_cols(); }
 
 /* ---------------- process side ---------------- */
 
@@ -98,6 +105,9 @@ bool tty_readable(void) { return in_count() > 0 || eof_pending; }
 
 int tty_read(char* buf, int n, bool nonblock) {
     if (n <= 0) return 0;
+    proc_t* me = proc_current();
+    if (me && me->tty_detached) return 0;          /* background job: EOF */
+    if (me) reader_pid = me->pid;
     uint32_t deadline = 0;
     for (;;) {
         uint32_t f = irq_save();
@@ -130,6 +140,8 @@ int tty_read(char* buf, int n, bool nonblock) {
 
 int tty_write(const char* buf, int n) {
     uint32_t waited_from = 0;
+    proc_t* me = proc_current();
+    if (me && me->tty_detached) return n;          /* background job: dropped */
     for (int i = 0; i < n; i++) {
         while (!out_push(buf[i])) {
             /* Nobody draining (console detached)? Drop instead of hanging. */
@@ -142,11 +154,32 @@ int tty_write(const char* buf, int n) {
     return n;
 }
 
-/* ---------------- keyboard side ---------------- */
-
 static void send_sig(int sig) {
     if (fg_pgrp) proc_signal_group(fg_pgrp, sig);
 }
+
+/* Mouse wheel over the console, dz > 0 = towards the user (scroll down).
+   Full-screen programs get keys, like xterm's alternateScroll: nano its
+   own scroll-without-moving-the-cursor (Alt+Up/Down, ESC [1;3A/B), the
+   rest plain arrows. Returns false for line-mode output, where the
+   console should move its scrollback instead. */
+bool tty_wheel(int dz) {
+    uint32_t f = irq_save();
+    if ((tio.c_lflag & TTY_ICANON) || !fullscreen || !dz) { irq_restore(f); return false; }
+    proc_t* r = reader_pid ? proc_by_pid(reader_pid) : NULL;
+    bool nano = r && !strcmp(r->name, "nano");
+    const char* seq = nano ? (dz < 0 ? "\x1b[1;3A" : "\x1b[1;3B")
+                           : (dz < 0 ? "\x1b[A" : "\x1b[B");
+    int n = (dz < 0 ? -dz : dz) * 3;
+    if (n > 30) n = 30;
+    for (int i = 0; i < n; i++) in_push_str(seq);
+    irq_restore(f);
+    return true;
+}
+
+bool tty_fullscreen(void) { return fullscreen && !(tio.c_lflag & TTY_ICANON); }
+
+/* ---------------- keyboard side ---------------- */
 
 static const char* key_seq(uint8_t k) {
     switch (k) {
@@ -192,20 +225,35 @@ void tty_key(char ch) {
         return;
     }
 
+    /* Programs speak UTF-8; the keyboard gives CP866 for non-ASCII. */
+    char u8[4];
+    int nu = 1;
+    u8[0] = (char)c;
+    if (c >= 0x80) {
+        uint32_t cp = cp866_to_uni(c);
+        if (cp < 0x800) { u8[0] = (char)(0xC0 | (cp >> 6)); u8[1] = (char)(0x80 | (cp & 0x3F)); nu = 2; }
+        else { u8[0] = (char)(0xE0 | (cp >> 12)); u8[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+               u8[2] = (char)(0x80 | (cp & 0x3F)); nu = 3; }
+    }
+
     if (!canon) {
-        in_push((char)c);
-        if (echo_on) echo((char)c);
+        for (int i = 0; i < nu; i++) { in_push(u8[i]); if (echo_on) echo(u8[i]); }
         irq_restore(f);
         return;
     }
 
     if (c == tio.c_cc[VERASE] || c == 0x7F) {
-        if (line_len > 0) {
+        if (line_len > 0) {                      /* a whole UTF-8 character */
+            while (line_len > 1 && ((uint8_t)line[line_len - 1] & 0xC0) == 0x80) line_len--;
             line_len--;
             if (echo_on) echo_str("\b \b");
         }
     } else if (c == tio.c_cc[VKILL]) {
-        while (line_len > 0) { line_len--; if (echo_on) echo_str("\b \b"); }
+        while (line_len > 0) {
+            while (line_len > 1 && ((uint8_t)line[line_len - 1] & 0xC0) == 0x80) line_len--;
+            line_len--;
+            if (echo_on) echo_str("\b \b");
+        }
     } else if (c == tio.c_cc[VEOF]) {
         if (line_len == 0) eof_pending = 1;
         for (int i = 0; i < line_len; i++) in_push(line[i]);
@@ -215,9 +263,8 @@ void tty_key(char ch) {
         in_push('\n');
         line_len = 0;
         if (echo_on || (tio.c_lflag & 0x40 /*ECHONL*/)) echo('\n');
-    } else if (c >= 0x20 && c < 0x7F && line_len < LINE_SZ - 1) {
-        line[line_len++] = (char)c;
-        if (echo_on) echo((char)c);
+    } else if ((c >= 0x20 && c != 0x7F) && line_len < LINE_SZ - nu) {
+        for (int i = 0; i < nu; i++) { line[line_len++] = u8[i]; if (echo_on) echo(u8[i]); }
     }
     irq_restore(f);
 }
@@ -230,7 +277,14 @@ void tty_key(char ch) {
 enum { ST_NORMAL, ST_ESC, ST_CSI, ST_SKIP1, ST_OSC, ST_OSC_ESC, ST_G0, ST_G1 };
 static int  st = ST_NORMAL;
 static int  par[16], npar;
-static bool par_priv;
+/* 24-bit colour from SGR 38;2 / 48;2 or a 256-colour index >= 16;
+   -1 = use the 16-colour fg/bg. */
+static int32_t fg_rgb = -1, bg_rgb = -1;
+static bool par_priv, par_q;             /* CSI with a private marker; '?' (DEC modes) */
+static uint8_t sgr_at;                    /* TF_BOLD | TF_UNDERLINE | ... */
+static int  utf_need, utf_n;              /* UTF-8 decoding */
+static uint32_t utf_cp;
+static uint8_t  utf_raw[4];
 static int  fg = VGA_LGREY, bg = VGA_BLACK;
 static bool bold, reverse, acs;
 static bool g0_gfx, g1_gfx, shift_out;     /* charsets: ESC ( 0, ESC ) 0, ^N/^O */
@@ -242,39 +296,97 @@ static void render_reset(void) {
     st = ST_NORMAL;
     fg = VGA_LGREY; bg = VGA_BLACK;
     bold = reverse = acs = false;
+    fg_rgb = bg_rgb = -1;
+    sgr_at = 0;
+    utf_need = 0;
     g0_gfx = g1_gfx = shift_out = false;
-    reg_top = 0; reg_bot = VGA_HEIGHT - 1;
+    reg_top = 0; reg_bot = vga_rows() - 1;
     need_color = true;
 }
+
+/* The console grid changed size: full-height scroll region again, and
+   tell the foreground job (curses programs redraw on SIGWINCH). */
+void tty_resized(void) {
+    uint32_t f = irq_save();
+    reg_top = 0;
+    reg_bot = vga_rows() - 1;
+    irq_restore(f);
+    send_sig(28);                               /* SIGWINCH */
+}
+
 
 static const uint8_t ansi2vga[8] = {
     VGA_BLACK, VGA_RED, VGA_GREEN, VGA_BROWN, VGA_BLUE, VGA_MAGENTA, VGA_CYAN, VGA_LGREY
 };
 
+/* xterm's 256-colour palette above the 16 base colours */
+static uint32_t xterm256(int n) {
+    if (n >= 232) { uint32_t v = (uint32_t)(8 + (n - 232) * 10); return (v << 16) | (v << 8) | v; }
+    n -= 16;
+    static const uint8_t lv[6] = { 0, 95, 135, 175, 215, 255 };
+    return ((uint32_t)lv[(n / 36) % 6] << 16) | ((uint32_t)lv[(n / 6) % 6] << 8) | lv[n % 6];
+}
+
 static void apply_color(void) {
     int f = fg, b = bg;
     if (bold && f < 8) f += 8;
-    if (reverse) { int t = f; f = b; b = t; }
-    vga_set_color((uint8_t)f, (uint8_t)b);
+    if (fg_rgb < 0 && bg_rgb < 0) {
+        if (reverse) { int t = f; f = b; b = t; }
+        vga_set_color((uint8_t)f, (uint8_t)b);
+        vga_set_attr(sgr_at);
+        return;
+    }
+    vga_set_attr(sgr_at);
+    uint32_t F = fg_rgb >= 0 ? (uint32_t)fg_rgb : gfx_term_color(f);
+    uint32_t B = bg_rgb >= 0 ? (uint32_t)bg_rgb : gfx_term_color(b);
+    if (reverse) { uint32_t t = F; F = B; B = t; }
+    vga_set_rgb(F, B);
+}
+
+/* 38/48 ; 5;n | 2;r;g;b  starting at par[i]; returns params consumed after i */
+static int ext_color(int i, bool is_fg) {
+    if (i + 1 >= npar) return 0;
+    if (par[i + 1] == 5 && i + 2 < npar) {
+        int n = par[i + 2] & 255;
+        if (n < 16) {
+            int v = n < 8 ? ansi2vga[n] : ansi2vga[n - 8] + 8;
+            if (is_fg) { fg = v; fg_rgb = -1; } else { bg = v; bg_rgb = -1; }
+        } else if (is_fg) fg_rgb = (int32_t)xterm256(n);
+        else              bg_rgb = (int32_t)xterm256(n);
+        return 2;
+    }
+    if (par[i + 1] == 2 && i + 4 < npar) {
+        int32_t c = ((par[i + 2] & 255) << 16) | ((par[i + 3] & 255) << 8) | (par[i + 4] & 255);
+        if (is_fg) fg_rgb = c; else bg_rgb = c;
+        return 4;
+    }
+    return 0;
 }
 
 static void sgr(void) {
     if (npar == 0) { par[0] = 0; npar = 1; }
     for (int i = 0; i < npar; i++) {
         int p = par[i];
-        if (p == 0) { fg = VGA_LGREY; bg = VGA_BLACK; bold = reverse = false; }
-        else if (p == 1) bold = true;
-        else if (p == 2 || p == 22) bold = false;
+        if (p == 0) { fg = VGA_LGREY; bg = VGA_BLACK; bold = reverse = false; fg_rgb = bg_rgb = -1; sgr_at = 0; }
+        else if (p == 1) { bold = true; sgr_at |= TF_BOLD; }
+        else if (p == 2) sgr_at |= TF_DIM;
+        else if (p == 22) { bold = false; sgr_at &= ~(TF_BOLD | TF_DIM); }
+        else if (p == 3) sgr_at |= TF_ITALIC;
+        else if (p == 23) sgr_at &= ~TF_ITALIC;
+        else if (p == 4 || p == 21) sgr_at |= TF_UNDERLINE;
+        else if (p == 24) sgr_at &= ~TF_UNDERLINE;
+        else if (p == 9) sgr_at |= TF_STRIKE;
+        else if (p == 29) sgr_at &= ~TF_STRIKE;
         else if (p == 7) reverse = true;
         else if (p == 27) reverse = false;
-        else if (p >= 30 && p <= 37) fg = ansi2vga[p - 30];
-        else if (p == 38 && i + 2 < npar && par[i + 1] == 5) { fg = par[i + 2] & 15; i += 2; }
-        else if (p == 39) fg = VGA_LGREY;
-        else if (p >= 40 && p <= 47) bg = ansi2vga[p - 40];
-        else if (p == 48 && i + 2 < npar && par[i + 1] == 5) { bg = par[i + 2] & 7; i += 2; }
-        else if (p == 49) bg = VGA_BLACK;
-        else if (p >= 90 && p <= 97) fg = ansi2vga[p - 90] + 8;
-        else if (p >= 100 && p <= 107) bg = ansi2vga[p - 100] + 8;
+        else if (p >= 30 && p <= 37) { fg = ansi2vga[p - 30]; fg_rgb = -1; }
+        else if (p == 38) i += ext_color(i, true);
+        else if (p == 39) { fg = VGA_LGREY; fg_rgb = -1; }
+        else if (p >= 40 && p <= 47) { bg = ansi2vga[p - 40]; bg_rgb = -1; }
+        else if (p == 48) i += ext_color(i, false);
+        else if (p == 49) { bg = VGA_BLACK; bg_rgb = -1; }
+        else if (p >= 90 && p <= 97) { fg = ansi2vga[p - 90] + 8; fg_rgb = -1; }
+        else if (p >= 100 && p <= 107) { bg = ansi2vga[p - 100] + 8; bg_rgb = -1; }
     }
     apply_color();
 }
@@ -283,7 +395,7 @@ static int P(int i, int def) { return (i < npar && par[i] > 0) ? par[i] : def; }
 
 static void cursor(int* x, int* y) {
     vga_get_cursor(x, y);
-    if (*y >= VGA_HEIGHT) *y = VGA_HEIGHT - 1;
+    if (*y >= vga_rows()) *y = vga_rows() - 1;
 }
 
 /* Line feed: scrolls the region when leaving its bottom line. */
@@ -291,8 +403,8 @@ static void line_feed(bool cr) {
     int x, y;
     cursor(&x, &y);
     if (y == reg_bot) vga_scroll_region(reg_top, reg_bot, 1);
-    else if (y < VGA_HEIGHT - 1) y++;
-    vga_set_cursor(cr ? 0 : (x >= VGA_WIDTH ? VGA_WIDTH - 1 : x), y);
+    else if (y < vga_rows() - 1) y++;
+    vga_set_cursor(cr ? 0 : (x >= vga_cols() ? vga_cols() - 1 : x), y);
 }
 
 static void reverse_index(void) {
@@ -300,13 +412,17 @@ static void reverse_index(void) {
     cursor(&x, &y);
     if (y == reg_top) vga_scroll_region(reg_top, reg_bot, -1);
     else if (y > 0) y--;
-    vga_set_cursor(x >= VGA_WIDTH ? VGA_WIDTH - 1 : x, y);
+    vga_set_cursor(x >= vga_cols() ? vga_cols() - 1 : x, y);
 }
 
 static void csi(char final) {
     int x, y;
     cursor(&x, &y);
-    if (x >= VGA_WIDTH) x = VGA_WIDTH - 1;
+    /* Absolute cursor moves / scroll regions from a raw-mode program mean
+       a full-screen UI (nano, vi, less, top): the wheel sends it keys. */
+    if ((final == 'H' || final == 'f' || final == 'r') && !(tio.c_lflag & TTY_ICANON))
+        fullscreen = true;
+    if (x >= vga_cols()) x = vga_cols() - 1;
     switch (final) {
         case 'm': sgr(); break;
         case 'A': vga_set_cursor(x, y - P(0, 1)); break;
@@ -320,19 +436,19 @@ static void csi(char final) {
         case 'H': case 'f': vga_set_cursor(P(1, 1) - 1, P(0, 1) - 1); break;
         case 'K': {
             int mode = npar ? par[0] : 0;
-            int x0 = mode == 0 ? x : 0, x1 = mode == 1 ? x + 1 : VGA_WIDTH;
+            int x0 = mode == 0 ? x : 0, x1 = mode == 1 ? x + 1 : vga_cols();
             vga_erase(x0, y, x1);
             break;
         }
         case 'J': {
             int mode = npar ? par[0] : 0;
             if (mode == 2 || mode == 3) {
-                for (int r = 0; r < VGA_HEIGHT; r++) vga_erase(0, r, VGA_WIDTH);
+                for (int r = 0; r < vga_rows(); r++) vga_erase(0, r, vga_cols());
             } else if (mode == 0) {
-                vga_erase(x, y, VGA_WIDTH);
-                for (int r = y + 1; r < VGA_HEIGHT; r++) vga_erase(0, r, VGA_WIDTH);
+                vga_erase(x, y, vga_cols());
+                for (int r = y + 1; r < vga_rows(); r++) vga_erase(0, r, vga_cols());
             } else {
-                for (int r = 0; r < y; r++) vga_erase(0, r, VGA_WIDTH);
+                for (int r = 0; r < y; r++) vga_erase(0, r, vga_cols());
                 vga_erase(0, y, x + 1);
             }
             break;
@@ -351,8 +467,8 @@ static void csi(char final) {
         case 'S': vga_scroll_region(reg_top, reg_bot, P(0, 1)); break;
         case 'T': vga_scroll_region(reg_top, reg_bot, -P(0, 1)); break;
         case 'r': {                                         /* DECSTBM */
-            int t = P(0, 1) - 1, b = P(1, VGA_HEIGHT) - 1;
-            if (b >= VGA_HEIGHT) b = VGA_HEIGHT - 1;
+            int t = P(0, 1) - 1, b = P(1, vga_rows()) - 1;
+            if (b >= vga_rows()) b = vga_rows() - 1;
             if (t < b) { reg_top = t; reg_bot = b; }
             vga_set_cursor(0, 0);
             break;
@@ -377,6 +493,15 @@ static void csi(char final) {
     }
 }
 
+/* DEC private modes: cursor visibility, the alternate screen. */
+static void dec_mode(bool set) {
+    for (int i = 0; i < (npar ? npar : 1); i++) {
+        int m = par[i];
+        if (m == 25) vga_cursor_visible(set);
+        else if (m == 1049 || m == 47 || m == 1047) vga_alt_screen(set);
+    }
+}
+
 /* VT100 special graphics (ESC(0 / smacs) -> CP437 box drawing. */
 static char acs_map(char c) {
     switch (c) {
@@ -390,11 +515,25 @@ static char acs_map(char c) {
     return c;
 }
 
+static void emit(uint32_t cp) {
+    int x, y;
+    cursor(&x, &y);
+    if (x >= vga_cols()) line_feed(true);                    /* deferred autowrap */
+    vga_putu(cp);
+}
+
+/* A broken UTF-8 sequence: show its bytes as CP866, like before UTF-8. */
+static void utf_flush(void) {
+    for (int i = 0; i < utf_n; i++) emit(cp866_to_uni(utf_raw[i]));
+    utf_need = utf_n = 0;
+}
+
 static void render(char c) {
+    if (utf_need && (st != ST_NORMAL || ((uint8_t)c & 0xC0) != 0x80)) utf_flush();
     switch (st) {
         case ST_ESC:
             st = ST_NORMAL;
-            if (c == '[') { st = ST_CSI; npar = 0; par_priv = false; par[0] = 0; return; }
+            if (c == '[') { st = ST_CSI; npar = 0; par_priv = par_q = false; par[0] = 0; return; }
             if (c == ']') { st = ST_OSC; return; }
             if (c == '(') { st = ST_G0; return; }
             if (c == ')') { st = ST_G1; return; }
@@ -432,8 +571,12 @@ static void render(char c) {
                 if (npar < 16) par[npar++] = 0;
                 return;
             }
-            if (c == '?' || c == '>' || c == '=' || c == '!') { par_priv = true; return; }
-            if (c >= 0x40 && c <= 0x7E) { if (!par_priv) csi(c); st = ST_NORMAL; }
+            if (c == '?' || c == '>' || c == '=' || c == '!') { par_priv = true; par_q = c == '?'; return; }
+            if (c >= 0x40 && c <= 0x7E) {
+                if (!par_priv) csi(c);
+                else if (par_q && (c == 'h' || c == 'l')) dec_mode(c == 'h');
+                st = ST_NORMAL;
+            }
             return;
         default:
             break;
@@ -450,18 +593,33 @@ static void render(char c) {
             return;
         case '\b':                                          /* move left, never erase */
             cursor(&x, &y);
-            if (x >= VGA_WIDTH) x = VGA_WIDTH - 1;
+            if (x >= vga_cols()) x = vga_cols() - 1;
             if (x > 0) vga_set_cursor(x - 1, y);
             return;
         case '\t':
             cursor(&x, &y);
             x = (x + 8) & ~7;
-            vga_set_cursor(x >= VGA_WIDTH ? VGA_WIDTH - 1 : x, y);
+            vga_set_cursor(x >= vga_cols() ? vga_cols() - 1 : x, y);
             return;
     }
-    cursor(&x, &y);
-    if (x >= VGA_WIDTH) line_feed(true);                    /* deferred autowrap */
-    vga_putc(acs ? acs_map(c) : c);
+    uint8_t u = (uint8_t)c;
+    if (utf_need) {                                          /* continuation byte */
+        utf_cp = (utf_cp << 6) | (u & 0x3F);
+        utf_raw[utf_n++] = u;
+        if (--utf_need == 0) { utf_n = 0; emit(utf_cp); }
+        return;
+    }
+    if (u >= 0xC2 && u <= 0xF4) {                            /* UTF-8 lead byte */
+        utf_need = u >= 0xF0 ? 3 : u >= 0xE0 ? 2 : 1;
+        utf_cp = u & (0x3F >> utf_need);
+        utf_raw[0] = u;
+        utf_n = 1;
+        return;
+    }
+    if (u >= 0x80) { emit(cp866_to_uni(u)); return; }        /* stray byte: CP866 */
+    if (acs) { emit(cp866_to_uni((uint8_t)acs_map(c))); return; }
+    (void)x; (void)y;
+    emit(u);
 }
 
 bool tty_has_output(void) { return out_head != out_tail; }

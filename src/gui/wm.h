@@ -40,7 +40,27 @@ struct window {
     bool needs_repaint;                                       /* set by app to force repaint */
     bool animate;                                             /* if true, app repainted every frame */
     bool minimized;                                           /* hidden, restorable from taskbar */
+
+    /* Geometry management (all windows). Apps must lay out from
+       wm_client_rect() on every paint; on_resize is just a heads-up. */
+    bool resizable;                  /* default true; false = fixed size, no maximize */
+    bool opaque;                     /* on_paint covers its whole client every time:
+                                        the compositor then skips what is beneath */
+    int  min_w, min_h;               /* resize limits (outer size) */
+    bool maximized;                  /* fills the desktop above the taskbar */
+    bool fullscreen;                 /* whole screen, no decorations (Alt+Enter) */
+    int  resizing;                   /* WM_EDGE_* mask while a border is dragged */
+    int  rs_x, rs_y, rs_w, rs_h, rs_mx, rs_my;               /* resize start */
+    int  norm_x, norm_y, norm_w, norm_h;                     /* before maximize */
+    int  fs_x, fs_y, fs_w, fs_h;                             /* before fullscreen */
+    void (*on_resize)(window_t*);                             /* client size changed; NULL ok */
+    void (*on_scroll)(window_t*, int dz);                     /* mouse wheel, dz > 0 = down; NULL ok */
 };
+
+#define WM_EDGE_L 1
+#define WM_EDGE_R 2
+#define WM_EDGE_T 4
+#define WM_EDGE_B 8
 
 /* Public API */
 void      wm_init(void);
@@ -70,6 +90,10 @@ window_t* wm_focused(void);
 void      wm_invalidate_wallpaper(void);
 /* Type + run a shell command line in the desktop terminal (opens it). */
 bool      wm_terminal_feed(const char* line);
+
+/* Toggle maximized / fullscreen state (no-op for non-resizable windows). */
+void      wm_toggle_maximize(window_t* w);
+void      wm_toggle_fullscreen(window_t* w);
 
 /* For app windows: get the client rectangle (inside title+border). */
 void      wm_client_rect(window_t* w, int* x, int* y, int* cw, int* ch);

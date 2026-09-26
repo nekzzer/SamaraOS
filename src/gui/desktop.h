@@ -10,4 +10,9 @@ bool desktop_init_graphics(void);             /* try VBE then mode 13h */
 void desktop_draw_chrome(int boot_sec_offset);
 void desktop_draw_terminal_window(int x, int y, int w, int h, const char* title);
 
+/* Full-screen graphical console (the shell outside the desktop). */
+bool console_gfx_start(void);
+bool console_is_gfx(void);
+int  console_font_step(int d);       /* Ctrl +/-: lines the content moved up */
+
 #endif

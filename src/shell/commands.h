@@ -92,6 +92,7 @@ void cmd_kbdignore(int argc, char **argv);
 /* Ring-3 program launching, shared with shell.c. */
 bool shell_find_program(const char *name, char *out, int cap);
 int  shell_exec_program(const char *path, int argc, char **argv);
+int  shell_spawn_background(const char *path, int argc, char **argv);   /* `cmd &` */
 bool shell_fg_running(void);
 void shell_fg_key(char c);
 bool shell_fg_poll(void);

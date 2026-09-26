@@ -23,6 +23,18 @@
 
 enum { U_FREE, U_PENDING, U_OPEN, U_CLOSING, U_FAILED };
 
+/* Text the program drew into its window buffer, kept as text: the WM draws
+   it at screen resolution over the scaled image (see u_paint), so a window
+   shown at 3x does not get 3x-pixel letters. One list per frame. */
+#define OVL_MAX 64
+#define OVL_STR 64
+typedef struct {
+    int16_t  x, y;
+    int16_t  font;
+    uint32_t color;
+    char     s[OVL_STR];
+} ovl_t;
+
 typedef struct {
     volatile int state;
     int pid;
@@ -37,6 +49,13 @@ typedef struct {
     bool pressed;
     int hover_x, hover_y;
     uint32_t* row;                   /* scaled-row scratch */
+    int row_cap;                     /* pixels in row */
+    uint32_t  buf;                   /* user address of the pixels it presents */
+    ovl_t     ovl_next[OVL_MAX];     /* text of the frame being drawn */
+    int       n_next;
+    ovl_t     ovl[2][OVL_MAX];       /* presented frames (double-buffered) */
+    int       n_ovl[2];
+    volatile int ovl_cur;
 } uwin_t;
 
 static uwin_t U[UWIN_MAX];
@@ -102,26 +121,94 @@ static uwin_t* of(window_t* w) { return (uwin_t*)w->user; }
 
 /* ---------------- WM callbacks (WM task) ---------------- */
 
-static void u_paint(window_t* w) {
-    uwin_t* u = of(w);
+/* Where the image sits in the window: the largest integer scale that fits
+   the client area (the window may have been resized or maximized),
+   centred. Screen coordinates. */
+static void u_geom(uwin_t* u, window_t* w, int* ox, int* oy, int* sc) {
     int cx, cy, cw, ch;
     wm_client_rect(w, &cx, &cy, &cw, &ch);
+    int s = cw / u->w, t = ch / u->h;
+    if (t < s) s = t;
+    if (s > 8) s = 8;
+    if (s < 1) s = 1;
+    *sc = s;
+    *ox = cx + (cw - u->w * s) / 2;
+    *oy = cy + (ch - u->h * s) / 2;
+    if (*ox < cx) *ox = cx;
+    if (*oy < cy) *oy = cy;
+}
+
+/* Screen point -> image pixel (clamped to the image). */
+static void u_map(uwin_t* u, window_t* w, int mx, int my, int* x, int* y) {
+    int ox, oy, s;
+    u_geom(u, w, &ox, &oy, &s);
+    int px = mx - ox, py = my - oy;
+    *x = (px < 0 ? 0 : px / s);
+    *y = (py < 0 ? 0 : py / s);
+    if (*x >= u->w) *x = u->w - 1;
+    if (*y >= u->h) *y = u->h - 1;
+}
+
+static void u_paint(window_t* w) {
+    uwin_t* u = of(w);
+    int cx, cy, cw, ch, ox, oy, s;
+    wm_client_rect(w, &cx, &cy, &cw, &ch);
     if (!u->pix) return;
-    if (u->scale <= 1) { gfx_blit_argb(cx, cy, u->w, u->h, u->pix); return; }
-    int s = u->scale;
-    for (int y = 0; y < u->h; y++) {
-        const uint32_t* src = u->pix + y * u->w;
-        for (int x = 0; x < u->w; x++)
-            for (int k = 0; k < s; k++) u->row[x * s + k] = src[x];
-        for (int k = 0; k < s; k++) gfx_blit_argb(cx, cy + y * s + k, u->w * s, 1, u->row);
+    u_geom(u, w, &ox, &oy, &s);
+    int iw = u->w * s, ih = u->h * s;
+    /* letterbox bands */
+    const uint32_t bar = 0x000000;
+    if (oy > cy)                gfx_rect_fill(cx, cy, cw, oy - cy, bar);
+    if (oy + ih < cy + ch)      gfx_rect_fill(cx, oy + ih, cw, cy + ch - oy - ih, bar);
+    if (ox > cx)                gfx_rect_fill(cx, oy, ox - cx, ih, bar);
+    if (ox + iw < cx + cw)      gfx_rect_fill(ox + iw, oy, cx + cw - ox - iw, ih, bar);
+    if (s == 1) {
+        gfx_blit_argb(ox, oy, u->w, u->h, u->pix);
+    } else {
+        if (iw > u->row_cap) return;
+        for (int y = 0; y < u->h; y++) {
+            const uint32_t* src = u->pix + y * u->w;
+            for (int x = 0; x < u->w; x++)
+                for (int k = 0; k < s; k++) u->row[x * s + k] = src[x];
+            for (int k = 0; k < s; k++) gfx_blit_argb(ox, oy + y * s + k, iw, 1, u->row);
+        }
     }
+    /* the frame's text, crisp at this scale, clipped to the image */
+    int cur = u->ovl_cur, n = u->n_ovl[cur];
+    if (!n) return;
+    int kx, ky, kw, kh;
+    gfx_get_clip(&kx, &ky, &kw, &kh);
+    int x0 = ox > kx ? ox : kx, y0 = oy > ky ? oy : ky;
+    int x1 = ox + iw < kx + kw ? ox + iw : kx + kw, y1 = oy + ih < ky + kh ? oy + ih : ky + kh;
+    if (x1 <= x0 || y1 <= y0) return;
+    gfx_set_clip(x0, y0, x1 - x0, y1 - y0);
+    for (int i = 0; i < n; i++) {
+        const ovl_t* o = &u->ovl[cur][i];
+        uif_draw_scaled(ox + o->x * s, oy + o->y * s, o->font, o->s, o->color, s);
+    }
+    gfx_set_clip(kx, ky, kw, kh);
+}
+
+/* SM_OP_TEXT aimed at a window's own pixel buffer (the one it presents):
+   record it instead of rasterizing at window resolution. */
+static uwin_t* text_target(uint32_t buf, int bw, int bh) {
+    proc_t* p = proc_current();
+    if (!p || !buf) return NULL;
+    for (int i = 0; i < UWIN_MAX; i++) {
+        uwin_t* u = &U[i];
+        if (u->state == U_OPEN && u->pid == p->pid && u->buf == buf && u->w == bw && u->h == bh)
+            return u;
+    }
+    return NULL;
 }
 
 static void u_key(window_t* w, char c) { push(of(w), SM_EV_KEY, (uint8_t)c, 0, 0); }
 
 static void u_click(window_t* w, int rx, int ry) {
     uwin_t* u = of(w);
-    int x = rx / u->scale, y = ry / u->scale;
+    int cx, cy, cw, ch, x, y;
+    wm_client_rect(w, &cx, &cy, &cw, &ch);
+    u_map(u, w, cx + rx, cy + ry, &x, &y);
     if (!u->pressed) { u->pressed = true; push(u, SM_EV_MOUSE_DOWN, x, y, 1); }
     else if (x != u->hover_x || y != u->hover_y) push(u, SM_EV_MOUSE_MOVE, x, y, 1);
     u->hover_x = x; u->hover_y = y;
@@ -147,11 +234,17 @@ static void u_tick(window_t* w, uint32_t now) {
     wm_client_rect(w, &cx, &cy, &cw, &ch);
     mouse_get(&mx, &my, &b);
     if (mx < cx || my < cy || mx >= cx + cw || my >= cy + ch) return;
-    int x = (mx - cx) / u->scale, y = (my - cy) / u->scale;
+    int x, y;
+    u_map(u, w, mx, my, &x, &y);
     if (x != u->hover_x || y != u->hover_y) {
         u->hover_x = x; u->hover_y = y;
         push(u, SM_EV_MOUSE_MOVE, x, y, 0);
     }
+}
+
+static void u_scroll(window_t* w, int dz) {
+    uwin_t* u = of(w);
+    push(u, SM_EV_WHEEL, dz, u->hover_x, u->hover_y);
 }
 
 static void u_close(window_t* w) {
@@ -186,6 +279,10 @@ void uwin_wm_frame(void) {
             if (!w) { u->state = U_FAILED; continue; }
             w->on_release = u_release;
             w->on_close = u_close;
+            w->on_scroll = u_scroll;
+            w->opaque = true;                    /* u_paint fills image + letterbox */
+            w->min_w = u->w + 8;                 /* never below 1:1 */
+            w->min_h = u->h + WM_TITLE_H + 6;
             u->win = w;
             u->state = U_OPEN;
         } else if (u->state == U_CLOSING) {
@@ -210,6 +307,12 @@ void uwin_wm_exit(void) {
 }
 
 bool uwin_wm_running(void) { return wm_up; }
+
+bool uwin_pid_has_window(int pid) {
+    for (int i = 0; i < UWIN_MAX; i++)
+        if (U[i].state == U_OPEN && U[i].pid == pid) return true;
+    return false;
+}
 
 void uwin_proc_exit(int pid) {
     for (int i = 0; i < UWIN_MAX; i++) {
@@ -242,7 +345,9 @@ static int32_t op_open(uint32_t a) {
     u->hover_x = u->hover_y = -1;
     if (!o.title || !ustr(o.title, u->title, sizeof(u->title))) strcpy(u->title, p->name);
     u->pix = (uint32_t*)kmalloc((size_t)o.w * o.h * 4);
-    u->row = (uint32_t*)kmalloc((size_t)o.w * o.scale * 4);
+    /* Wide enough for any scale a maximized window can reach. */
+    u->row_cap = gfx_w() > o.w * o.scale ? gfx_w() : o.w * o.scale;
+    u->row = (uint32_t*)kmalloc((size_t)u->row_cap * 4);
     if (!u->pix || !u->row) { release_slot(u); return -ENOMEM; }
     memset(u->pix, 0, (size_t)o.w * o.h * 4);
     u->state = U_PENDING;
@@ -278,6 +383,17 @@ int32_t uwin_syscall(uint32_t op, uint32_t a, uint32_t b, uint32_t c) {
         char s[512];
         if (!ustr(t.str, s, sizeof(s))) return -EFAULT;
         if (!t.buf) return uif_width_any(t.font, s);
+        uwin_t* tu = text_target(t.buf, t.bw, t.bh);
+        if (tu) {
+            if (tu->n_next < OVL_MAX) {
+                ovl_t* o = &tu->ovl_next[tu->n_next++];
+                o->x = (int16_t)t.x; o->y = (int16_t)t.y;
+                o->font = (int16_t)t.font; o->color = t.color;
+                strncpy(o->s, s, OVL_STR - 1);
+                o->s[OVL_STR - 1] = 0;
+            }
+            return t.x + uif_width_any(t.font, s);
+        }
         if (t.bw <= 0 || t.bh <= 0 || t.bw * t.bh > MAX_PIXELS ||
             !uok(t.buf, (uint32_t)t.bw * t.bh * 4)) return -EFAULT;
         return uif_draw_mem((uint32_t*)t.buf, t.bw, t.bh, t.x, t.y, t.font, s, t.color);
@@ -291,6 +407,14 @@ int32_t uwin_syscall(uint32_t op, uint32_t a, uint32_t b, uint32_t c) {
         if (u->gone) return -EPIPE;
         if (u->state != U_OPEN) return -EAGAIN;
         memcpy(u->pix, (const void*)b, (size_t)u->w * u->h * 4);
+        if (u->buf == b) {                    /* frame's text goes live with its pixels */
+            int nx = 1 - u->ovl_cur;
+            memcpy(u->ovl[nx], u->ovl_next, (size_t)u->n_next * sizeof(ovl_t));
+            u->n_ovl[nx] = u->n_next;
+            u->ovl_cur = nx;
+        }
+        u->n_next = 0;
+        u->buf = b;       /* text drawn into this buffer from now on becomes overlay */
         if (u->win) u->win->needs_repaint = true;
         return 0;
     case SM_OP_EVENT:
@@ -314,9 +438,11 @@ int32_t uwin_syscall(uint32_t op, uint32_t a, uint32_t b, uint32_t c) {
         uint8_t btn;
         wm_client_rect(u->win, &cx, &cy, &cw, &ch);
         mouse_get(&mx, &my, &btn);
-        bool inside = mx >= cx && my >= cy && mx < cx + cw && my < cy + ch;
-        out[0] = (mx - cx) / u->scale;
-        out[1] = (my - cy) / u->scale;
+        int ox, oy, sc;
+        u_geom(u, u->win, &ox, &oy, &sc);
+        bool inside = mx >= ox && my >= oy && mx < ox + u->w * sc && my < oy + u->h * sc;
+        out[0] = (mx - ox) / sc;
+        out[1] = (my - oy) / sc;
         out[2] = wm_focused() == u->win ? btn : 0;
         return inside ? 1 : 0;
     }

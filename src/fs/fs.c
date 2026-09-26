@@ -38,7 +38,7 @@ void fs_init(void) {
     static const struct { const char* name; uint8_t dev; } devs[] = {
         { "null", FS_DEV_NULL }, { "zero", FS_DEV_ZERO }, { "tty", FS_DEV_TTY },
         { "console", FS_DEV_TTY }, { "random", FS_DEV_RANDOM }, { "urandom", FS_DEV_RANDOM },
-        { "fb0", FS_DEV_FB }, { "input", FS_DEV_INPUT },
+        { "fb0", FS_DEV_FB }, { "input", FS_DEV_INPUT }, { "ptmx", FS_DEV_PTMX },
     };
     for (unsigned i = 0; i < sizeof(devs) / sizeof(devs[0]); i++) {
         fs_node_t* d = node_new(devs[i].name, FS_FILE, dev);
@@ -46,6 +46,8 @@ void fs_init(void) {
         d->mode = 0666;
         link_child(dev, d);
     }
+
+    link_child(dev, node_new("pts", FS_DIR, dev));      /* pty slaves appear here */
 
     fs_node_t* user = node_new("user", FS_DIR, home);
     link_child(home, user);
@@ -139,7 +141,7 @@ int fs_unlink(fs_node_t* cwd, const char* path) {
     if (n->type == FS_DIR && n->child) return -1;
     fs_detach(n);
     if (n->refs > 0) { n->unlinked = true; return 0; }   /* still open */
-    if (n->data) kfree(n->data);
+    fs_data_free(n);
     kfree(n);
     return 0;
 }
@@ -166,19 +168,34 @@ void fs_attach(fs_node_t* dir, fs_node_t* n) {
 void fs_release(fs_node_t* n) {
     if (!n || --n->refs > 0) return;
     if (n->unlinked) {
-        if (n->data) kfree(n->data);
+        fs_data_free(n);
         kfree(n);
     }
 }
 
 fs_node_t* fs_child(fs_node_t* dir, const char* name) { return find_child(dir, name); }
 
+void fs_data_free(fs_node_t* n) {
+    if (n->data && n->cap) kfree(n->data);
+    n->data = NULL;
+    n->cap = 0;
+}
+
+void fs_set_static(fs_node_t* n, const char* data, size_t len) {
+    fs_data_free(n);
+    n->data = (char*)data;
+    n->size = len;
+    n->cap = 0;
+    n->mtime = fs_now();
+    fs_touch(n);
+}
+
 int fs_write(fs_node_t* f, const char* data, size_t len) {
     if (!f || f->type != FS_FILE) return -1;
     if (f->cap < len + 1) {
-        if (f->data) kfree(f->data);
+        fs_data_free(f);
         f->cap = len + 64;
-        f->data = (char*)kmalloc(f->cap);
+        f->data = (char*)kmalloc_big(f->cap);
         if (!f->data) { f->cap = 0; f->size = 0; return -1; }
     }
     memcpy(f->data, data, len);
@@ -193,9 +210,10 @@ int fs_append(fs_node_t* f, const char* data, size_t len) {
     if (!f || f->type != FS_FILE) return -1;
     size_t need = f->size + len + 1;
     if (f->cap < need) {
-        char* nb = (char*)kmalloc(need + 64);
+        char* nb = (char*)kmalloc_big(need + 64);
         if (!nb) return -1;
-        if (f->data) { memcpy(nb, f->data, f->size); kfree(f->data); }
+        if (f->data) memcpy(nb, f->data, f->size);
+        fs_data_free(f);
         f->data = nb; f->cap = need + 64;
     }
     memcpy(f->data + f->size, data, len);

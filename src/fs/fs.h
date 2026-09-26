@@ -12,7 +12,8 @@ typedef struct fs_node {
     struct fs_node* parent;
     struct fs_node* child;     /* dir: first child */
     struct fs_node* next;      /* sibling */
-    char* data;                /* file: contents */
+    char* data;                /* file: contents; cap == 0 && data: borrowed,
+                                  read-only (boot archive) - copied on write */
     size_t size;
     size_t cap;
     uint16_t mode;             /* permission bits (0755 dirs, 0644 files) */
@@ -23,8 +24,12 @@ typedef struct fs_node {
     uint8_t  mount_id;         /* nonzero on the root of a mounted volume */
 } fs_node_t;
 
-enum { FS_DEV_NONE = 0, FS_DEV_NULL, FS_DEV_ZERO, FS_DEV_TTY, FS_DEV_RANDOM, FS_DEV_FB, FS_DEV_INPUT };
+enum { FS_DEV_NONE = 0, FS_DEV_NULL, FS_DEV_ZERO, FS_DEV_TTY, FS_DEV_RANDOM, FS_DEV_FB, FS_DEV_INPUT,
+       FS_DEV_PTMX };
 #define FS_DEV_DISK 16                 /* FS_DEV_DISK + ata index: /dev/hda.. /dev/sda.. */
+#define FS_DEV_PTS  64                 /* FS_DEV_PTS + n: /dev/pts/n (pty slaves) */
+#define FS_DEV_IS_DISK(d) ((d) >= FS_DEV_DISK && (d) < FS_DEV_PTS)
+#define FS_DEV_IS_PTS(d)  ((d) >= FS_DEV_PTS && (d) < FS_DEV_PTS + 16)
 
 void        fs_add_disk_nodes(void);      /* after disks are probed */
 
@@ -34,6 +39,10 @@ fs_node_t*  fs_resolve(fs_node_t* cwd, const char* path);   /* NULL if missing *
 fs_node_t*  fs_create(fs_node_t* cwd, const char* path, fs_type_t type);
 int         fs_unlink(fs_node_t* cwd, const char* path);
 int         fs_write(fs_node_t* file, const char* data, size_t len);  /* replaces */
+void        fs_data_free(fs_node_t* n);       /* drop contents (owned ones are freed) */
+/* Contents in place without copying (must outlive the node, e.g. a boot
+   module); the first write makes a private copy. */
+void        fs_set_static(fs_node_t* n, const char* data, size_t len);
 int         fs_append(fs_node_t* file, const char* data, size_t len);
 void        fs_path(fs_node_t* node, char* out, size_t cap);
 void        fs_release(fs_node_t* node);          /* drop an open reference */

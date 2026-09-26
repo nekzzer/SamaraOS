@@ -15,8 +15,11 @@
 #include "fs/fs.h"
 #include "shell/shell.h"
 #include "boot/multiboot.h"
+#include "core/bootmod.h"
+#include "core/vmm.h"
 #include "gfx/font.h"
 #include "gui/desktop.h"
+#include "gfx/termfont.h"
 #include "drivers/ata.h"
 #include "drivers/ahci.h"
 #include "apps/doom.h"
@@ -125,6 +128,7 @@ static void task_blinker(void) {
 /* Kernel command line (multiboot / QEMU -append), copied before anything
    can overwrite the bootloader's copy. */
 static char boot_cmdline[512];
+const char* kernel_cmdline(void) { return boot_cmdline; }
 
 /* "autosh=<script>" runs `/bin/sh -c <script>` at boot with the program's
    output mirrored to COM1, then powers off: headless tests from the host. */
@@ -140,7 +144,70 @@ static void boot_autorun(void) {
     outw(0x604, 0x2000);                 /* QEMU ACPI power off */
 }
 
+/* ---- boot modules ---- */
+
+#define MAX_BOOTMODS 8
+static bootmod_t bootmods[MAX_BOOTMODS];
+static int n_bootmods;
+static uint32_t mods_floor;               /* lowest byte used by moved modules */
+
+int boot_modules(const bootmod_t** out) { *out = bootmods; return n_bootmods; }
+
+typedef struct { uint32_t start, end, string, reserved; } mb_mod_t;
+
+/* The loader drops modules right after the kernel image - where our heap
+   goes. Before anything allocates (paging is still off), slide them to the
+   top of RAM, highest first so none overwrites another. */
+static void relocate_modules(multiboot_info_t* mbi, uint32_t ram_end) {
+    mods_floor = ram_end;
+    if (!(mbi->flags & 8) || !mbi->mods_count) return;
+    mb_mod_t* m = (mb_mod_t*)mbi->mods_addr;
+    int n = (int)mbi->mods_count;
+    if (n > MAX_BOOTMODS) n = MAX_BOOTMODS;
+    for (int i = 0; i < n; i++) {
+        bootmods[i].start = m[i].start;
+        bootmods[i].end = m[i].end;
+        const char* nm = m[i].string ? (const char*)m[i].string : "";
+        int k = 0;
+        while (nm[k] && k < 63) { bootmods[i].name[k] = nm[k]; k++; }
+        bootmods[i].name[k] = 0;
+    }
+    /* order by source address, descending */
+    for (int i = 1; i < n; i++) {
+        bootmod_t v = bootmods[i];
+        int j = i - 1;
+        while (j >= 0 && bootmods[j].start < v.start) { bootmods[j + 1] = bootmods[j]; j--; }
+        bootmods[j + 1] = v;
+    }
+    uint32_t top = ram_end & ~0xFFFu;
+    for (int i = 0; i < n; i++) {
+        uint32_t len = bootmods[i].end - bootmods[i].start;
+        uint32_t dst = (top - len) & ~0xFFFu;
+        if (len > top || dst < 0x08000000u) { n = i; break; }  /* no room above 128 MiB */
+        memmove((void*)dst, (const void*)bootmods[i].start, len);
+        bootmods[i].start = dst;
+        bootmods[i].end = dst + len;
+        top = dst;
+    }
+    n_bootmods = n;
+    mods_floor = top;
+}
+
+static uint32_t ram_top(uint32_t magic, uint32_t mb_info_addr) {
+    uint32_t ram_end = 0x08000000;
+    if (magic == MB1_BOOTED_MAGIC && mb_info_addr) {
+        multiboot_info_t* mbi = (multiboot_info_t*)mb_info_addr;
+        if (mbi->flags & 1) ram_end = 0x100000 + mbi->mem_upper * 1024;
+    }
+    if (ram_end > DMAP_SIZE) ram_end = DMAP_SIZE;
+    return ram_end;
+}
+
 void kmain(uint32_t magic, uint32_t mb_info_addr) {
+    if (magic == MB1_BOOTED_MAGIC && mb_info_addr)
+        relocate_modules((multiboot_info_t*)mb_info_addr, ram_top(magic, mb_info_addr));
+    else
+        mods_floor = ram_top(magic, mb_info_addr);
     if (magic == MB1_BOOTED_MAGIC && mb_info_addr) {
         multiboot_info_t* mbi = (multiboot_info_t*)mb_info_addr;
         if ((mbi->flags & 4) && mbi->cmdline) {
@@ -148,6 +215,16 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
             int i = 0;
             while (c[i] && i < (int)sizeof(boot_cmdline) - 1) { boot_cmdline[i] = c[i]; i++; }
             boot_cmdline[i] = 0;
+        }
+    }
+
+    { extern bool g_wm_stats; g_wm_stats = strstr(boot_cmdline, "wmstats") != NULL; }
+    {   /* syscalls -> COM1: "strace" (all) or "strace=PID" */
+        extern bool g_strace; extern int g_strace_pid;
+        const char* k = strstr(boot_cmdline, "strace");
+        if (k) {
+            g_strace = true;
+            if (k[6] == '=') for (k += 7; *k >= '0' && *k <= '9'; k++) g_strace_pid = g_strace_pid * 10 + (*k - '0');
         }
     }
 
@@ -162,6 +239,7 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
     const uint32_t heap_bytes = 0x4000000;
     heap_init((void*)_heap_start, heap_bytes);
 
+    termfont_init();
     vga_init();
     vga_set_color(VGA_LCYAN, VGA_BLACK);
     vga_puts("=== SamaraOS booting ===\n");
@@ -181,7 +259,7 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
     vga_printf("ok (cr0=0x%x cr4=0x%x)\n", paging_cr0(), paging_cr4());
 
     boot_step("fpu"); fpu_init();
-    boot_done(fpu_present() ? "ok" : "absent");
+    boot_done(!fpu_present() ? "absent" : fpu_sse() ? "ok (x87 + SSE)" : "ok (x87)");
 
     BOOT_OK("pic", pic_remap());
     clock_init();
@@ -206,17 +284,20 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
     BOOT_OK("pit 1000Hz", pit_init(1000));
 
     /* User frames: from the first 4 MiB boundary past the heap up to the
-       end of RAM (capped at USER_BASE, see vmm.h). */
+       boot modules / end of RAM (direct-mapped, see vmm.h). */
     {
+        /* [pool_start, mods_floor): process frames, and with RAM to spare
+           the top 40% of it becomes the big heap arena for file contents
+           (compilers, archives), reached through the direct map. */
         uint32_t pool_start = ((uint32_t)_heap_start + heap_bytes + 0x3FFFFF) & ~0x3FFFFFu;
-        uint32_t ram_end = 0x08000000;
-        if (magic == MB1_BOOTED_MAGIC && mb_info_addr) {
-            multiboot_info_t* mbi = (multiboot_info_t*)mb_info_addr;
-            if (mbi->flags & 1) ram_end = 0x100000 + mbi->mem_upper * 1024;
-        }
+        uint32_t pool_end = mods_floor & ~0x3FFFFFu;
+        uint32_t avail = pool_end > pool_start ? pool_end - pool_start : 0;
+        uint32_t big = avail >= 0x10000000u ? (avail / 5 * 2) & ~0x3FFFFFu : 0;   /* >= 256 MiB */
+        if (big) heap_add_big(P2V(pool_end - big), big);
         boot_step("user memory");
-        pmm_init(pool_start, ram_end);
-        vga_printf("ok (%u KB)\n", pmm_total_frames() * 4);
+        pmm_init(pool_start, pool_end - big);
+        vga_printf("ok (%u KB, files %u KB, modules %d)\n", pmm_total_frames() * 4, big / 1024,
+                   n_bootmods);
     }
     BOOT_OK("syscalls", (proc_init(), syscall_init()));
     BOOT_OK("sockets", sock_init());
@@ -225,6 +306,10 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
         int n = userland_install();
         if (n < 0) boot_done("failed");
         else vga_printf("ok (%d applets)\n", n);
+    }
+    if (n_bootmods) {
+        boot_step("boot modules");
+        vga_printf("ok (%d files)\n", userland_install_modules());
     }
 
     boot_step("disks");
@@ -245,6 +330,24 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
     if (ata_drive_present(DISK_AHCI_BASE) && fatfs_probe(DISK_AHCI_BASE)) {
         int r = fatfs_mount(DISK_AHCI_BASE, fs_resolve(fs_root(), "/mnt"));
         vga_printf("    /mnt: %s\n", r == 0 ? "sda mounted (vfat, persistent)" : "mount failed");
+    }
+
+    /* Background services from /etc/rc: the dropbear ssh server and telnetd
+       (both on a pty per session). Skipped with "noservices". */
+    if (!strstr(boot_cmdline, "noservices")) {
+        fs_node_t* rc = fs_resolve(fs_root(), "/etc/rc");
+        extern fs_node_t* cwd;
+        fs_node_t* saved = cwd;
+        cwd = fs_root();
+        if (rc) {
+            char* argv[] = { "sh", "/etc/rc", NULL };
+            char* envp[] = { "PATH=/bin:/sbin:/usr/bin:/usr/sbin", "HOME=/root", NULL };
+            boot_step("services");
+            int pid = proc_spawn_detached("/bin/sh", argv, envp);
+            if (pid > 0) vga_printf("ok (ssh :22, telnet :23)\n");
+            else boot_done("failed");
+        }
+        cwd = saved;
     }
     for (const char* m = "samara: ahci: "; *m; m++) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, *m); }
     for (const char* m = ahci_status(); *m; m++) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, *m); }
@@ -297,6 +400,9 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
     sti();
 
     boot_autorun();
+    /* The shell runs on the graphical console (true colour, the terminal
+       font) unless "textmode" asks for plain VGA text. */
+    if (!strstr(boot_cmdline, "textmode")) console_gfx_start();
     shell_run();
 
     while (1) hlt();

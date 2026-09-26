@@ -18,7 +18,7 @@ void cmd_help(int argc, char **argv) {
       "net:     ifconfig  ping <ip> [count]  wget <http://ip[:port]/path> "
       "[file]\n"
       "         browser [url]   www [url]    (full web browser in desktop)\n"
-      "i18n:    klayout [ru|en]              (F11 toggles, indicator in "
+      "i18n:    klayout [ru|en]              (Alt+Shift toggles, indicator in "
       "taskbar)\n"
       "python:  python [file.py]   MicroPython (demos in /usr/src/py)\n"
       "Line ed: Left/Right Home/End Up/Down history Del ^C ^L ^D\n");

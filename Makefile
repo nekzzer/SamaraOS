@@ -10,6 +10,13 @@ LD       := $(CROSS)ld
 OBJCOPY  := $(CROSS)objcopy
 
 QEMU     ?= qemu-system-i386
+# Hardware virtualization when the host has it (/dev/kvm), else QEMU falls
+# back to TCG emulation - ~10-20x slower for drawing and compiling.
+ACCEL    ?= -accel kvm -accel tcg -cpu max
+# Guest resolution, shown 1:1 (no blurry scaling): pick one that fits your
+# screen with the window frame. `make run VIDEO=1920x1080` for fullscreen.
+VIDEO    ?= 1600x900
+QDISPLAY ?= -display gtk,zoom-to-fit=off
 
 # Wire the PC speaker (PIT channel 2) to a real audio backend. Without these
 # flags QEMU silently drops the speaker output even though the OS programs it.
@@ -70,10 +77,12 @@ KERN_SRC := \
     src/proc/userland.c \
     src/proc/procfs.c \
     src/proc/signal.c \
+    src/proc/pty.c \
     src/fs/fs.c \
     src/gfx/font.c \
     src/gfx/gfx.c \
     src/gfx/gfx_term.c \
+    src/gfx/termfont.c \
     src/gfx/uifont.c \
     src/gui/desktop.c \
     src/gui/wm.c \
@@ -98,6 +107,7 @@ KERN_SRC := \
     src/apps/browser.c \
     $(SHELL_CMD_SRC) \
     src/shell/shell.c \
+    src/shell/complete.c \
     src/boot/libgcc_div.c \
     src/core/kernel.c
 
@@ -168,8 +178,10 @@ DGEN_OBJ  := $(DGEN_SRC:.c=.o)
 # image and unpacked into the ramfs at boot (src/proc/userland.c).
 USERLAND_BINS := userland/busybox userland/busybox.applets userland/sysroot.tar
 USERLAND_OBJS := $(addsuffix .bin.o,$(USERLAND_BINS))
+# terminal font atlas (tools/mktermfont.py), linked in like the userland blobs
+TERMFONT_OBJ  := src/gfx/termfont.bin.o
 
-ALL_OBJ := $(KERN_OBJ) $(LIBC_OBJ) $(DGEN_LOC_OBJ) $(DGEN_OBJ) $(EMBED_OBJS) $(USERLAND_OBJS)
+ALL_OBJ := $(KERN_OBJ) $(LIBC_OBJ) $(DGEN_LOC_OBJ) $(DGEN_OBJ) $(EMBED_OBJS) $(USERLAND_OBJS) $(TERMFONT_OBJ)
 
 KERNEL := build/samara.elf
 
@@ -189,6 +201,9 @@ embed/%.wav.o: embed/%.wav
 	$(OBJCOPY) -I binary -O elf32-i386 -B i386 $< $@
 
 # Symbols come out as _binary_userland_busybox_start etc.
+src/gfx/termfont.bin.o: src/gfx/termfont.bin
+	$(OBJCOPY) -I binary -O elf32-i386 -B i386 --rename-section .data=.rodata,alloc,load,readonly,data,contents $< $@
+
 userland/%.bin.o: userland/%
 	$(OBJCOPY) -I binary -O elf32-i386 -B i386 --rename-section .data=.rodata,alloc,load,readonly,data,contents $< $@
 
@@ -237,7 +252,9 @@ MUSIC_DRIVE := -drive file=fat:$(MUSIC_DIR),format=raw,if=ide,index=2,snapshot=o
 
 # RTL8139 NIC on QEMU user-mode SLIRP. Guest gets 10.0.2.15, gw 10.0.2.2.
 # DNS at 10.0.2.3 is exposed but our stack doesn't use it (numeric IPs only).
-NET_DRIVE := -netdev user,id=n0 -device rtl8139,netdev=n0
+# Host loopback only: `ssh -p 2222 root@localhost`, `telnet localhost 2323`.
+NET_DRIVE := -netdev user,id=n0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:2323-:23 \
+             -device rtl8139,netdev=n0
 
 # Persistent 64 MiB FAT32 disk on AHCI: SamaraOS mounts it at /mnt and
 # writes changes back, so files there survive reboots. Created on first run;
@@ -250,15 +267,47 @@ $(DISK_IMG):
 	truncate -s 64M $@
 	mkfs.fat -F 32 -n SAMARA $@ >/dev/null
 
-run: $(KERNEL) $(DISK_IMG)
+# ---------- Self-hosting: gcc inside SamaraOS ----------
+# build/gcc.tar  = musl.cc native i686 gcc 11 (C) + GNU make  -> /opt/gcc
+# build/src.tar  = this tree's kernel sources                -> /usr/src/samaraos
+# Both are multiboot modules (qemu -initrd); the kernel moves them to the top
+# of RAM and unpacks them zero-copy. Inside the OS:
+#     cd /usr/src/samaraos && make CROSS=/opt/gcc/bin/
+GCC_TAR := build/gcc.tar
+SRC_TAR := build/src.tar
+GCC_MEM ?= 1024
+
+$(GCC_TAR): tools/mk-gcc-tar.py
+	python3 tools/mk-gcc-tar.py $@
+
+.PHONY: src-tar gcc-tar run run-gcc
+gcc-tar: $(GCC_TAR)
+src-tar:
+	python3 tools/mk-src-tar.py $(SRC_TAR)
+
+# `make run` boots the newest kernel: the host build, or the one SamaraOS
+# built itself (`selfbuild` inside the OS stores it on disk.img as
+# /samara.elf). SELF=0 forces the host build. With the gcc module present
+# the OS gets 1 GiB and /opt/gcc + /usr/src/samaraos, so it can rebuild
+# itself again.
+SELF_KERNEL := build/samara-self.elf
+BOOT_MODS   := $(GCC_TAR),$(SRC_TAR)
+RUN_MODULES = $(if $(wildcard $(GCC_TAR)),-initrd "$(BOOT_MODS)")
+
+run: $(KERNEL) $(DISK_IMG) src-tar
 	@mkdir -p $(MUSIC_DIR)
-	$(QEMU) -kernel $(KERNEL) -m 256 -vga std -serial stdio $(AUDIO) $(MUSIC_DRIVE) $(NET_DRIVE) $(DISK_DRIVE)
+	@test -f $(GCC_TAR) || $(MAKE) --no-print-directory $(GCC_TAR) || echo "(no gcc module: toolchain/gcc-native missing)"
+	K=$$(python3 tools/pick-kernel.py $(DISK_IMG) $(KERNEL) $(SELF_KERNEL)) && \
+	$(QEMU) -kernel $$K $(ACCEL) -m $(GCC_MEM) $(RUN_MODULES) -append "video=$(VIDEO) $(APPEND)" \
+	    -vga std $(QDISPLAY) -serial stdio $(AUDIO) $(MUSIC_DRIVE) $(NET_DRIVE) $(DISK_DRIVE)
+
+run-gcc: run
 
 # Run with DOOM1.WAD attached as the primary disk so 'doom' command works.
 WAD ?= Doom1.WAD
 run-doom: $(KERNEL)
 	@mkdir -p $(MUSIC_DIR)
-	$(QEMU) -kernel $(KERNEL) -m 256 -vga std -serial stdio $(AUDIO) \
+	$(QEMU) -kernel $(KERNEL) $(ACCEL) -m 256 -vga std -serial stdio $(AUDIO) \
 	    -drive file=$(WAD),format=raw,if=ide,index=0 $(MUSIC_DRIVE) $(NET_DRIVE)
 
 run-debug: $(KERNEL)
@@ -288,12 +337,16 @@ run-iso: $(ISO)
 # (exercises src/drivers/ahci.c; shows up as /dev/sda, disk index 4).
 run-sata: $(KERNEL)
 	@mkdir -p $(MUSIC_DIR)
-	$(QEMU) -kernel $(KERNEL) -m 256 -vga std -serial stdio $(AUDIO) \
+	$(QEMU) -kernel $(KERNEL) $(ACCEL) -m 256 -vga std -serial stdio $(AUDIO) \
 	    -device ahci,id=ahci -drive id=sata0,file=$(WAD),format=raw,if=none \
 	    -device ide-hd,drive=sata0,bus=ahci.0 $(MUSIC_DRIVE) $(NET_DRIVE)
+
+# compile_commands.json for clangd / editors (dry run, builds nothing)
+compile_commands.json: Makefile tools/gen-compile-commands.py
+	python3 tools/gen-compile-commands.py
 
 clean:
 	rm -f $(ALL_OBJ) $(KERNEL)
 	rm -rf build
 
-.PHONY: all run run-doom run-sata run-debug iso run-iso clean build
+.PHONY: all run run-doom run-sata run-debug iso run-iso clean build compile_commands.json

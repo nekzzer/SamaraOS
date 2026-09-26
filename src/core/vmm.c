@@ -6,11 +6,12 @@
 /* ---------------- physical frame pool ---------------- */
 
 static uint32_t pool_base, pool_frames, pool_free, hint;
-static uint8_t  refcnt[(USER_BASE >> 12)];     /* frames never exceed USER_BASE */
+static uint8_t  refcnt[(DMAP_SIZE >> 12)];     /* frames live in the direct map */
 
 void pmm_init(uint32_t start, uint32_t end) {
     start = (start + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    if (end > USER_BASE) end = USER_BASE;
+    end &= ~(PAGE_SIZE - 1);
+    if (end > DMAP_SIZE) end = DMAP_SIZE;
     if (end <= start) { pool_frames = 0; return; }
     pool_base = start;
     pool_frames = (end - start) >> 12;
@@ -35,7 +36,7 @@ uint32_t pmm_alloc(void) {
         break;
     }
     irq_restore(f);
-    if (frame) memset((void*)frame, 0, PAGE_SIZE);
+    if (frame) memset(P2V(frame), 0, PAGE_SIZE);
     return frame;
 }
 
@@ -71,15 +72,15 @@ void vmm_flush(void) {
 uint32_t vmm_new_space(void) {
     uint32_t pd = pmm_alloc();
     if (!pd) return 0;
-    const uint32_t* kpd = (const uint32_t*)task_kernel_cr3();
-    uint32_t* d = (uint32_t*)pd;
+    const uint32_t* kpd = (const uint32_t*)P2V(task_kernel_cr3());
+    uint32_t* d = (uint32_t*)P2V(pd);
     for (int i = 0; i < 1024; i++)
         d[i] = (i >= (int)PDI(USER_BASE) && i < (int)PDI(USER_TOP)) ? 0 : kpd[i];
     return pd;
 }
 
 static uint32_t* pte_slot(uint32_t pd, uint32_t va, bool create) {
-    uint32_t* d = (uint32_t*)pd;
+    uint32_t* d = (uint32_t*)P2V(pd);
     uint32_t pde = d[PDI(va)];
     if (!(pde & PTE_P)) {
         if (!create) return NULL;
@@ -88,7 +89,7 @@ static uint32_t* pte_slot(uint32_t pd, uint32_t va, bool create) {
         d[PDI(va)] = pt | PTE_P | PTE_RW | PTE_US;
         pde = d[PDI(va)];
     }
-    return (uint32_t*)(pde & ~0xFFFu) + PTI(va);
+    return (uint32_t*)P2V(pde & ~0xFFFu) + PTI(va);
 }
 
 uint32_t vmm_pte(uint32_t pd, uint32_t va) {
@@ -147,7 +148,7 @@ uint32_t vmm_find_free(uint32_t pd, uint32_t from, uint32_t limit, uint32_t len)
     len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     uint32_t run = 0, start = from;
     for (uint32_t a = from; a < limit; a += PAGE_SIZE) {
-        uint32_t* d = (uint32_t*)pd;
+        uint32_t* d = (uint32_t*)P2V(pd);
         if (!(d[PDI(a)] & PTE_P) && (a & 0x3FFFFF) == 0 && run == 0) {
             /* Whole empty 4 MiB table: take it in one step. */
             start = a;
@@ -166,13 +167,14 @@ uint32_t vmm_find_free(uint32_t pd, uint32_t from, uint32_t limit, uint32_t len)
 }
 
 void vmm_destroy_space(uint32_t pd) {
-    uint32_t* d = (uint32_t*)pd;
+    uint32_t* d = (uint32_t*)P2V(pd);
     for (uint32_t i = PDI(USER_BASE); i < PDI(USER_TOP); i++) {
         if (!(d[i] & PTE_P)) continue;
-        uint32_t* pt = (uint32_t*)(d[i] & ~0xFFFu);
+        uint32_t ptf = d[i] & ~0xFFFu;
+        uint32_t* pt = (uint32_t*)P2V(ptf);
         for (int j = 0; j < 1024; j++)
             if (pt[j] & PTE_P) pmm_unref(pt[j] & ~0xFFFu);
-        pmm_unref((uint32_t)pt);
+        pmm_unref(ptf);
         d[i] = 0;
     }
     pmm_unref(pd);
@@ -181,10 +183,10 @@ void vmm_destroy_space(uint32_t pd) {
 uint32_t vmm_clone_space(uint32_t pd) {
     uint32_t npd = vmm_new_space();
     if (!npd) return 0;
-    uint32_t* d = (uint32_t*)pd;
+    uint32_t* d = (uint32_t*)P2V(pd);
     for (uint32_t i = PDI(USER_BASE); i < PDI(USER_TOP); i++) {
         if (!(d[i] & PTE_P)) continue;
-        uint32_t* pt = (uint32_t*)(d[i] & ~0xFFFu);
+        uint32_t* pt = (uint32_t*)P2V(d[i] & ~0xFFFu);
         for (int j = 0; j < 1024; j++) {
             if (!(pt[j] & PTE_P)) continue;
             uint32_t va = (i << 22) | ((uint32_t)j << 12);
@@ -194,7 +196,7 @@ uint32_t vmm_clone_space(uint32_t pd) {
             if (pt[j] & PTE_RW) {
                 uint32_t nf = pmm_alloc();
                 if (!nf) { vmm_destroy_space(npd); return 0; }
-                memcpy((void*)nf, (void*)fr, PAGE_SIZE);
+                memcpy(P2V(nf), P2V(fr), PAGE_SIZE);
                 *np = nf | (pt[j] & 0xFFFu);
             } else {
                 pmm_ref(fr);                 /* read-only text: share */
@@ -213,7 +215,7 @@ int vmm_copy_to(uint32_t pd, uint32_t va, const void* src, uint32_t len) {
         uint32_t off = va & 0xFFF;
         uint32_t n = PAGE_SIZE - off;
         if (n > len) n = len;
-        uint8_t* dst = (uint8_t*)((pte & ~0xFFFu) + off);
+        uint8_t* dst = (uint8_t*)P2V(pte & ~0xFFFu) + off;
         if (s) { memcpy(dst, s, n); s += n; }
         else   memset(dst, 0, n);
         va += n; len -= n;
@@ -222,11 +224,11 @@ int vmm_copy_to(uint32_t pd, uint32_t va, const void* src, uint32_t len) {
 }
 
 uint32_t vmm_count_pages(uint32_t pd) {
-    uint32_t* d = (uint32_t*)pd;
+    uint32_t* d = (uint32_t*)P2V(pd);
     uint32_t n = 0;
     for (uint32_t i = PDI(USER_BASE); i < PDI(USER_TOP); i++) {
         if (!(d[i] & PTE_P)) continue;
-        uint32_t* pt = (uint32_t*)(d[i] & ~0xFFFu);
+        uint32_t* pt = (uint32_t*)P2V(d[i] & ~0xFFFu);
         for (int j = 0; j < 1024; j++) if (pt[j] & PTE_P) n++;
     }
     return n;

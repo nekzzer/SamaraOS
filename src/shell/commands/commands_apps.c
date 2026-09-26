@@ -6,6 +6,7 @@
 #include "apps/paint.h"
 #include "apps/snake.h"
 #include "core/string.h"
+#include "gui/uwin.h"
 #include "drivers/keyboard.h"
 #include "drivers/vga.h"
 #include "gfx/gfx.h"
@@ -22,7 +23,7 @@ void cmd_doom_mini(int argc, char **argv) {
   vga_puts("doom-mini: ");
   vga_puts(doom_status());
   vga_putc('\n');
-  if (!gfx_ready()) {
+  if (!uwin_wm_running()) {             /* graphics alone is the console now */
     vga_puts("doom-mini: enter 'desktop' first to view TITLEPIC\n");
     return;
   }
@@ -32,7 +33,7 @@ void cmd_doom_mini(int argc, char **argv) {
 void cmd_play(int argc, char **argv) {
   (void)argc;
   (void)argv;
-  if (!gfx_ready()) {
+  if (!uwin_wm_running()) {             /* graphics alone is the console now */
     vga_puts("play: enter 'desktop' first\n");
     return;
   }
@@ -50,7 +51,7 @@ extern const char *samara_doom_status(void);
 void cmd_doom(int argc, char **argv) {
   (void)argc;
   (void)argv;
-  if (!gfx_ready()) {
+  if (!uwin_wm_running()) {             /* graphics alone is the console now */
     vga_puts("doom: enter 'desktop' first\n");
     return;
   }
@@ -64,7 +65,7 @@ void cmd_doom(int argc, char **argv) {
 void cmd_snake(int argc, char **argv) {
   (void)argc;
   (void)argv;
-  if (!gfx_ready()) {
+  if (!uwin_wm_running()) {             /* graphics alone is the console now */
     vga_puts("snake: enter 'desktop' first\n");
     return;
   }
@@ -75,7 +76,7 @@ void cmd_snake(int argc, char **argv) {
 void cmd_player(int argc, char **argv) {
   (void)argc;
   (void)argv;
-  if (!gfx_ready()) {
+  if (!uwin_wm_running()) {             /* graphics alone is the console now */
     vga_puts("player: enter 'desktop' first\n");
     return;
   }
@@ -86,7 +87,7 @@ void cmd_player(int argc, char **argv) {
 void cmd_paint(int argc, char **argv) {
   (void)argc;
   (void)argv;
-  if (!gfx_ready()) {
+  if (!uwin_wm_running()) {             /* graphics alone is the console now */
     vga_puts("paint: enter 'desktop' first\n");
     return;
   }
@@ -97,7 +98,7 @@ void cmd_paint(int argc, char **argv) {
 void cmd_clock(int argc, char **argv) {
   (void)argc;
   (void)argv;
-  if (!gfx_ready()) {
+  if (!uwin_wm_running()) {             /* graphics alone is the console now */
     vga_puts("clock: enter 'desktop' first\n");
     return;
   }
@@ -109,7 +110,7 @@ void cmd_clock(int argc, char **argv) {
 void cmd_browser(int argc, char **argv) {
   /* If a graphics mode is up and the WM is alive, just nudge browser_open.
      Otherwise, kick off the desktop which auto-opens it via the start menu. */
-  if (!gfx_ready()) {
+  if (!uwin_wm_running()) {             /* graphics alone is the console now */
     vga_puts("browser: needs graphical desktop — run 'desktop' first\n");
     return;
   }
@@ -125,7 +126,7 @@ void cmd_klayout(int argc, char **argv) {
     else if (!strcmp(argv[1], "en") || !strcmp(argv[1], "EN"))
       kbd_set_ru(false);
     else {
-      vga_puts("klayout: usage: klayout [ru|en]    (F11 toggles)\n");
+      vga_puts("klayout: usage: klayout [ru|en]    (Alt+Shift toggles)\n");
       return;
     }
   } else {

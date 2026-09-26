@@ -7,5 +7,6 @@ void fpu_init(void);
 
 /* True if a hardware FPU was detected. */
 int fpu_present(void);
+int fpu_sse(void);           /* SSE/SSE2 enabled for programs (CR4.OSFXSR) */
 
 #endif

@@ -283,6 +283,19 @@ cp "$SAM/hello.c" "$SAM/hello.py" "$OUT/usr/src/samara/"
 cp "$SAM/tetris.c" "$SAM/breakout.py" "$OUT/usr/src/games/"
 cp "$SAM/breakout.py" "$OUT/usr/games/breakout.py"
 "$XBIN/i686-linux-musl-gcc" -static -no-pie -O2 -s -I"$SAM" "$SAM/tetris.c" -o "$OUT/usr/games/tetris"
+# logo + system info in true-colour gradients; also makes the sh prompt
+"$XBIN/i686-linux-musl-gcc" -static -no-pie -O2 -s "$SAM/samarafetch.c" -o "$OUT/usr/bin/samarafetch"
+
+# SSH: dropbear (server + dbclient + scp + dropbearkey) as one static
+# multi-call binary, hard-linked under each name (the kernel's untar shares
+# the bytes). Built by: toolchain/dropbear-*/ (see the SSH notes in README).
+DB=$(ls -d "$ROOT"/toolchain/dropbear-*/dropbearmulti 2>/dev/null | tail -1)
+if [ -n "$DB" ]; then
+    cp "$DB" "$OUT/usr/bin/dropbearmulti"
+    for n in dropbear dbclient ssh dropbearkey scp; do
+        ln -f "$OUT/usr/bin/dropbearmulti" "$OUT/usr/bin/$n"
+    done
+fi
 
 cd "$OUT"
 tar --format=ustar --owner=0 --group=0 -cf "$ROOT/userland/sysroot.tar" usr $( [ -d etc ] && echo etc )

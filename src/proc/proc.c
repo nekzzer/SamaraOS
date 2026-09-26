@@ -133,16 +133,26 @@ typedef struct {
 } __attribute__((packed)) elf_phdr_t;
 
 #define PT_LOAD 1
+#define PT_INTERP 3
 #define PT_PHDR 6
 #define PF_W    2
 
 static bool elf_ok(const fs_node_t* n) {
     if (n->size < sizeof(elf_ehdr_t)) return false;
     const elf_ehdr_t* h = (const elf_ehdr_t*)n->data;
-    return h->ident[0] == 0x7F && h->ident[1] == 'E' && h->ident[2] == 'L' && h->ident[3] == 'F' &&
-           h->ident[4] == 1 /*32-bit*/ && h->type == 2 /*EXEC*/ && h->machine == 3 /*i386*/ &&
-           h->phoff + (uint32_t)h->phnum * sizeof(elf_phdr_t) <= n->size;
+    if (!(h->ident[0] == 0x7F && h->ident[1] == 'E' && h->ident[2] == 'L' && h->ident[3] == 'F' &&
+          h->ident[4] == 1 /*32-bit*/ && h->machine == 3 /*i386*/ &&
+          h->phoff + (uint32_t)h->phnum * sizeof(elf_phdr_t) <= n->size)) return false;
+    if (h->type == 2) return true;                            /* ET_EXEC */
+    if (h->type != 3) return false;
+    /* ET_DYN: only static-pie (no interpreter) - it relocates itself. */
+    const elf_phdr_t* ph = (const elf_phdr_t*)(n->data + h->phoff);
+    for (int i = 0; i < h->phnum; i++) if (ph[i].type == PT_INTERP) return false;
+    return true;
 }
+
+/* Where static-pie images (e.g. binutils from musl.cc) are put. */
+#define PIE_BASE 0x08048000u
 
 typedef struct {
     uint32_t entry, brk, phdr, phnum;
@@ -151,29 +161,32 @@ typedef struct {
 static int load_elf(uint32_t pd, const fs_node_t* n, image_t* img) {
     const elf_ehdr_t* h = (const elf_ehdr_t*)n->data;
     const elf_phdr_t* ph = (const elf_phdr_t*)(n->data + h->phoff);
+    uint32_t bias = h->type == 3 ? PIE_BASE : 0;
     uint32_t top = 0;
     img->phdr = 0;
     for (int i = 0; i < h->phnum; i++) {
         const elf_phdr_t* p = &ph[i];
-        if (p->type == PT_PHDR) img->phdr = p->vaddr;
+        uint32_t va = p->vaddr + bias;
+        if (p->type == PT_PHDR) img->phdr = va;
         if (p->type != PT_LOAD || p->memsz == 0) continue;
-        if (p->vaddr < USER_BASE || p->vaddr + p->memsz > USER_MMAP_BASE ||
+        if (va < USER_BASE || va + p->memsz > USER_MMAP_BASE ||
             p->filesz > p->memsz || p->offset + p->filesz > n->size) return -ENOEXEC;
-        if (vmm_alloc_range(pd, p->vaddr, p->memsz, true) < 0) return -ENOMEM;
-        vmm_copy_to(pd, p->vaddr, n->data + p->offset, p->filesz);
-        vmm_copy_to(pd, p->vaddr + p->filesz, NULL, p->memsz - p->filesz);
-        if (p->vaddr + p->memsz > top) top = p->vaddr + p->memsz;
-        if (!img->phdr && p->offset == 0) img->phdr = p->vaddr + h->phoff;
+        if (vmm_alloc_range(pd, va, p->memsz, true) < 0) return -ENOMEM;
+        vmm_copy_to(pd, va, n->data + p->offset, p->filesz);
+        vmm_copy_to(pd, va + p->filesz, NULL, p->memsz - p->filesz);
+        if (va + p->memsz > top) top = va + p->memsz;
+        if (!img->phdr && p->offset == 0) img->phdr = va + h->phoff;
     }
     /* Text read-only (so fork can share it), then re-open writable segments
-       in case one shares a page with text. */
+       in case one shares a page with text. A static-pie writes its own
+       relocations into RELRO data, which lives in a writable segment. */
     for (int i = 0; i < h->phnum; i++)
         if (ph[i].type == PT_LOAD && !(ph[i].flags & PF_W))
-            vmm_set_writable(pd, ph[i].vaddr, ph[i].memsz, false);
+            vmm_set_writable(pd, ph[i].vaddr + bias, ph[i].memsz, false);
     for (int i = 0; i < h->phnum; i++)
         if (ph[i].type == PT_LOAD && (ph[i].flags & PF_W))
-            vmm_set_writable(pd, ph[i].vaddr, ph[i].memsz, true);
-    img->entry = h->entry;
+            vmm_set_writable(pd, ph[i].vaddr + bias, ph[i].memsz, true);
+    img->entry = h->entry + bias;
     img->brk = (top + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     img->phnum = h->phnum;
     return 0;
@@ -268,15 +281,19 @@ static void init_user_frame(regs_t* r, uint32_t entry, uint32_t sp) {
 /* Resolve `path`, follow up to two "#!" levels, load the ELF into a fresh
    address space. On success *pd_out/frame are ready and `a` holds the final
    argv (caller frees). Nothing about the calling process changes. */
-static void save_cmdline(proc_t* p, const kargs_t* a) {
+static uint16_t cmdline_of(char* out, uint32_t cap, const kargs_t* a) {
     uint32_t n = 0;
     for (int i = 0; i < a->argc; i++) {
         uint32_t l = strlen(a->argv[i]) + 1;
-        if (n + l > sizeof(p->cmdline)) break;
-        memcpy(p->cmdline + n, a->argv[i], l);
+        if (n + l > cap) break;
+        memcpy(out + n, a->argv[i], l);
         n += l;
     }
-    p->cmdline_len = (uint16_t)n;
+    return (uint16_t)n;
+}
+
+static void save_cmdline(proc_t* p, const kargs_t* a) {
+    p->cmdline_len = cmdline_of(p->cmdline, sizeof(p->cmdline), a);
 }
 
 static int load_program(fs_node_t* cwd, const char* path, kargs_t* a,
@@ -353,7 +370,7 @@ static int start_task(proc_t* p, const regs_t* frame) {
 
 /* ---------------- spawn from the kernel shell ---------------- */
 
-int proc_spawn(const char* path, char* const argv[], char* const envp[]) {
+static int spawn(const char* path, char* const argv[], char* const envp[], bool detached) {
     extern fs_node_t* cwd;                               /* shell's cwd */
     kargs_t a;
     int r = kargs_build(&a, NULL, 0, argv, 0, envp);
@@ -368,14 +385,18 @@ int proc_spawn(const char* path, char* const argv[], char* const envp[]) {
     p->brk = p->brk_start;
     p->ppid = 0;
     p->pgid = p->sid = p->pid;
-    p->kernel_waited = true;
+    p->kernel_waited = !detached;
+    p->tty_detached = detached;
+    p->ctty = detached ? -1 : 0;
     p->cwd = cwd ? cwd : fs_root();
-    file_t* t = file_new(F_TTY, 2 /*O_RDWR*/);
+    file_t* t = file_new(detached ? F_NULL : F_TTY, 2 /*O_RDWR*/);
     if (!t) { vmm_destroy_space(p->pd); p->state = P_FREE; return -ENOMEM; }
     p->fds[0] = p->fds[1] = p->fds[2] = t;
     t->refs = 3;
-    tty_reset();
-    tty_set_fg_pgrp(p->pgid);
+    if (!detached) {
+        tty_reset();
+        tty_set_fg_pgrp(p->pgid);
+    }
     r = start_task(p, &frame);
     if (r < 0) {
         file_close(t); file_close(t); file_close(t);
@@ -384,6 +405,32 @@ int proc_spawn(const char* path, char* const argv[], char* const envp[]) {
         return r;
     }
     return p->pid;
+}
+
+int proc_spawn(const char* path, char* const argv[], char* const envp[]) {
+    return spawn(path, argv, envp, false);
+}
+
+int proc_spawn_detached(const char* path, char* const argv[], char* const envp[]) {
+    return spawn(path, argv, envp, true);
+}
+
+void proc_detach(int pid) {
+    uint32_t f = irq_save();
+    proc_t* p = proc_by_pid(pid);
+    if (p && p->state == P_ZOMBIE && p->kernel_waited) {
+        p->state = P_FREE;                        /* already done: nobody will reap it */
+    } else if (p && p->state == P_ALIVE) {
+        p->kernel_waited = false;
+        p->tty_detached = true;
+        if (tty_fg_pgrp() == p->pgid) tty_set_fg_pgrp(0);
+    }
+    irq_restore(f);
+}
+
+void proc_kill_session(int sid) {
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (procs[i].state == P_ALIVE && procs[i].sid == sid) proc_send_signal(&procs[i], 9);
 }
 
 int proc_reap(int pid) {
@@ -537,6 +584,8 @@ int proc_fork(regs_t* r) {
     c->tls_base = parent->tls_base;
     c->cwd = parent->cwd;
     c->umask = parent->umask;
+    c->tty_detached = parent->tty_detached;
+    c->ctty = parent->ctty;
     c->sig_mask = parent->sig_mask;         /* alarms are not inherited */
     memcpy(c->sa, parent->sa, sizeof(c->sa));
     memcpy(c->name, parent->name, sizeof(c->name));
@@ -567,8 +616,8 @@ int proc_execve(regs_t* r, const char* path, char* const argv[], char* const env
     kpath[sizeof(kpath) - 1] = 0;
     int e = kargs_build(&a, NULL, 0, argv, 0, envp);
     if (e < 0) return e;
-    proc_t tmp;
-    save_cmdline(&tmp, &a);
+    char cmdline[sizeof(p->cmdline)];               /* not a whole proc_t: kernel stack */
+    uint16_t cmdline_len = cmdline_of(cmdline, sizeof(cmdline), &a);
     uint32_t pd, brk;
     regs_t frame;
     char name[32];
@@ -584,8 +633,8 @@ int proc_execve(regs_t* r, const char* path, char* const argv[], char* const env
     p->tls_base = 0;
     gdt_set_tls(0);
     memcpy(p->name, name, sizeof(p->name));
-    memcpy(p->cmdline, tmp.cmdline, sizeof(p->cmdline));
-    p->cmdline_len = tmp.cmdline_len;
+    memcpy(p->cmdline, cmdline, sizeof(p->cmdline));
+    p->cmdline_len = cmdline_len;
     strncpy(task_current()->name, name, 31);
     for (int i = 0; i < NSIG_MAX; i++)
         if (p->sa[i].handler > 1) { p->sa[i].handler = 0; p->sa[i].flags = 0; p->sa[i].mask = 0; }

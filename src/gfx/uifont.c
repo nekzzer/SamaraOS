@@ -159,3 +159,97 @@ void uif_mono_cell(int x, int y, uint8_t c, uint32_t fg, uint32_t bg) {
     gfx_alpha_mask(x, y, UIF_MONO_W, UIF_MONO_H,
                    uif_mono_px + (uint32_t)c * UIF_MONO_W * UIF_MONO_H, UIF_MONO_W, fg);
 }
+
+/* ---- one 8x16 cell for gfx_string(): the anti-aliased terminal face ---- */
+
+void uif_mono_char(int x, int y, uint8_t c, uint32_t fg, uint32_t bg, bool draw_bg) {
+    if (!uif_mono_have[c]) { gfx_glyph(x, y, (char)c, fg, bg, draw_bg); return; }
+    if (draw_bg) gfx_rect_fill(x, y, UIF_MONO_W, UIF_MONO_H, bg);
+    gfx_alpha_mask(x, y, UIF_MONO_W, UIF_MONO_H,
+                   uif_mono_px + (uint32_t)c * UIF_MONO_W * UIF_MONO_H, UIF_MONO_W, fg);
+}
+
+/* ---- text for integer-scaled user windows, at screen resolution ----
+
+   A window drawn at w x h and shown at `scale` x gets its text laid out
+   exactly as uif_draw_mem() would at 1x (same pen advances, times scale),
+   but each glyph is resampled (bilinear) from the UIF_MASTER-size atlas,
+   so it is smooth at 2x, 3x and beyond instead of big square pixels. */
+
+#define SCR_MAX 256
+static uint8_t scr[SCR_MAX * SCR_MAX];         /* one resampled glyph */
+
+/* Resample a master alpha glyph (sw x sh) to dw x dh; ratio = scale/UIF_MASTER. */
+static void resample(const uint8_t* src, int sw, int sh, int dw, int dh, int scale) {
+    for (int j = 0; j < dh; j++) {
+        /* source coordinate of the pixel centre, 8.8 fixed point */
+        int fy = ((2 * j + 1) * UIF_MASTER * 256) / (2 * scale) - 128;
+        int iy = fy >> 8, wy = fy & 255;
+        for (int i = 0; i < dw; i++) {
+            int fx = ((2 * i + 1) * UIF_MASTER * 256) / (2 * scale) - 128;
+            int ix = fx >> 8, wx = fx & 255;
+            int a00 = 0, a01 = 0, a10 = 0, a11 = 0;
+            if (iy >= 0 && iy < sh) {
+                if (ix >= 0 && ix < sw)         a00 = src[iy * sw + ix];
+                if (ix + 1 >= 0 && ix + 1 < sw) a01 = src[iy * sw + ix + 1];
+            }
+            if (iy + 1 >= 0 && iy + 1 < sh) {
+                if (ix >= 0 && ix < sw)         a10 = src[(iy + 1) * sw + ix];
+                if (ix + 1 >= 0 && ix + 1 < sw) a11 = src[(iy + 1) * sw + ix + 1];
+            }
+            int top = a00 * (256 - wx) + a01 * wx;
+            int bot = a10 * (256 - wx) + a11 * wx;
+            scr[j * dw + i] = (uint8_t)((top * (256 - wy) + bot * wy) >> 16);
+        }
+    }
+}
+
+static void scaled_glyph(int x, int y, const uint8_t* src, int sw, int sh, int scale, uint32_t color) {
+    int dw = (sw * scale + UIF_MASTER - 1) / UIF_MASTER;
+    int dh = (sh * scale + UIF_MASTER - 1) / UIF_MASTER;
+    if (dw <= 0 || dh <= 0 || dw > SCR_MAX || dh > SCR_MAX) return;
+    resample(src, sw, sh, dw, dh, scale);
+    gfx_alpha_mask(x, y, dw, dh, scr, dw, color);
+}
+
+int uif_draw_scaled(int x, int y, int font, const char* s, uint32_t color, int scale) {
+    if (scale <= 1) {
+        if (font != UIF_MONO) return uif_draw(x, y, (uif_t)font, s, color);
+        for (; *s; s++, x += UIF_MONO_W) uif_mono_char(x, y, (uint8_t)*s, color, 0, false);
+        return x;
+    }
+    if (font == UIF_MONO) {
+        const int mw = UIF_MONO_W * UIF_MASTER, mh = UIF_MONO_H * UIF_MASTER;
+        for (; *s; s++, x += UIF_MONO_W * scale) {
+            uint8_t c = (uint8_t)*s;
+            if (uif_mono_have[c]) {
+                scaled_glyph(x, y, uif_mono_master_px + (uint32_t)c * mw * mh, mw, mh, scale, color);
+                continue;
+            }
+            const uint8_t* g = font_glyph(c);              /* box drawing: blocks are fine */
+            for (int r = 0; r < FONT_H; r++)
+                for (int b = 0; b < FONT_W; b++)
+                    if (g[r] & (0x80 >> b))
+                        gfx_rect_fill(x + b * scale, y + r * scale, scale, scale, color);
+        }
+        return x;
+    }
+    const uif_face_t* fl = face((uif_t)font);
+    const uif_face_t* fm = &uif_master_faces[(unsigned)font < UIF_COUNT ? font : UIF_REG];
+    if (!fm->gl) {                                          /* no master: plain 1x face */
+        return uif_draw(x, y, (uif_t)font, s, color);
+    }
+    int pen = x << 6;
+    for (; *s; s++) {
+        uint8_t c = (uint8_t)*s;
+        const uif_glyph_t* gl = glyph(fl, c);              /* layout: the 1x face */
+        const uif_glyph_t* gm = glyph(fm, c);              /* shape: the master */
+        if (gm->w) {
+            int gx = ((pen + 32) >> 6) + (gm->x * scale) / UIF_MASTER;
+            int gy = y + (gm->y * scale) / UIF_MASTER;
+            scaled_glyph(gx, gy, fm->px + gm->off, gm->w, gm->h, scale, color);
+        }
+        pen += gl->adv * scale;
+    }
+    return (pen + 32) >> 6;
+}

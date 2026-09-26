@@ -11,7 +11,10 @@ void        wm_terminal_handle_key(window_t* w, char c);
 const char* wm_sysinfo_text(void);
 void        wm_terminal_poll(window_t* w);    /* per frame, while open */
 bool        wm_terminal_busy(void);           /* a program owns the keyboard */
-void        wm_terminal_closed(void);         /* window gone: kill its programs */
+void        wm_terminal_closed(void);
+int         shell_launch_detached(const char* line);  /* icon: run in background, pid or < 0 */
+void        wm_terminal_resized(window_t* w, int cols, int rows); /* grid resized */
+void        wm_terminal_wheel(window_t* w, int dz);   /* dz > 0 = scroll down */         /* window gone: kill its programs */
 bool        wm_terminal_submit(window_t* w, const char* line); /* type + run a command line */
 
 #endif

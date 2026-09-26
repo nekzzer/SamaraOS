@@ -9,7 +9,7 @@
    unmodified static binaries (busybox + musl) run as-is. */
 
 #define MAX_PROCS   48
-#define MAX_FDS     64
+#define MAX_FDS     1024            /* Linux default RLIMIT_NOFILE: ld keeps every input open */
 #define NSIG_MAX    65
 #define KSTACK_SZ   16384
 
@@ -43,6 +43,8 @@ typedef struct proc {
     int      exit_status;          /* wait(2) encoding once zombie */
     int      umask;
     bool     kernel_waited;        /* launched by the kernel shell, which reaps it */
+    bool     tty_detached;         /* background job: console reads EOF, writes are dropped */
+    int      ctty;                 /* controlling terminal: 0 console, -1 none, n>0 pty n-1 */
     char     name[32];
     /* Accounting for /proc. */
     uint32_t start_ms;
@@ -56,6 +58,12 @@ void    proc_init(void);
 /* Kernel-side launch: runs `path` with argv/envp (NULL-terminated) in a new
    process whose stdin/out/err are the console tty. Returns pid or -errno. */
 int     proc_spawn(const char* path, char* const argv[], char* const envp[]);
+/* Background launch (desktop icons, `cmd &`): stdio is /dev/null, nobody
+   waits for it - it is freed when it exits - and it never touches the tty. */
+int     proc_spawn_detached(const char* path, char* const argv[], char* const envp[]);
+/* Turn a kernel-waited foreground job into such a background one. */
+void    proc_detach(int pid);
+void    proc_kill_session(int sid);   /* SIGKILL every process of a session */
 bool    proc_alive(int pid);          /* still running (not zombie/free) */
 int     proc_reap(int pid);           /* free a kernel-launched zombie, returns wait status */
 void    proc_kill_all(void);          /* terminate every user process */

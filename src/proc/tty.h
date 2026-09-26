@@ -51,5 +51,8 @@ void tty_winsize(int* rows, int* cols);
 void tty_key(char c);                 /* keyboard byte / K_* code */
 void tty_pump(void);                  /* render pending output */
 bool tty_has_output(void);
+void tty_resized(void);               /* console grid changed: SIGWINCH */
+bool tty_wheel(int dz);               /* wheel -> keys for full-screen apps */
+bool tty_fullscreen(void);
 
 #endif

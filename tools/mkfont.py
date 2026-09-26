@@ -39,6 +39,12 @@ MONO_SIZE = 13
 MONO_BASELINE = 12          # baseline row inside the 16px cell
 CELL_W, CELL_H = 8, 16
 
+# Masters: the same faces baked MASTER x larger. User windows are shown
+# integer-scaled (2x, 3x, more when maximized); their text is drawn by the
+# window manager at screen resolution, resampled from these, so it stays
+# smooth instead of turning into big pixels.
+MASTER = 3
+
 
 def cp866(code):
     ch = bytes([code]).decode("cp866")
@@ -65,15 +71,16 @@ def bake_ui(size, weight, charset):
     return ascent, descent, glyphs, data
 
 
-def bake_mono():
-    f = ImageFont.truetype(MONO, MONO_SIZE)
-    present, data = [0] * 256, bytearray(256 * CELL_W * CELL_H)
+def bake_mono(k=1):
+    f = ImageFont.truetype(MONO, MONO_SIZE * k)
+    cw, ch = CELL_W * k, CELL_H * k
+    present, data = [0] * 256, bytearray(256 * cw * ch)
     for code in TEXT_CODES:
         if code == 0xFF:
             continue
-        img = Image.new("L", (CELL_W, CELL_H), 0)
-        ImageDraw.Draw(img).text((0, MONO_BASELINE), cp866(code), font=f, fill=255, anchor="ls")
-        data[code * CELL_W * CELL_H:(code + 1) * CELL_W * CELL_H] = img.tobytes()
+        img = Image.new("L", (cw, ch), 0)
+        ImageDraw.Draw(img).text((0, MONO_BASELINE * k), cp866(code), font=f, fill=255, anchor="ls")
+        data[code * cw * ch:(code + 1) * cw * ch] = img.tobytes()
         present[code] = 1
     return present, data
 
@@ -111,10 +118,32 @@ def main():
     lines += faces
     lines.append("};")
 
+    masters = []
+    for name, size, weight, charset in UI_FONTS:
+        sym = name.lower() + "_m"
+        if charset is not None:                   # the wordmark needs no master
+            masters.append(f"    [{name}] = {{0, 0, 0, 0}},")
+            continue
+        asc, desc, glyphs, data = bake_ui(size * MASTER, weight, charset)
+        lines.append(f"static const uint8_t {sym}_px[] = {{\n{c_bytes(data)}\n}};")
+        lines.append(f"static const uif_glyph_t {sym}_gl[256] = {{")
+        for code in sorted(glyphs):
+            x, y, w, h, adv, off = glyphs[code]
+            lines.append(f"    [{code}] = {{{x}, {y}, {w}, {h}, {adv}, {off}}},")
+        lines.append("};")
+        masters.append(f"    [{name}] = {{{asc}, {desc}, {sym}_gl, {sym}_px}},")
+        print(f"{name} master: {size * MASTER}px {len(data)} bytes", file=sys.stderr)
+    lines.append(f"#define UIF_MASTER {MASTER}")
+    lines.append("static const uif_face_t uif_master_faces[UIF_COUNT] = {")
+    lines += masters
+    lines.append("};")
+
     present, mono = bake_mono()
     lines.append(f"#define UIF_MONO_W {CELL_W}\n#define UIF_MONO_H {CELL_H}")
     lines.append("static const uint8_t uif_mono_have[256] = {\n" + c_bytes(present, 64) + "\n};")
     lines.append("static const uint8_t uif_mono_px[] = {\n" + c_bytes(mono) + "\n};")
+    _, mono_m = bake_mono(MASTER)
+    lines.append("static const uint8_t uif_mono_master_px[] = {\n" + c_bytes(mono_m) + "\n};")
     lines.append("")
     lines.append("#endif")
     with open(OUT, "w") as fp:

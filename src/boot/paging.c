@@ -1,4 +1,5 @@
 #include "boot/paging.h"
+#include "core/vmm.h"
 #include "boot/idt.h"
 #include "gfx/gfx.h"
 #include "drivers/vga.h"
@@ -150,6 +151,9 @@ void paging_init(void) {
         uint32_t phys = i << 22;                 /* 4 MiB stride */
         pdir[i] = phys | PDE_P | PDE_RW | PDE_PS;
     }
+    /* Direct map of physical RAM at DMAP_BASE (see core/vmm.h). */
+    for (uint32_t i = 0; i < (DMAP_SIZE >> 22); i++)
+        pdir[(DMAP_BASE >> 22) + i] = (i << 22) | PDE_P | PDE_RW | PDE_PS;
 
     idt_set_gate(0,  de_isr, 0x08, 0x8E);        /* #DE Divide Error */
     idt_set_gate(6,  ud_isr, 0x08, 0x8E);        /* #UD Invalid Opcode */
