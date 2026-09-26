@@ -6,7 +6,8 @@
 /* Open file descriptions, shared between fds after dup()/fork(). */
 
 typedef enum { F_NODE = 1, F_TTY, F_PIPE_R, F_PIPE_W, F_NULL, F_ZERO, F_RANDOM, F_DISK, F_SOCKET, F_FB, F_INPUT,
-               F_PTM, F_PTS } ftype_t;             /* pty master / slave */
+               F_PTM, F_PTS,                        /* pty master / slave */
+               F_SPAIR } ftype_t;                  /* AF_UNIX socketpair end: rx=pipe, tx=pipe2 */
 
 #define PIPE_SZ 8192
 
@@ -23,6 +24,8 @@ typedef struct file {
     uint32_t   off;
     fs_node_t* node;
     pipe_t*    pipe;
+    pipe_t*    pipe2;       /* F_SPAIR: transmit direction */
+    int        shut;        /* F_SPAIR: 1 = rx shut, 2 = tx shut */
     int        disk;        /* F_DISK: ata index */
     struct sock* sock;      /* F_SOCKET */
     int        pty;         /* F_PTM / F_PTS: pair index */
@@ -39,6 +42,8 @@ bool    file_readable(file_t* f);
 bool    file_writable(file_t* f);
 
 int     pipe_create(file_t** rd, file_t** wr);
+int     spair_create(file_t** a, file_t** b);
+int     spair_shutdown(file_t* f, int how);
 uint32_t file_disk_size(file_t* f);
 
 /* ramfs helpers */

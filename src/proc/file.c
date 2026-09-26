@@ -88,7 +88,11 @@ void file_close(file_t* f) {
     if (f->type == F_INPUT) input_close();
     if (f->type == F_PTM) pty_master_close(f->pty);
     if (f->type == F_PTS) pty_slave_close(f->pty);
-    if (f->pipe) {
+    if (f->type == F_SPAIR) {
+        spair_shutdown(f, 2);
+        if (f->pipe->readers <= 0 && f->pipe->writers <= 0) kfree(f->pipe);
+        if (f->pipe2->readers <= 0 && f->pipe2->writers <= 0) kfree(f->pipe2);
+    } else if (f->pipe) {
         if (f->type == F_PIPE_R) f->pipe->readers--;
         else                     f->pipe->writers--;
         if (f->pipe->readers <= 0 && f->pipe->writers <= 0) kfree(f->pipe);
@@ -105,6 +109,36 @@ int pipe_create(file_t** rd, file_t** wr) {
     if (!*rd || !*wr) { kfree(p); if (*rd) kfree(*rd); if (*wr) kfree(*wr); return -ENOMEM; }
     (*rd)->pipe = (*wr)->pipe = p;
     p->readers = p->writers = 1;
+    return 0;
+}
+
+/* AF_UNIX SOCK_STREAM pair: two pipes, one per direction. */
+int spair_create(file_t** a, file_t** b) {
+    pipe_t* p1 = (pipe_t*)kmalloc(sizeof(pipe_t));
+    pipe_t* p2 = (pipe_t*)kmalloc(sizeof(pipe_t));
+    *a = file_new(F_SPAIR, 2);
+    *b = file_new(F_SPAIR, 2);
+    if (!p1 || !p2 || !*a || !*b) {
+        if (p1) kfree(p1);
+        if (p2) kfree(p2);
+        if (*a) kfree(*a);
+        if (*b) kfree(*b);
+        return -ENOMEM;
+    }
+    memset(p1, 0, sizeof(*p1));
+    memset(p2, 0, sizeof(*p2));
+    (*a)->pipe = p1; (*a)->pipe2 = p2;          /* a reads p1, writes p2 */
+    (*b)->pipe = p2; (*b)->pipe2 = p1;          /* b reads p2, writes p1 */
+    p1->readers = p1->writers = 1;
+    p2->readers = p2->writers = 1;
+    return 0;
+}
+
+/* how: 0 = SHUT_RD, 1 = SHUT_WR, 2 = both. */
+int spair_shutdown(file_t* f, int how) {
+    if (how < 0 || how > 2) return -22;             /* EINVAL */
+    if ((how == 0 || how == 2) && !(f->shut & 1)) { f->shut |= 1; f->pipe->readers--; }
+    if ((how == 1 || how == 2) && !(f->shut & 2)) { f->shut |= 2; f->pipe2->writers--; }
     return 0;
 }
 
@@ -202,6 +236,7 @@ bool file_readable(file_t* f) {
         case F_TTY:    return tty_readable();
         case F_PIPE_R: return f->pipe->count > 0 || f->pipe->writers <= 0;
         case F_PIPE_W: return false;
+        case F_SPAIR:  return f->pipe->count > 0 || f->pipe->writers <= 0 || (f->shut & 1);
         case F_SOCKET: return sock_readable(f->sock);
         case F_INPUT:  return input_pending();
         case F_PTM:    return pty_readable(f->pty, true);
@@ -213,8 +248,46 @@ bool file_readable(file_t* f) {
 bool file_writable(file_t* f) {
     if (f->type == F_PIPE_W) return f->pipe->count < PIPE_SZ || f->pipe->readers <= 0;
     if (f->type == F_SOCKET) return sock_writable(f->sock);
+    if (f->type == F_SPAIR) return (f->shut & 2) || f->pipe2->count < PIPE_SZ || f->pipe2->readers <= 0;
     if (f->type == F_PTM || f->type == F_PTS) return pty_writable(f->pty, f->type == F_PTM);
     return f->type != F_PIPE_R;
+}
+
+static int pipe_read(file_t* f, pipe_t* p, char* buf, uint32_t n) {
+    while (p->count == 0) {
+        if (p->writers <= 0) return 0;
+        if (f->flags & O_NONBLOCK) return -EAGAIN;
+        if (proc_interrupted()) return -EINTR;
+        task_yield();
+    }
+    uint32_t got = 0;
+    while (got < n && p->count > 0) {
+        buf[got++] = p->buf[p->tail];
+        p->tail = (p->tail + 1) % PIPE_SZ;
+        p->count--;
+    }
+    return (int)got;
+}
+
+static int pipe_write(file_t* f, pipe_t* p, const char* buf, uint32_t n) {
+    uint32_t put = 0;
+    while (put < n) {
+        if (p->readers <= 0) {
+            proc_t* me = proc_current();
+            if (me) proc_send_signal(me, 13);   /* SIGPIPE */
+            return put ? (int)put : -EPIPE;
+        }
+        if (p->count == PIPE_SZ) {
+            if (f->flags & O_NONBLOCK) return put ? (int)put : -EAGAIN;
+            if (proc_interrupted()) return put ? (int)put : -EINTR;
+            task_yield();
+            continue;
+        }
+        p->buf[p->head] = buf[put++];
+        p->head = (p->head + 1) % PIPE_SZ;
+        p->count++;
+    }
+    return (int)put;
 }
 
 int file_read(file_t* f, char* buf, uint32_t n) {
@@ -230,22 +303,10 @@ int file_read(file_t* f, char* buf, uint32_t n) {
         case F_INPUT: return input_read(buf, n, (f->flags & O_NONBLOCK) != 0);
         case F_SOCKET: return sock_recv(f->sock, (uint8_t*)buf, n, (f->flags & O_NONBLOCK) != 0, false, 0, 0);
         case F_PIPE_W: return -EBADF;
-        case F_PIPE_R: {
-            pipe_t* p = f->pipe;
-            while (p->count == 0) {
-                if (p->writers <= 0) return 0;
-                if (f->flags & O_NONBLOCK) return -EAGAIN;
-                if (proc_interrupted()) return -EINTR;
-                task_yield();
-            }
-            uint32_t got = 0;
-            while (got < n && p->count > 0) {
-                buf[got++] = p->buf[p->tail];
-                p->tail = (p->tail + 1) % PIPE_SZ;
-                p->count--;
-            }
-            return (int)got;
-        }
+        case F_SPAIR:
+            if (f->shut & 1) return 0;
+            return pipe_read(f, f->pipe, buf, n);
+        case F_PIPE_R: return pipe_read(f, f->pipe, buf, n);
         case F_NODE: {
             fs_node_t* nd = f->node;
             if (nd->type == FS_DIR) return -EISDIR;
@@ -275,27 +336,14 @@ int file_write(file_t* f, const char* buf, uint32_t n) {
         }
         case F_SOCKET: return sock_send(f->sock, (const uint8_t*)buf, n, (f->flags & O_NONBLOCK) != 0, 0, 0);
         case F_PIPE_R: return -EBADF;
-        case F_PIPE_W: {
-            pipe_t* p = f->pipe;
-            uint32_t put = 0;
-            while (put < n) {
-                if (p->readers <= 0) {
-                    proc_t* me = proc_current();
-                    if (me) proc_send_signal(me, 13);   /* SIGPIPE */
-                    return put ? (int)put : -EPIPE;
-                }
-                if (p->count == PIPE_SZ) {
-                    if (f->flags & O_NONBLOCK) return put ? (int)put : -EAGAIN;
-                    if (proc_interrupted()) return put ? (int)put : -EINTR;
-                    task_yield();
-                    continue;
-                }
-                p->buf[p->head] = buf[put++];
-                p->head = (p->head + 1) % PIPE_SZ;
-                p->count++;
+        case F_SPAIR:
+            if (f->shut & 2) {
+                proc_t* me = proc_current();
+                if (me) proc_send_signal(me, 13);
+                return -EPIPE;
             }
-            return (int)put;
-        }
+            return pipe_write(f, f->pipe2, buf, n);
+        case F_PIPE_W: return pipe_write(f, f->pipe, buf, n);
         case F_NODE: {
             if (f->flags & O_APPEND) f->off = f->node->size;
             int r = node_write_at(f->node, f->off, buf, n);

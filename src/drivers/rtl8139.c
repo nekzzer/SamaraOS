@@ -27,9 +27,13 @@
 #define CR_RST      0x10
 
 /* RCR: AAP(1)|APM(2)|AM(4)|AB(8)|WRAP(1<<7)|MXDMA=7(1<<8..10) */
-#define RCR_VAL     ((1<<0)|(1<<1)|(1<<2)|(1<<3)|(7<<8)|(1<<7))
+/* RBLEN (bits 11-12) = 3: 64 KiB ring. Polled, so a big ring is what keeps
+   TCP bursts from overflowing it between polls. WRAP is ignored at 64 KiB:
+   a packet crossing the end continues at the start of the ring. */
+#define RCR_VAL     ((1<<0)|(1<<1)|(1<<2)|(1<<3)|(7<<8)|(1<<7)|(3<<11))
 
-#define RX_BUF_SIZE (8192 + 16 + 1500)   /* WRAP=1 needs trailing pad */
+#define RX_RING     65536
+#define RX_BUF_SIZE (RX_RING + 16 + 1536)   /* WRAP=1 needs trailing pad */
 #define TX_BUF_SIZE 2048
 
 static bool        g_present = false;
@@ -177,12 +181,18 @@ int rtl8139_recv(void* buf, int max) {
 
     int data_len = pkt_len - 4;     /* strip CRC */
     if (data_len > max) data_len = max;
-    /* copy from g_rx_off+4, possibly wrapping (extra 1500 padding prevents wrap on packet level) */
-    memcpy(buf, g_rx_buf + g_rx_off + 4, data_len);
+    /* data follows the 4-byte header (headers are 4-aligned: never split) */
+    uint32_t d0 = (g_rx_off + 4) % RX_RING;
+    uint32_t first = RX_RING - d0;
+    if (first >= (uint32_t)data_len) memcpy(buf, g_rx_buf + d0, data_len);
+    else {
+        memcpy(buf, g_rx_buf + d0, first);
+        memcpy((uint8_t*)buf + first, g_rx_buf, data_len - first);
+    }
 
     /* advance sw read pointer; align to 4 */
     g_rx_off = (g_rx_off + pkt_len + 4 + 3) & ~3u;
-    if (g_rx_off >= 8192) g_rx_off -= 8192;        /* wrap */
+    if (g_rx_off >= RX_RING) g_rx_off -= RX_RING;  /* wrap */
 
     outw(g_io + RTL_CAPR, (uint16_t)(g_rx_off - 0x10));
     return data_len;

@@ -464,7 +464,14 @@ static void teardown(proc_t* p, int status) {
     }
     if (p->pd) {
         if (p == proc_current() || (t && t == task_current())) task_set_cr3(0);
-        vmm_destroy_space(p->pd);
+        /* A vfork child still running on our space inherits it. */
+        proc_t* heir = NULL;
+        for (int i = 0; i < MAX_PROCS; i++)
+            if (procs[i].state == P_ALIVE && procs[i].vfork_shared && procs[i].ppid == p->pid
+                && procs[i].pd == p->pd) heir = &procs[i];
+        if (p->vfork_shared) p->vfork_shared = false; /* borrowed from the parent */
+        else if (heir) heir->vfork_shared = false;
+        else vmm_destroy_space(p->pd);
         p->pd = 0;
     }
     /* Orphans: children lose their parent; finished ones go away. */
@@ -570,11 +577,12 @@ void proc_fault_kill(const char* what, int sig, uint32_t eip, uint32_t addr) {
 
 /* ---------------- fork / exec / wait ---------------- */
 
-int proc_fork(regs_t* r) {
+static int do_fork(regs_t* r, bool share) {
     proc_t* parent = proc_current();
     proc_t* c = alloc_proc();
     if (!c) return -EAGAIN;
-    c->pd = vmm_clone_space(parent->pd);
+    c->vfork_shared = share;
+    c->pd = share ? parent->pd : vmm_clone_space(parent->pd);
     if (!c->pd) { c->state = P_FREE; return -ENOMEM; }
     c->ppid = parent->pid;
     c->pgid = parent->pgid;
@@ -601,12 +609,21 @@ int proc_fork(regs_t* r) {
     int e = start_task(c, &child);
     if (e < 0) {
         for (int i = 0; i < MAX_FDS; i++) { file_close(c->fds[i]); c->fds[i] = NULL; }
-        vmm_destroy_space(c->pd);
+        if (!share) vmm_destroy_space(c->pd);
+        c->vfork_shared = false;
         c->state = P_FREE;
         return e;
     }
-    return c->pid;
+    int pid = c->pid;
+    /* vfork: the child borrows our memory (and stack) until it execs or
+       exits, so we must not run until then. */
+    while (share && c->pid == pid && c->state == P_ALIVE && c->vfork_shared)
+        task_yield();
+    return pid;
 }
+
+int proc_fork(regs_t* r)  { return do_fork(r, false); }
+int proc_vfork(regs_t* r) { return do_fork(r, true); }
 
 int proc_execve(regs_t* r, const char* path, char* const argv[], char* const envp[]) {
     proc_t* p = proc_current();
@@ -628,7 +645,8 @@ int proc_execve(regs_t* r, const char* path, char* const argv[], char* const env
     uint32_t old = p->pd;
     p->pd = pd;
     task_set_cr3(pd);
-    vmm_destroy_space(old);
+    if (p->vfork_shared) p->vfork_shared = false;     /* old space is the parent's */
+    else vmm_destroy_space(old);
     p->brk_start = p->brk = brk;
     p->tls_base = 0;
     gdt_set_tls(0);

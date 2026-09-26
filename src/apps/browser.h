@@ -3,7 +3,8 @@
 #include "core/types.h"
 
 /* Open the browser window. If `url` is non-NULL, immediately navigate to it.
-   URL format is restricted to http://A.B.C.D[:port][/path] — no DNS. */
+   Accepts full URLs, bare host names (google.com) or search words;
+   pages are fetched with the userland curl (DNS + HTTPS). */
 int browser_open(const char* url);
 
 #endif

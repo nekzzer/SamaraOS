@@ -46,6 +46,7 @@ typedef struct proc {
     bool     tty_detached;         /* background job: console reads EOF, writes are dropped */
     int      ctty;                 /* controlling terminal: 0 console, -1 none, n>0 pty n-1 */
     char     name[32];
+    bool     vfork_shared;         /* vfork child running on the parent's page directory */
     /* Accounting for /proc. */
     uint32_t start_ms;
     uint32_t utime, stime;         /* PIT ticks (1 ms) in ring 3 / ring 0 */
@@ -84,6 +85,7 @@ void    proc_fault_kill(const char* what, int sig, uint32_t eip, uint32_t addr) 
 
 /* Syscall-level operations (syscall.c calls these). */
 int     proc_fork(regs_t* r);
+int     proc_vfork(regs_t* r);     /* child shares memory, parent waits for exec/exit */
 int     proc_execve(regs_t* r, const char* path, char* const argv[], char* const envp[]);
 void    proc_exit(int status) __attribute__((noreturn));   /* status = wait encoding */
 int     proc_wait(int pid, int* status, int options);

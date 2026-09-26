@@ -61,6 +61,7 @@ struct sock {
     /* TCP */
     uint32_t iss, snd_una, snd_nxt, rcv_nxt, tx_seq;
     uint16_t snd_wnd;
+    uint16_t adv_wnd;          /* receive window we last advertised */
     uint8_t* rx; uint32_t rx_head, rx_count;
     uint8_t* tx; uint32_t tx_len;
     bool     fin_rcvd, shut_wr, fin_sent;
@@ -166,26 +167,38 @@ static uint16_t ephemeral(int type) {
 
 /* ---------------- TCP output ---------------- */
 
+/* The NIC is polled and its receive ring holds 64 KiB (~42 full frames with
+   headers): never let the peer have more in flight than fits, or bursts
+   overflow the ring and every drop costs a retransmit timeout. */
+#define RX_WND_MAX (48u * 1024u)
+#define RX_MSS     1460                     /* advertised in SYNs (default would be 536) */
+
 static uint16_t rx_window(sock_t* s) {
     uint32_t free = RX_CAP - s->rx_count;
-    return (uint16_t)(free > 65535 ? 65535 : free);
+    return (uint16_t)(free > RX_WND_MAX ? RX_WND_MAX : free);
 }
 
 static void tcp_segment(sock_t* s, uint32_t seq, uint8_t flags, const uint8_t* data, uint32_t len) {
-    uint8_t buf[20 + MSS];
+    uint8_t buf[24 + MSS];
     tcph_t* h = (tcph_t*)buf;
+    uint32_t hl = 20;
+    if (flags & TCP_SYN) {                           /* MSS option */
+        buf[20] = 2; buf[21] = 4; buf[22] = RX_MSS >> 8; buf[23] = RX_MSS & 0xFF;
+        hl = 24;
+    }
     h->sport = be16(s->lport);
     h->dport = be16(s->rport);
     h->seq = be32(seq);
     h->ack = be32((flags & TCP_ACK) ? s->rcv_nxt : 0);
-    h->off = 5 << 4;
+    h->off = (uint8_t)((hl / 4) << 4);
     h->flags = flags;
-    h->win = be16(rx_window(s));
+    s->adv_wnd = rx_window(s);
+    h->win = be16(s->adv_wnd);
     h->sum = 0;
     h->urg = 0;
-    if (len) memcpy(buf + 20, data, len);
-    h->sum = be16(l4_sum(s->lip, s->rip, 6, buf, 20 + (int)len));
-    net_send_ip(s->rip, 6, buf, 20 + (int)len);
+    if (len) memcpy(buf + hl, data, len);
+    h->sum = be16(l4_sum(s->lip, s->rip, 6, buf, (int)(hl + len)));
+    net_send_ip(s->rip, 6, buf, (int)(hl + len));
 }
 
 static void send_rst(uint32_t src, uint32_t dst, const tcph_t* in, int datalen) {
@@ -659,12 +672,14 @@ int sock_recv(sock_t* s, uint8_t* buf, uint32_t len, bool nonblock, bool peek,
         return 0;                                          /* orderly EOF */
     }
     uint32_t n = s->rx_count < len ? s->rx_count : len;
-    bool was_full = rx_window(s) < MSS;
     for (uint32_t i = 0; i < n; i++) buf[i] = s->rx[(s->rx_head + i) % RX_CAP];
     if (!peek) {
         s->rx_head = (s->rx_head + n) % RX_CAP;
         s->rx_count -= n;
-        if (was_full && s->state != S_CLOSED)              /* window update */
+        /* Window update once it opened by 2 segments: a sender will not
+           fill a window smaller than its MSS and would sit in its persist
+           timer (seconds) instead. */
+        if (s->state != S_CLOSED && rx_window(s) >= (uint32_t)s->adv_wnd + 2 * RX_MSS)
             tcp_segment(s, s->snd_nxt, TCP_ACK, NULL, 0);
     }
     if (from_ip) *from_ip = s->rip;

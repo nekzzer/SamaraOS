@@ -303,6 +303,16 @@ run: $(KERNEL) $(DISK_IMG) src-tar
 
 run-gcc: run
 
+# `make run-internet`: same as `make run`, with internet over SLIRP NAT.
+# Inside SamaraOS: DNS 10.0.2.3, `wget http://...`, and the host (with its
+# sshd) is 10.0.2.2: `ssh eralp@10.0.2.2`. From the host:
+# ssh -p 2222 root@localhost, telnet localhost 2323, http://localhost:8080 -> guest :80.
+INET_DRIVE := -netdev user,id=n0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:2323-:23,hostfwd=tcp:127.0.0.1:8080-:80 \
+              -device rtl8139,netdev=n0
+
+run-internet: NET_DRIVE = $(INET_DRIVE)
+run-internet: run
+
 # Run with DOOM1.WAD attached as the primary disk so 'doom' command works.
 WAD ?= Doom1.WAD
 run-doom: $(KERNEL)
@@ -349,4 +359,5 @@ clean:
 	rm -f $(ALL_OBJ) $(KERNEL)
 	rm -rf build
 
+.PHONY: run-internet
 .PHONY: all run run-doom run-sata run-debug iso run-iso clean build compile_commands.json

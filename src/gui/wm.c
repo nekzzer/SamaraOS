@@ -1873,6 +1873,17 @@ void wm_run(void) {
     bool fb_was_active = false;
     int prev_mx = -1, prev_my = -1;
 
+    /* "browser=<url>" on the kernel command line opens it at startup */
+    extern const char* kernel_cmdline(void);
+    const char* bk = strstr(kernel_cmdline(), "browser=");
+    if (bk) {
+        char u[256];
+        int n = 0;
+        for (bk += 8; *bk && *bk != ' ' && n < 255; bk++) u[n++] = *bk;
+        u[n] = 0;
+        browser_open(u);
+    }
+
     while (!exit_requested) {
         uint32_t due = t0 + frame * FRAME_NUM / FRAME_DEN;
         while ((int32_t)(pit_uptime_ms() - due) < 0) task_yield();   /* lets user programs run */

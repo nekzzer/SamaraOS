@@ -1,1420 +1,1919 @@
-/* SamaraOS Web Browser — HTTP-only, numeric IPs only, tiny HTML renderer.
-   Single-window WM app. Fetches with net_http_get(), strips HTML tags,
-   wraps text, draws clickable links. URL bar at top, status bar at bottom. */
+/* SamaraOS Web Browser.
+ *
+ * Pages are fetched by the userland `curl` (DNS, HTTPS via mbedTLS,
+ * redirects): the browser spawns it in the background and polls it from the
+ * WM tick, so the desktop never freezes while a page loads. The result is
+ * decoded (UTF-8 / windows-1251 -> CP866, the OS charset), parsed by a small
+ * HTML tokenizer and laid out with the Golos UI fonts: headings, paragraphs,
+ * lists, links, <pre>, rules and simple GET/POST forms (text fields and
+ * submit buttons), which is enough for search boxes.
+ *
+ * No JavaScript and no CSS. Google search needs JavaScript nowadays, so
+ * searches sent to google.com/search go to DuckDuckGo's HTML version. */
 
 #include "apps/browser.h"
 #include "gui/wm.h"
+#include "gui/theme.h"
 #include "gfx/gfx.h"
+#include "gfx/uifont.h"
 #include "core/string.h"
 #include "core/heap.h"
 #include "drivers/keyboard.h"
-#include "boot/pit.h"
-#include "net/net.h"
-#include "gfx/font.h"
 #include "drivers/mouse.h"
+#include "fs/fs.h"
+#include "proc/proc.h"
+#include "boot/pit.h"
 
 /* ---------- tunables ---------- */
-#define RESP_CAP        (256 * 1024)   /* HTTP response cap */
-#define TEXT_POOL_CAP   (128 * 1024)   /* doc word storage */
-#define MAX_RUNS        4096           /* drawable text runs */
-#define MAX_LINKS       512            /* anchor targets */
-#define URL_MAX         256
-#define HIST_MAX        32
+#define RESP_CAP     (2 * 1024 * 1024)   /* page bytes kept */
+#define POOL_CAP     (1024 * 1024)       /* laid-out text */
+#define URLPOOL_CAP  (512 * 1024)        /* link targets */
+#define MAX_RUNS     24000
+#define MAX_LINKS    6000
+#define MAX_FIELDS   96
+#define MAX_FORMS    24
+#define URL_MAX      1024
+#define FIELD_MAX    256
+#define HIST_MAX     24
 
-#define LINE_H          18             /* gap between text lines (font is 16) */
-#define HEAD_H          24
-#define SCROLL_STEP     LINE_H
-#define PAGE_STEP       (LINE_H * 10)
+#define TB_H         48                  /* toolbar */
+#define SB_H         26                  /* status bar */
+#define PAD          20                  /* page margin */
+#define BTN          32
+#define F_MONO       UIF_MONO
+#define FIELD_H      30
 
-/* ---------- colours ---------- */
-#define COL_PAGE_BG     RGB(0xFA, 0xFB, 0xFE)
-#define COL_TEXT        RGB(0x10, 0x14, 0x1E)
-#define COL_LINK        RGB(0x16, 0x52, 0xC8)
-#define COL_LINK_HOV    RGB(0xC0, 0x30, 0x30)
-#define COL_HEAD        RGB(0x1A, 0x1E, 0x40)
-#define COL_CHROME      RGB(0x20, 0x26, 0x3E)
-#define COL_CHROME_HI   RGB(0x6A, 0x82, 0xFB)
-#define COL_CHROME_FG   RGB(0xF0, 0xF2, 0xFA)
-#define COL_BTN         RGB(0x33, 0x3C, 0x5C)
-#define COL_BTN_DOWN    RGB(0x6E, 0xA8, 0xFE)
-#define COL_BTN_DIM     RGB(0x40, 0x46, 0x5A)
-#define COL_URL_BG      RGB(0xFF, 0xFF, 0xFF)
-#define COL_URL_FG      RGB(0x18, 0x1A, 0x28)
-#define COL_URL_BORDER  RGB(0x6E, 0xA8, 0xFE)
-#define COL_STATUS_BG   RGB(0x18, 0x1C, 0x30)
-#define COL_STATUS_FG   RGB(0xC8, 0xCC, 0xE0)
-#define COL_DIM         RGB(0x88, 0x8E, 0xA8)
-#define COL_RULE        RGB(0xCC, 0xCE, 0xD8)
+#define PAGE_FILE    "/tmp/.browser-page"
+#define META_FILE    "/tmp/.browser-meta"
+#define ERR_FILE     "/tmp/.browser-err"
+#define CURL         "/usr/bin/curl"
+#define USER_AGENT   "Dillo/3.0.5"        /* gets Google's classic no-JS page */
+#define SEARCH_URL   "https://html.duckduckgo.com/html/?q="
+#define HOME_URL     "about:home"
 
-/* ---------- data ---------- */
+/* ---------- colours (theme family) ---------- */
+#define COL_PAPER    RGB(0xFB, 0xFA, 0xF7)
+#define COL_TEXT     C_INK
+#define COL_LINK     RGB(0x1F, 0x5C, 0xB8)
+#define COL_LINK_HOV RGB(0xC2, 0x6A, 0x12)
+
+/* ---------- document model ---------- */
+enum { RK_TEXT, RK_RULE, RK_BULLET, RK_FIELD, RK_BUTTON };
+enum { FT_TEXT, FT_PASSWORD, FT_HIDDEN, FT_SUBMIT };
 
 typedef struct {
-    int      x, y;        /* document-space pixels */
-    int      w;
-    int      text_off;    /* offset into doc_text_pool */
-    int      text_len;
+    int      x, y;           /* document pixels */
+    uint16_t w, h;
+    int      off;            /* text in pool */
+    uint16_t len;
+    uint8_t  font, kind;
     uint32_t fg;
-    int      link_idx;
-    uint8_t  underline;
+    int16_t  link, field;
 } run_t;
 
 typedef struct {
-    char url[URL_MAX];
-} link_t;
+    int     form;
+    uint8_t type;
+    char    name[64];
+    char    value[FIELD_MAX];
+    int     len, cur;
+} field_t;
 
-static uint8_t  resp_buf[RESP_CAP];
-static char     doc_text_pool[TEXT_POOL_CAP];
-static int      doc_text_used = 0;
-static run_t    runs[MAX_RUNS];
-static int      n_runs = 0;
-static link_t   links[MAX_LINKS];
-static int      n_links = 0;
+typedef struct { int action; bool post; } form_t;   /* action: url_pool offset */
 
-static int      doc_height = 0;        /* total document pixel height */
-static int      scroll_y   = 0;
+static uint8_t* resp;
+static int      resp_len;
+static char*    pool;
+static int      pool_used;
+static char*    url_pool;
+static int      url_used;
+static run_t*   runs;
+static int      n_runs;
+static int      link_off[MAX_LINKS];
+static int      n_links;
+static field_t  fields[MAX_FIELDS];
+static int      n_fields, n_fields_prev;
+static bool     keep_fields;
+static form_t   forms[MAX_FORMS];
+static int      n_forms;
+static int      doc_h, scroll_y;
+static char     page_title[64];
+static char     refresh_url[URL_MAX];
+static bool     plain_text;
 
-/* URL bar / status */
-static char     cur_url[URL_MAX];      /* loaded page */
-static char     edit_url[URL_MAX];     /* what's in the URL field */
-static int      edit_len   = 0;
-static int      edit_cur   = 0;
-static bool     url_focused = true;
-static uint32_t blink_ms   = 0;
+/* ---------- browser state ---------- */
+static window_t* g_win;
+static char     cur_url[URL_MAX];     /* the page being shown */
+static char     base_url[URL_MAX];    /* for relative links (after redirects) */
+static char     edit[URL_MAX];        /* address bar text */
+static int      edit_len, edit_cur;
+static bool     edit_all;             /* whole address selected: typing replaces it */
+enum { FOCUS_NONE = -2, FOCUS_URL = -1 };  /* >= 0: a form field */
+static int      focus = FOCUS_URL;
+static char     back_stack[HIST_MAX][URL_MAX], fwd_stack[HIST_MAX][URL_MAX];
+static int      n_back, n_fwd;
+static char     status[200];
+static int      hover_link = -1, hover_btn = -1, hover_run = -1;
+static bool     click_consumed;
+static uint32_t now_ms;
+static int      laid_w;
+static int      auto_redirects;
 
-static char     status_text[160];
-static bool     loading    = false;
+/* in-flight fetch */
+static int      fetch_pid = -1;
+static bool     loading;
+static uint32_t load_start;
+static char     load_url[URL_MAX];
 
-/* navigation history (back stack) */
-static char     hist[HIST_MAX][URL_MAX];
-static int      hist_top = 0;
+/* hit boxes (screen coords, filled by paint) */
+typedef struct { int x, y, w, h; } box_t;
+enum { B_BACK, B_FWD, B_RELOAD, B_HOME, B_COUNT };
+static box_t    btn_box[B_COUNT], url_box, view_box;
 
-/* click debounce / interactive hit testing */
-static bool     click_consumed = false;
-static int      hover_link = -1;       /* updated on hover redraws */
+static bool in_box(box_t b, int x, int y) { return x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h; }
+static char lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
 
-/* button hit rects (filled by paint) */
-static struct {
-    int x, y, w, h;
-} btn_back, btn_reload, btn_home, btn_go;
-static struct {
-    int x, y, w, h;
-} url_rect;
-static struct {
-    int x, y, w, h;
-} content_rect;
-
-static window_t* g_browser_win = NULL;
-
-/* ---------- string helpers ---------- */
-
-static char to_lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c; }
-
-static void str_set(char* dst, int cap, const char* src) {
+static void scpy(char* d, int cap, const char* s) {
     int i = 0;
-    while (src && src[i] && i < cap - 1) { dst[i] = src[i]; i++; }
-    dst[i] = 0;
+    while (s && s[i] && i < cap - 1) { d[i] = s[i]; i++; }
+    d[i] = 0;
+}
+static void scat(char* d, int cap, const char* s) {
+    int n = (int)strlen(d);
+    scpy(d + n, cap - n, s);
+}
+static bool starts_ci(const char* s, const char* p) {
+    for (; *p; s++, p++) if (lower(*s) != lower(*p)) return false;
+    return true;
+}
+static const char* find_ci(const char* h, int n, const char* needle) {
+    int k = (int)strlen(needle);
+    for (int i = 0; i + k <= n; i++) {
+        int j = 0;
+        while (j < k && lower(h[i + j]) == needle[j]) j++;
+        if (j == k) return h + i;
+    }
+    return NULL;
+}
+static void set_status(const char* a, const char* b) {
+    scpy(status, sizeof status, a);
+    if (b) scat(status, sizeof status, b);
 }
 
-static int int_to_str(int v, char* buf) {
-    char t[12]; int p = 0;
-    if (v == 0) { t[p++] = '0'; }
-    else {
-        bool neg = v < 0;
-        unsigned u = neg ? (unsigned)(-v) : (unsigned)v;
-        while (u) { t[p++] = (char)('0' + u % 10); u /= 10; }
-        if (neg) t[p++] = '-';
+/* ======================================================================
+   Character sets. Everything inside is CP866 (what the fonts draw).
+   ====================================================================== */
+
+static const char latin1_fold[65] =            /* U+00C0..U+00FF -> ASCII */
+    "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYPsaaaaaaaceeeeiiiidnooooo/ouuuuypy";
+
+/* One code point -> up to 3 CP866 bytes; returns the count (0 = drop). */
+static int uni_to_cp866(uint32_t cp, uint8_t* o) {
+    if (cp < 0x80) { o[0] = (uint8_t)cp; return 1; }
+    if (cp >= 0x410 && cp <= 0x43F) { o[0] = (uint8_t)(0x80 + (cp - 0x410)); return 1; }
+    if (cp >= 0x440 && cp <= 0x44F) { o[0] = (uint8_t)(0xE0 + (cp - 0x440)); return 1; }
+    if (cp == 0x401) { o[0] = 0xF0; return 1; }
+    if (cp == 0x451) { o[0] = 0xF1; return 1; }
+    if (cp == 0x404) { o[0] = 0xF2; return 1; }
+    if (cp == 0x454) { o[0] = 0xF3; return 1; }
+    if (cp == 0x407) { o[0] = 0xF4; return 1; }
+    if (cp == 0x457) { o[0] = 0xF5; return 1; }
+    if (cp == 0x406) { o[0] = 'I'; return 1; }
+    if (cp == 0x456) { o[0] = 'i'; return 1; }
+    if (cp >= 0xC0 && cp <= 0xFF) { o[0] = (uint8_t)latin1_fold[cp - 0xC0]; return 1; }
+    switch (cp) {
+    case 0xA0: case 0x2002: case 0x2003: case 0x2009: case 0x202F: o[0] = ' '; return 1;
+    case 0xAB: case 0xBB: case 0x201C: case 0x201D: case 0x201E: o[0] = '"'; return 1;
+    case 0x2018: case 0x2019: case 0x201A: case 0xB4: o[0] = '\''; return 1;
+    case 0x2010: case 0x2011: case 0x2012: case 0x2013: case 0x2014: case 0x2015: case 0x2212:
+        o[0] = '-'; return 1;
+    case 0x2022: case 0xB7: case 0x25CF: case 0x2219: o[0] = 0xF9; return 1;
+    case 0xB0: o[0] = 0xF8; return 1;
+    case 0x2116: o[0] = 0xFC; return 1;
+    case 0xA9: o[0] = '('; o[1] = 'c'; o[2] = ')'; return 3;
+    case 0xAE: o[0] = '('; o[1] = 'R'; o[2] = ')'; return 3;
+    case 0x2122: o[0] = 'T'; o[1] = 'M'; return 2;
+    case 0x2026: o[0] = o[1] = o[2] = '.'; return 3;
+    case 0x2190: o[0] = '<'; return 1;
+    case 0x2192: o[0] = '>'; return 1;
+    case 0xD7: o[0] = 'x'; return 1;
+    case 0x20AC: o[0] = 'E'; return 1;
+    case 0x20BD: o[0] = 0xE0; return 1;           /* rouble sign -> р */
     }
-    int n = p;
-    for (int i = 0; i < p; i++) buf[i] = t[p - 1 - i];
-    buf[p] = 0;
+    if (cp >= 0x250 || cp == 0xAD) return 0;     /* other scripts, symbols, emoji, soft hyphen */
+    o[0] = '?';
+    return 1;
+}
+
+/* In place: output is never longer than input. */
+static int utf8_to_cp866(uint8_t* b, int n) {
+    int r = 0, w = 0;
+    while (r < n) {
+        uint8_t c = b[r];
+        uint32_t cp; int k;
+        if (c < 0x80) { b[w++] = c; r++; continue; }
+        if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; k = 1; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; k = 2; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; k = 3; }
+        else { r++; continue; }
+        bool ok = true;
+        for (int i = 1; i <= k; i++) {
+            if (r + i >= n || (b[r + i] & 0xC0) != 0x80) { ok = false; break; }
+            cp = (cp << 6) | (b[r + i] & 0x3F);
+        }
+        if (!ok) { r++; continue; }
+        r += k + 1;
+        uint8_t o[3];
+        int m = uni_to_cp866(cp, o);
+        if (m > k + 1) m = k + 1;
+        for (int i = 0; i < m; i++) b[w++] = o[i];
+    }
+    return w;
+}
+
+static int cp1251_to_cp866(uint8_t* b, int n) {
+    for (int i = 0; i < n; i++) {
+        uint8_t c = b[i];
+        if (c < 0x80) continue;
+        if (c >= 0xC0 && c <= 0xEF) b[i] = (uint8_t)(0x80 + (c - 0xC0));
+        else if (c >= 0xF0) b[i] = (uint8_t)(0xE0 + (c - 0xF0));
+        else if (c == 0xA8) b[i] = 0xF0;
+        else if (c == 0xB8) b[i] = 0xF1;
+        else if (c == 0xA0) b[i] = ' ';
+        else if (c == 0x96 || c == 0x97) b[i] = '-';
+        else if (c == 0xAB || c == 0xBB || c == 0x93 || c == 0x94) b[i] = '"';
+        else if (c == 0x91 || c == 0x92) b[i] = '\'';
+        else if (c == 0xB9) b[i] = 0xFC;
+        else b[i] = '?';
+    }
     return n;
 }
 
-static void set_status(const char* a, const char* b) {
-    int p = 0;
-    if (a) for (int i = 0; a[i] && p < (int)sizeof(status_text) - 1; i++) status_text[p++] = a[i];
-    if (b) for (int i = 0; b[i] && p < (int)sizeof(status_text) - 1; i++) status_text[p++] = b[i];
-    status_text[p] = 0;
+/* CP866 byte -> UTF-8 (for URLs and form data). Returns bytes written. */
+static int cp866_to_utf8(uint8_t c, uint8_t* o) {
+    uint32_t cp;
+    if (c < 0x80) { o[0] = c; return 1; }
+    if (c <= 0xAF) cp = 0x410 + (c - 0x80);
+    else if (c >= 0xE0 && c <= 0xEF) cp = 0x440 + (c - 0xE0);
+    else if (c == 0xF0) cp = 0x401;
+    else if (c == 0xF1) cp = 0x451;
+    else { o[0] = '?'; return 1; }
+    o[0] = (uint8_t)(0xC0 | (cp >> 6));
+    o[1] = (uint8_t)(0x80 | (cp & 0x3F));
+    return 2;
 }
 
-static void set_status_num(const char* a, int v, const char* b) {
-    int p = 0;
-    if (a) for (int i = 0; a[i] && p < (int)sizeof(status_text) - 1; i++) status_text[p++] = a[i];
-    char num[16];
-    int n = int_to_str(v, num);
-    for (int i = 0; i < n && p < (int)sizeof(status_text) - 1; i++) status_text[p++] = num[i];
-    if (b) for (int i = 0; b[i] && p < (int)sizeof(status_text) - 1; i++) status_text[p++] = b[i];
-    status_text[p] = 0;
-}
+static const char HEX[] = "0123456789ABCDEF";
 
-/* ---------- URL parsing ---------- */
-
-static int parse_octet(const char** pp) {
-    const char* p = *pp;
-    int v = 0, n = 0;
-    while (*p >= '0' && *p <= '9' && n < 3) { v = v*10 + (*p - '0'); p++; n++; }
-    if (n == 0 || v > 255) return -1;
-    *pp = p;
-    return v;
-}
-
-/* Tiny static "/etc/hosts" — we have no DNS, but most things people type
-   are these two names anyway. `host` and `localhost` mean the QEMU SLIRP
-   gateway (= the machine the user is running QEMU on). */
-typedef struct { const char* name; uint32_t ip; } host_alias_t;
-
-static const host_alias_t host_aliases[] = {
-    {"host",      IP4(10,0,2,2)},
-    {"localhost", IP4(10,0,2,2)},
-    {"gateway",   IP4(10,0,2,2)},
-    {"samara",    IP4(10,0,2,15)},
-    {"self",      IP4(10,0,2,15)},
-};
-#define HOST_ALIAS_N (int)(sizeof(host_aliases) / sizeof(host_aliases[0]))
-
-static int parse_url(const char* url, uint32_t* ip, uint16_t* port,
-                     char* path_out, int path_cap) {
-    const char* p = url;
-    while (*p == ' ' || *p == '\t') p++;
-    /* case-insensitive http:// */
-    if ((p[0]|0x20) == 'h' && (p[1]|0x20) == 't' && (p[2]|0x20) == 't' &&
-        (p[3]|0x20) == 'p' && p[4] == ':' && p[5] == '/' && p[6] == '/')
-        p += 7;
-    /* explicitly reject https:// — no TLS */
-    if ((p[0]|0x20) == 'h' && (p[1]|0x20) == 't' && (p[2]|0x20) == 't' &&
-        (p[3]|0x20) == 'p' && (p[4]|0x20) == 's' && p[5] == ':')
-        return 0;
-
-    bool resolved = false;
-    if (!(*p >= '0' && *p <= '9')) {
-        for (int i = 0; i < HOST_ALIAS_N; i++) {
-            const char* name = host_aliases[i].name;
-            int nl = 0; while (name[nl]) nl++;
-            bool eq = true;
-            for (int k = 0; k < nl; k++)
-                if (to_lower(p[k]) != name[k]) { eq = false; break; }
-            if (eq && (p[nl] == 0 || p[nl] == '/' || p[nl] == ':')) {
-                *ip = host_aliases[i].ip;
-                p += nl;
-                resolved = true;
-                break;
-            }
+/* application/x-www-form-urlencoded, from CP866 text */
+static void form_encode(const char* s, int n, char* out, int* op, int cap) {
+    for (int i = 0; i < n && *op < cap - 7; i++) {
+        uint8_t u[2];
+        int m = cp866_to_utf8((uint8_t)s[i], u);
+        for (int j = 0; j < m; j++) {
+            uint8_t c = u[j];
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                c == '-' || c == '_' || c == '.' || c == '~') out[(*op)++] = (char)c;
+            else if (c == ' ') out[(*op)++] = '+';
+            else { out[(*op)++] = '%'; out[(*op)++] = HEX[c >> 4]; out[(*op)++] = HEX[c & 15]; }
         }
-        if (!resolved) return 0;
-    } else {
-        int a = parse_octet(&p); if (a < 0 || *p != '.') return 0; p++;
-        int b = parse_octet(&p); if (b < 0 || *p != '.') return 0; p++;
-        int c = parse_octet(&p); if (c < 0 || *p != '.') return 0; p++;
-        int d = parse_octet(&p); if (d < 0) return 0;
-        *ip = ((uint32_t)a << 24) | ((uint32_t)b << 16) | ((uint32_t)c << 8) | (uint32_t)d;
     }
-
-    *port = 80;
-    if (*p == ':') {
-        p++;
-        int v = 0;
-        while (*p >= '0' && *p <= '9') { v = v*10 + (*p - '0'); p++; }
-        if (v < 1 || v > 65535) return 0;
-        *port = (uint16_t)v;
-    }
-    int pi = 0;
-    if (*p == 0) {
-        if (path_cap > 1) { path_out[pi++] = '/'; path_out[pi] = 0; }
-    } else if (*p == '/') {
-        while (*p && pi < path_cap - 1) path_out[pi++] = *p++;
-        path_out[pi] = 0;
-    } else {
-        return 0;
-    }
-    return 1;
+    out[*op] = 0;
 }
 
-/* Resolve a possibly-relative href against the current page URL. Writes a
-   fully qualified http:// URL into out. Returns 1 on success, 0 if not
-   reachable (e.g. mailto:, https://). */
-static int resolve_href(const char* href, char* out, int cap) {
-    if (!href || !*href) return 0;
-    /* Already absolute http? */
-    if (strncmp(href, "http://", 7) == 0) {
-        str_set(out, cap, href);
-        return 1;
-    }
-    /* Anything else with a scheme — give up. */
-    for (int i = 0; href[i]; i++) {
-        if (href[i] == ':') return 0;
-        if (href[i] == '/' || href[i] == '#' || href[i] == '?') break;
-    }
-    if (href[0] == '#') return 0;       /* same-page fragment, skip */
-
-    /* Need the base from cur_url. Parse it. */
-    uint32_t ip; uint16_t port; char base_path[URL_MAX];
-    if (!parse_url(cur_url, &ip, &port, base_path, sizeof(base_path))) return 0;
-
-    /* Compose http://IP[:port] */
+/* Internal (CP866) URL -> wire form: spaces/non-ASCII become %XX of UTF-8. */
+static void wire_url(const char* in, char* out, int cap) {
     int p = 0;
-    const char* pfx = "http://";
-    for (int i = 0; pfx[i] && p < cap - 1; i++) out[p++] = pfx[i];
-    char tmp[8];
-    for (int oct = 0; oct < 4; oct++) {
-        int n = int_to_str((ip >> (24 - oct*8)) & 0xFF, tmp);
-        for (int i = 0; i < n && p < cap - 1; i++) out[p++] = tmp[i];
-        if (oct < 3 && p < cap - 1) out[p++] = '.';
-    }
-    if (port != 80 && p < cap - 1) {
-        out[p++] = ':';
-        int n = int_to_str(port, tmp);
-        for (int i = 0; i < n && p < cap - 1; i++) out[p++] = tmp[i];
-    }
-
-    if (href[0] == '/') {
-        for (int i = 0; href[i] && p < cap - 1; i++) out[p++] = href[i];
-    } else {
-        /* Strip filename from base_path, then append href */
-        int last_slash = 0;
-        for (int i = 0; base_path[i]; i++) if (base_path[i] == '/') last_slash = i;
-        for (int i = 0; i <= last_slash && p < cap - 1; i++) out[p++] = base_path[i];
-        for (int i = 0; href[i] && p < cap - 1; i++) out[p++] = href[i];
+    for (int i = 0; in[i] && p < cap - 7; i++) {
+        uint8_t c = (uint8_t)in[i];
+        if (c > 0x20 && c < 0x7F && c != '"' && c != '<' && c != '>' && c != '\\' && c != '^' &&
+            c != '`' && c != '{' && c != '|' && c != '}') { out[p++] = (char)c; continue; }
+        uint8_t u[2];
+        int m = cp866_to_utf8(c, u);
+        for (int j = 0; j < m; j++) { out[p++] = '%'; out[p++] = HEX[u[j] >> 4]; out[p++] = HEX[u[j] & 15]; }
     }
     out[p] = 0;
-    return 1;
 }
 
-/* ---------- UTF-8 -> CP866 ---------- */
-
-/* Walks the buffer in place, converting UTF-8 byte sequences (mainly the
-   Russian Cyrillic block) into CP866 single-byte codes that our 8x16 font
-   can render. Returns the new (possibly shorter) length. */
-static int utf8_to_cp866_inplace(uint8_t* buf, int len) {
-    int rd = 0, wr = 0;
-    while (rd < len) {
-        uint8_t c = buf[rd];
-        if (c < 0x80) { buf[wr++] = c; rd++; continue; }
-
-        if (c == 0xD0 && rd + 1 < len) {
-            uint8_t c2 = buf[rd + 1];
-            uint8_t out = '?';
-            if      (c2 == 0x81) out = 0xF0;                      /* Ё */
-            else if (c2 >= 0x90 && c2 <= 0xAF) out = 0x80 + (c2 - 0x90);   /* А..Я (incl. И, Й, ...) */
-            else if (c2 >= 0xB0 && c2 <= 0xBF) out = 0xA0 + (c2 - 0xB0);   /* а..п */
-            buf[wr++] = out; rd += 2; continue;
-        }
-        if (c == 0xD1 && rd + 1 < len) {
-            uint8_t c2 = buf[rd + 1];
-            uint8_t out = '?';
-            if      (c2 == 0x91) out = 0xF1;                      /* ё */
-            else if (c2 >= 0x80 && c2 <= 0x8F) out = 0xE0 + (c2 - 0x80);   /* р..я */
-            buf[wr++] = out; rd += 2; continue;
-        }
-        if ((c & 0xE0) == 0xC0 && rd + 1 < len) {
-            /* Other 2-byte UTF-8 (Latin extended, etc) — squash to '?' */
-            uint8_t c2 = buf[rd + 1];
-            uint32_t cp = ((c & 0x1F) << 6) | (c2 & 0x3F);
-            uint8_t out;
-            if (cp == 0x00A0) out = ' ';        /* nbsp */
-            else if (cp == 0x00AB) out = '<';
-            else if (cp == 0x00BB) out = '>';
-            else if (cp == 0x00A9 || cp == 0x00AE) out = 'C';
-            else out = '?';
-            buf[wr++] = out; rd += 2; continue;
-        }
-        if ((c & 0xF0) == 0xE0 && rd + 2 < len) {
-            uint8_t c2 = buf[rd + 1], c3 = buf[rd + 2];
-            uint32_t cp = ((c & 0x0F) << 12) | ((c2 & 0x3F) << 6) | (c3 & 0x3F);
-            if (cp == 0x2026) {     /* ellipsis "..." — expand if room */
-                if (wr + 3 <= rd + 3) { buf[wr++]='.'; buf[wr++]='.'; buf[wr++]='.'; rd += 3; continue; }
-            }
-            uint8_t out = '?';
-            if      (cp == 0x2013 || cp == 0x2014 || cp == 0x2212) out = '-';
-            else if (cp == 0x2018 || cp == 0x2019) out = '\'';
-            else if (cp == 0x201C || cp == 0x201D || cp == 0x00AB) out = '"';
-            else if (cp == 0x2022 || cp == 0x00B7 || cp == 0x25CF) out = '*';
-            else if (cp == 0x00A0) out = ' ';
-            buf[wr++] = out; rd += 3; continue;
-        }
-        if ((c & 0xF8) == 0xF0 && rd + 3 < len) {
-            buf[wr++] = '?';
-            rd += 4; continue;
-        }
-        /* stray byte — pass through */
-        buf[wr++] = c; rd++;
-    }
-    return wr;
+static int hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    c = lower(c);
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
 }
 
-/* ---------- HTML parser ---------- */
+/* ======================================================================
+   URLs
+   ====================================================================== */
 
-static bool tag_eq(const char* tag, int tlen, const char* name) {
-    int nlen = 0; while (name[nlen]) nlen++;
-    if (tlen != nlen) return false;
-    for (int i = 0; i < tlen; i++) if (to_lower(tag[i]) != name[i]) return false;
+static bool url_parts(const char* u, int* scheme_end, int* host_end) {
+    const char* s = strstr(u, "://");
+    if (!s) return false;
+    *scheme_end = (int)(s - u);
+    int h = *scheme_end + 3;
+    while (u[h] && u[h] != '/' && u[h] != '?' && u[h] != '#') h++;
+    *host_end = h;
     return true;
 }
 
-/* Decode a single HTML entity starting at body[*i] (which is '&').
-   Writes the decoded char(s) to out (up to *out_cap); on success, advances
-   *i past the ';' and returns the number of bytes written. On failure
-   (unrecognized), returns 0 and *i is unchanged. */
-static int decode_entity(const char* body, int body_len, int* i, char* out, int out_cap) {
-    int start = *i;
-    if (start >= body_len || body[start] != '&') return 0;
-    int j = start + 1;
-    int max_j = j + 8;
-    if (max_j > body_len) max_j = body_len;
-    int end = -1;
-    for (int k = j; k < max_j; k++) {
-        if (body[k] == ';') { end = k; break; }
-        /* numeric refs allow #, x, digits, hex digits; named refs only alnum */
-        char c = body[k];
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
-              (c >= 'A' && c <= 'Z') || c == '#' || c == 'x'))
-            return 0;
-    }
-    if (end < 0) return 0;
-    int len = end - j;
-    if (len <= 0) return 0;
-
-    char buf[12];
-    if (len > 11) return 0;
-    for (int k = 0; k < len; k++) buf[k] = body[j + k];
-    buf[len] = 0;
-
-    /* numeric */
-    if (buf[0] == '#') {
-        int v = 0;
-        if (buf[1] == 'x' || buf[1] == 'X') {
-            for (int k = 2; k < len; k++) {
-                char c = buf[k]; int d;
-                if      (c >= '0' && c <= '9') d = c - '0';
-                else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
-                else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
-                else return 0;
-                v = v*16 + d;
-            }
-        } else {
-            for (int k = 1; k < len; k++) {
-                char c = buf[k];
-                if (c < '0' || c > '9') return 0;
-                v = v*10 + (c - '0');
-            }
-        }
-        uint8_t mapped = 0;
-        if (v > 0 && v < 128) {
-            mapped = (uint8_t)v;
-        } else if (v >= 0x0410 && v <= 0x042F) {       /* А..Я */
-            mapped = (uint8_t)(0x80 + (v - 0x0410));
-        } else if (v >= 0x0430 && v <= 0x043F) {       /* а..п */
-            mapped = (uint8_t)(0xA0 + (v - 0x0430));
-        } else if (v >= 0x0440 && v <= 0x044F) {       /* р..я */
-            mapped = (uint8_t)(0xE0 + (v - 0x0440));
-        } else if (v == 0x0401) {                      /* Ё */
-            mapped = 0xF0;
-        } else if (v == 0x0451) {                      /* ё */
-            mapped = 0xF1;
-        } else if (v == 0x00A0) {                      /* nbsp */
-            mapped = ' ';
-        } else if (v == 0x2013 || v == 0x2014 || v == 0x2212) {
-            mapped = '-';
-        } else {
-            mapped = '?';
-        }
-        if (out_cap >= 1) { out[0] = (char)mapped; *i = end + 1; return 1; }
-        return 0;
-    }
-    /* named */
-    struct { const char* name; const char* repl; } table[] = {
-        {"amp", "&"},  {"lt", "<"},   {"gt", ">"},
-        {"quot", "\""}, {"apos", "'"}, {"nbsp", " "},
-        {"copy", "(c)"}, {"reg", "(R)"}, {"mdash", "--"}, {"ndash", "-"},
-        {"hellip", "..."}, {"laquo", "<<"}, {"raquo", ">>"},
-        {"middot", "*"}, {"bull", "*"}, {"trade", "(TM)"},
-        {NULL, NULL}
-    };
-    for (int t = 0; table[t].name; t++) {
-        int nlen = 0; while (table[t].name[nlen]) nlen++;
-        if (nlen == len) {
-            bool eq = true;
-            for (int k = 0; k < len; k++)
-                if (to_lower(buf[k]) != table[t].name[k]) { eq = false; break; }
-            if (eq) {
-                int rl = 0; while (table[t].repl[rl]) rl++;
-                if (rl > out_cap) rl = out_cap;
-                for (int k = 0; k < rl; k++) out[k] = table[t].repl[k];
-                *i = end + 1;
-                return rl;
-            }
-        }
-    }
-    /* Unknown entity — pass through as '?' */
-    if (out_cap >= 1) { out[0] = '?'; *i = end + 1; return 1; }
-    return 0;
+static void url_host(const char* u, char* out, int cap) {
+    int se, he;
+    out[0] = 0;
+    if (!url_parts(u, &se, &he)) return;
+    int n = he - se - 3;
+    if (n >= cap) n = cap - 1;
+    memcpy(out, u + se + 3, (size_t)n);
+    out[n] = 0;
 }
 
-/* Add `len` chars of text into the doc_text_pool; returns offset or -1 if full.
-   The terminator at [off+len] must survive subsequent calls, so we reserve
-   len+1 bytes — otherwise the next pool_add would overwrite it and gfx_string
-   would print run-on garbage. */
-static int pool_add(const char* s, int len) {
-    if (doc_text_used + len + 1 > TEXT_POOL_CAP) return -1;
-    int off = doc_text_used;
-    for (int i = 0; i < len; i++) doc_text_pool[off + i] = s[i];
-    doc_text_pool[off + len] = 0;
-    doc_text_used += len + 1;
+static void remove_dot_segments(char* url) {
+    int se, he;
+    if (!url_parts(url, &se, &he)) return;
+    char* path = url + he;
+    static char out[URL_MAX];
+    int o = 0, i = 0;
+    while (path[i] && path[i] != '?' && path[i] != '#') {
+        if (path[i] == '/' && path[i + 1] == '.' &&
+            (path[i + 2] == '/' || path[i + 2] == 0 || path[i + 2] == '?')) { i += 2; continue; }
+        if (path[i] == '/' && path[i + 1] == '.' && path[i + 2] == '.' &&
+            (path[i + 3] == '/' || path[i + 3] == 0 || path[i + 3] == '?')) {
+            while (o > 0 && out[o - 1] != '/') o--;
+            if (o > 0) o--;
+            while (o > 0 && out[o - 1] != '/') o--;
+            if (o > 0) o--;
+            i += 3;
+            continue;
+        }
+        if (o < URL_MAX - 1) out[o++] = path[i];
+        i++;
+    }
+    if (o == 0) out[o++] = '/';
+    while (path[i] && o < URL_MAX - 1) out[o++] = path[i++];
+    out[o] = 0;
+    scpy(path, URL_MAX - he, out);
+}
+
+/* Value of query parameter `key`, percent-decoded (raw bytes). */
+static bool query_param(const char* url, const char* key, char* out, int cap) {
+    const char* q = strchr(url, '?');
+    if (!q) return false;
+    int kl = (int)strlen(key);
+    for (const char* p = q + 1; *p; ) {
+        if (!strncmp(p, key, (size_t)kl) && p[kl] == '=') {
+            p += kl + 1;
+            int o = 0;
+            while (*p && *p != '&' && *p != '#' && o < cap - 1) {
+                if (*p == '%' && hexval(p[1]) >= 0 && hexval(p[2]) >= 0) {
+                    out[o++] = (char)(hexval(p[1]) * 16 + hexval(p[2])); p += 3;
+                } else if (*p == '+') { out[o++] = ' '; p++; }
+                else out[o++] = *p++;
+            }
+            out[o] = 0;
+            return true;
+        }
+        while (*p && *p != '&') p++;
+        if (*p == '&') p++;
+    }
+    return false;
+}
+
+/* Redirector links (DuckDuckGo /l/?uddg=, Google /url?q=) -> the target. */
+static void unwrap_redirect(char* url) {
+    int se, he;
+    if (!url_parts(url, &se, &he)) return;
+    char host[128];
+    url_host(url, host, sizeof host);
+    const char* path = url + he;
+    static char tgt[URL_MAX];
+    bool got = false;
+    if (strstr(host, "duckduckgo.com") && !strncmp(path, "/l/", 3))
+        got = query_param(url, "uddg", tgt, sizeof tgt);
+    else if (strstr(host, "google.") && !strncmp(path, "/url?", 5))
+        got = query_param(url, "q", tgt, sizeof tgt) || query_param(url, "url", tgt, sizeof tgt);
+    if (!got || strncmp(tgt, "http", 4)) return;
+    int n = utf8_to_cp866((uint8_t*)tgt, (int)strlen(tgt));
+    tgt[n] = 0;
+    scpy(url, URL_MAX, tgt);
+}
+
+/* href relative to base -> absolute URL. false for javascript:, mailto:, #frag. */
+static bool resolve_url(const char* base, const char* href, char* out) {
+    while (*href == ' ' || *href == '\t' || *href == '\n' || *href == '\r') href++;
+    if (!*href || href[0] == '#') return false;
+    if (starts_ci(href, "javascript:") || starts_ci(href, "mailto:") || starts_ci(href, "tel:") ||
+        starts_ci(href, "data:")) return false;
+    int se, he;
+    if (starts_ci(href, "http://") || starts_ci(href, "https://") || starts_ci(href, "about:")) {
+        scpy(out, URL_MAX, href);
+    } else if (!url_parts(base, &se, &he)) {
+        return false;
+    } else if (href[0] == '/' && href[1] == '/') {
+        memcpy(out, base, (size_t)se + 1);
+        out[se + 1] = 0;
+        scat(out, URL_MAX, href);
+    } else if (href[0] == '/') {
+        memcpy(out, base, (size_t)he);
+        out[he] = 0;
+        scat(out, URL_MAX, href);
+    } else if (href[0] == '?') {
+        int e = he;
+        while (base[e] && base[e] != '?' && base[e] != '#') e++;
+        memcpy(out, base, (size_t)e);
+        out[e] = 0;
+        scat(out, URL_MAX, href);
+    } else {
+        int e = he, slash = -1;
+        while (base[e] && base[e] != '?' && base[e] != '#') { if (base[e] == '/') slash = e; e++; }
+        if (slash < 0) { memcpy(out, base, (size_t)he); out[he] = '/'; out[he + 1] = 0; }
+        else { memcpy(out, base, (size_t)slash + 1); out[slash + 1] = 0; }
+        scat(out, URL_MAX, href);
+    }
+    char* h = strchr(out, '#');
+    if (h) *h = 0;
+    for (char* p = out; *p; p++) if (*p == '\n' || *p == '\r' || *p == '\t') *p = ' ';
+    remove_dot_segments(out);
+    unwrap_redirect(out);
+    return true;
+}
+
+static void search_url(const char* q, char* out) {
+    scpy(out, URL_MAX, SEARCH_URL);
+    int p = (int)strlen(out);
+    form_encode(q, (int)strlen(q), out, &p, URL_MAX);
+}
+
+/* What the user typed -> a URL (or a search). */
+static void normalize_typed(const char* in, char* out) {
+    while (*in == ' ') in++;
+    static char t[URL_MAX];
+    scpy(t, sizeof t, in);
+    int n = (int)strlen(t);
+    while (n > 0 && t[n - 1] == ' ') t[--n] = 0;
+    if (!n) { scpy(out, URL_MAX, HOME_URL); return; }
+    if (strstr(t, "://") || starts_ci(t, "about:")) { scpy(out, URL_MAX, t); return; }
+    bool space = strchr(t, ' ') != NULL, dot = strchr(t, '.') != NULL;
+    bool local = starts_ci(t, "host") || starts_ci(t, "localhost") ||
+                 (t[0] >= '0' && t[0] <= '9' && dot);
+    if (space || (!dot && !local)) { search_url(t, out); return; }
+    scpy(out, URL_MAX, local ? "http://" : "https://");
+    scat(out, URL_MAX, t);
+}
+
+/* Google's results need JavaScript: send its searches to DuckDuckGo. */
+static bool reroute_search(char* url) {
+    char host[128];
+    url_host(url, host, sizeof host);
+    int se, he;
+    if (!strstr(host, "google.") || !url_parts(url, &se, &he) || strncmp(url + he, "/search", 7)) return false;
+    static char q[FIELD_MAX * 3];
+    if (!query_param(url, "q", q, sizeof q)) return false;
+    int n = utf8_to_cp866((uint8_t*)q, (int)strlen(q));
+    q[n] = 0;
+    search_url(q, url);
+    return true;
+}
+
+/* ======================================================================
+   Layout
+   ====================================================================== */
+
+static int font_h(int f) { return f == F_MONO ? 16 : uif_height((uif_t)f); }
+static int text_w(int f, const char* s, int n) { return f == F_MONO ? n * 8 : uif_width_n((uif_t)f, s, n); }
+
+typedef struct {
+    int  view_w, cx, cy, line_h, line_first, margin, indent;
+    bool dirty, space;
+    int  bold, mono, small, h, pre, center;
+    int  link;
+    int  list_depth;
+    int  list_num[10];                 /* 0 = ul, else next ol number */
+    int  form;
+} lay_t;
+
+static int cur_font(lay_t* L) {
+    if (L->h == 1 || L->h == 2) return UIF_BIG;
+    if (L->h) return UIF_MED;
+    if (L->mono || L->pre) return F_MONO;
+    if (L->bold) return UIF_MED;
+    if (L->small) return UIF_SMALL;
+    return UIF_REG;
+}
+static uint32_t cur_fg(lay_t* L) { return L->link >= 0 ? COL_LINK : COL_TEXT; }
+
+static int pool_put(const char* s, int n) {
+    if (pool_used + n + 1 > POOL_CAP) return -1;
+    int off = pool_used;
+    memcpy(pool + off, s, (size_t)n);
+    pool[off + n] = 0;
+    pool_used += n + 1;
+    return off;
+}
+static int url_put(const char* s) {
+    int n = (int)strlen(s);
+    if (url_used + n + 1 > URLPOOL_CAP) return -1;
+    int off = url_used;
+    memcpy(url_pool + off, s, (size_t)n + 1);
+    url_used += n + 1;
     return off;
 }
 
-/* ---------- Parser state, exposed to handle_tag ---------- */
-
-typedef struct {
-    int      view_w;       /* pixel width available */
-    int      cx, cy;       /* doc cursor */
-    int      line_h;       /* current line spacing */
-    uint32_t fg;
-    int      link_idx;
-    bool     underline;
-    bool     pre;
-    int      indent;       /* x indent (e.g., for <li>) */
-    bool     pending_space;
-    bool     line_dirty;   /* something on current line */
-    int      skip_until_tag; /* 0=none, 1=until </script>, 2=until </style> */
-    int      h_level;      /* >0 if inside <hN> */
-    bool     bold;
-} pstate_t;
-
-static void emit_text_chunk(pstate_t* st, const char* s, int len) {
-    if (len <= 0) return;
-    if (n_runs >= MAX_RUNS) return;
-    int w = len * 8;
-    int off = pool_add(s, len);
-    if (off < 0) return;
+static run_t* add_run(int kind, int x, int y, int w, int h, int font, uint32_t fg,
+                      int link, int field, int off, int len) {
+    if (n_runs >= MAX_RUNS) return NULL;
     run_t* r = &runs[n_runs++];
-    r->x = st->cx + st->indent;
-    r->y = st->cy;
-    r->w = w;
-    r->text_off = off;
-    r->text_len = len;
-    r->fg = st->fg;
-    r->link_idx = st->link_idx;
-    r->underline = (st->underline || st->link_idx >= 0) ? 1 : 0;
-    st->cx += w;
-    st->line_dirty = true;
+    r->kind = (uint8_t)kind; r->x = x; r->y = y; r->w = (uint16_t)w; r->h = (uint16_t)h;
+    r->font = (uint8_t)font; r->fg = fg; r->link = (int16_t)link; r->field = (int16_t)field;
+    r->off = off; r->len = (uint16_t)len;
+    return r;
 }
 
-static void parser_newline(pstate_t* st, int extra) {
-    st->cy += st->line_h + extra;
-    st->cx = 0;
-    st->pending_space = false;
-    st->line_dirty = false;
-}
+static int left_x(lay_t* L) { return PAD + L->indent; }
 
-static void word_break(pstate_t* st) {
-    /* about to add a word; nothing more to do here, emit_word handles wrap */
-}
-
-static void emit_word(pstate_t* st, const char* word, int len) {
-    if (len <= 0) return;
-    int word_w = len * 8;
-    int space_w = (st->pending_space && st->line_dirty) ? 8 : 0;
-    if (st->cx + space_w + word_w > st->view_w) {
-        parser_newline(st, 0);
-    } else if (space_w) {
-        st->cx += space_w;
+static void end_line(lay_t* L) {
+    if (!L->dirty) return;
+    int shift = 0;
+    if (L->center) {
+        int w = L->cx - left_x(L), avail = L->view_w - PAD - left_x(L);
+        if (w < avail) shift = (avail - w) / 2;
     }
-    emit_text_chunk(st, word, len);
-    st->pending_space = false;
+    for (int i = L->line_first; i < n_runs; i++) {
+        runs[i].y = L->cy + (L->line_h - runs[i].h) / 2;
+        runs[i].x += shift;
+    }
+    L->cy += L->line_h + 3;
+    L->line_h = 0;
+    L->dirty = false;
+    L->space = false;
 }
 
-/* Find an attribute value within a tag's body (between < and >).
-   tag_body points just past the tag-name. Returns 1 on success and writes
-   the value into out. Strips surrounding quotes. */
-static int find_attr(const char* tag_body, int tlen, const char* attr,
-                     char* out, int cap) {
-    int alen = 0; while (attr[alen]) alen++;
-    int i = 0;
-    while (i < tlen) {
-        while (i < tlen && (tag_body[i] == ' ' || tag_body[i] == '\t' ||
-                             tag_body[i] == '\r' || tag_body[i] == '\n')) i++;
-        if (i >= tlen) return 0;
-        int ns = i;
-        while (i < tlen && tag_body[i] != '=' && tag_body[i] != ' ' &&
-               tag_body[i] != '\t' && tag_body[i] != '>') i++;
-        int nlen = i - ns;
-        bool match = (nlen == alen);
+static void block(lay_t* L, int margin) {
+    end_line(L);
+    if (margin > L->margin) L->margin = margin;
+}
+
+static void need_line(lay_t* L) {
+    if (L->dirty) return;
+    if (L->margin) { L->cy += L->margin; L->margin = 0; }
+    L->cx = left_x(L);
+    L->line_first = n_runs;
+}
+
+static void place(lay_t* L, int w, int h) {
+    L->dirty = true;
+    if (h > L->line_h) L->line_h = h;
+    L->cx += w;
+}
+
+static void emit_piece(lay_t* L, const char* s, int n, int f, int sp) {
+    uint32_t fg = cur_fg(L);
+    int w = text_w(f, s, n);
+    run_t* p = n_runs > L->line_first ? &runs[n_runs - 1] : NULL;
+    if (p && p->kind == RK_TEXT && p->font == f && p->fg == fg && p->link == L->link &&
+        p->off + p->len + 1 == pool_used && p->x + p->w == L->cx &&
+        pool_used + n + 2 < POOL_CAP && p->len + n + 1 < 60000) {
+        int at = pool_used - 1;
+        if (sp) pool[at++] = ' ';
+        memcpy(pool + at, s, (size_t)n);
+        pool[at + n] = 0;
+        pool_used = at + n + 1;
+        p->len = (uint16_t)(p->len + (sp ? 1 : 0) + n);
+        p->w = (uint16_t)(p->w + sp + w);
+        place(L, sp + w, font_h(f));
+        return;
+    }
+    L->cx += sp;
+    int off = pool_put(s, n);
+    if (off < 0) return;
+    add_run(RK_TEXT, L->cx, L->cy, w, font_h(f), f, fg, L->link, -1, off, n);
+    place(L, w, font_h(f));
+}
+
+static void emit_word(lay_t* L, const char* s, int n) {
+    if (n <= 0) return;
+    int f = cur_font(L);
+    int avail = L->view_w - PAD - left_x(L);
+    if (avail < 40) avail = 40;
+    int sp = (L->space && L->dirty) ? text_w(f, " ", 1) : 0;
+    L->space = false;
+    int w = text_w(f, s, n);
+    if (L->dirty && L->cx + sp + w > L->view_w - PAD) { end_line(L); sp = 0; }
+    while (w > avail && n > 1) {                 /* longer than a line: hard-break it */
+        need_line(L);
+        int k = n;
+        while (k > 1 && text_w(f, s, k) > avail - (L->cx - left_x(L))) k = k * 3 / 4 < k - 1 ? k * 3 / 4 : k - 1;
+        emit_piece(L, s, k, f, sp);
+        end_line(L);
+        s += k; n -= k; sp = 0;
+        w = text_w(f, s, n);
+    }
+    need_line(L);
+    emit_piece(L, s, n, f, sp);
+}
+
+static void emit_box(lay_t* L, int kind, int w, int h, int field, int off, int len) {
+    int sp = L->dirty ? (L->space ? 8 : 4) : 0;
+    L->space = false;
+    if (L->dirty && L->cx + sp + w > L->view_w - PAD) { end_line(L); sp = 0; }
+    need_line(L);
+    L->cx += sp;
+    add_run(kind, L->cx, L->cy, w, h, UIF_MED, COL_TEXT, L->link, field, off, len);
+    place(L, w, h);
+}
+
+static void emit_rule(lay_t* L) {
+    block(L, 8);
+    need_line(L);
+    add_run(RK_RULE, left_x(L), L->cy, L->view_w - PAD - left_x(L), 1, 0, C_RULE, -1, -1, 0, 0);
+    L->cy += 1;
+    L->margin = 8;
+}
+
+/* ---------- entities ---------- */
+static const struct { const char* n; uint16_t cp; } ents[] = {
+    {"amp",'&'},{"lt",'<'},{"gt",'>'},{"quot",'"'},{"apos",'\''},{"nbsp",0xA0},
+    {"mdash",0x2014},{"ndash",0x2013},{"laquo",0xAB},{"raquo",0xBB},{"hellip",0x2026},
+    {"copy",0xA9},{"reg",0xAE},{"trade",0x2122},{"bull",0x2022},{"middot",0xB7},
+    {"rsquo",0x2019},{"lsquo",0x2018},{"ldquo",0x201C},{"rdquo",0x201D},{"bdquo",0x201E},
+    {"times",0xD7},{"deg",0xB0},{"euro",0x20AC},{"shy",0xAD},{"larr",0x2190},{"rarr",0x2192},
+    {"minus",0x2212},{"numero",0x2116},{"thinsp",0x2009},{"ensp",0x2002},{"emsp",0x2003},
+    {"zwnj",0x200C},{"zwj",0x200D},{"lrm",0x200E},{"rlm",0x200F},
+};
+
+/* Decode entities of s[0..n) into out; returns length. */
+static int decode_entities(const char* s, int n, char* out, int cap) {
+    int o = 0;
+    for (int i = 0; i < n && o < cap - 4; i++) {
+        if (s[i] != '&') { out[o++] = s[i]; continue; }
+        int j = i + 1;
+        uint32_t cp = 0;
+        bool ok = false;
+        if (j < n && s[j] == '#') {
+            j++;
+            bool hex = j < n && (s[j] == 'x' || s[j] == 'X');
+            if (hex) j++;
+            int d0 = j;
+            while (j < n && j - d0 < 8) {
+                int v = hex ? hexval(s[j]) : (s[j] >= '0' && s[j] <= '9' ? s[j] - '0' : -1);
+                if (v < 0) break;
+                cp = cp * (hex ? 16 : 10) + (uint32_t)v;
+                j++;
+            }
+            ok = j > d0;
+        } else {
+            int k0 = j;
+            while (j < n && j - k0 < 10 && ((s[j] >= 'a' && s[j] <= 'z') || (s[j] >= 'A' && s[j] <= 'Z'))) j++;
+            for (unsigned e = 0; e < sizeof ents / sizeof ents[0]; e++)
+                if ((int)strlen(ents[e].n) == j - k0 && !strncmp(ents[e].n, s + k0, (size_t)(j - k0))) {
+                    cp = ents[e].cp; ok = true; break;
+                }
+        }
+        if (!ok) { out[o++] = '&'; continue; }
+        if (j < n && s[j] == ';') j++;
+        i = j - 1;
+        uint8_t b[3];
+        int m = uni_to_cp866(cp, b);
+        for (int k = 0; k < m; k++) out[o++] = (char)b[k];
+    }
+    out[o] = 0;
+    return o;
+}
+
+/* ---------- tags ---------- */
+typedef struct { const char* a; int n; } attrs_t;
+
+static bool get_attr(attrs_t A, const char* key, char* out, int cap) {
+    const char* s = A.a;
+    int n = A.n, i = 0, kl = (int)strlen(key);
+    while (i < n) {
+        while (i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r' || s[i] == '/')) i++;
+        int k0 = i;
+        while (i < n && s[i] != '=' && s[i] != ' ' && s[i] != '\t' && s[i] != '\n' && s[i] != '\r' && s[i] != '>') i++;
+        int k1 = i;
+        while (i < n && (s[i] == ' ' || s[i] == '\n')) i++;
+        int v0 = i, v1 = i;
+        if (i < n && s[i] == '=') {
+            i++;
+            while (i < n && (s[i] == ' ' || s[i] == '\n')) i++;
+            if (i < n && (s[i] == '"' || s[i] == '\'')) {
+                char q = s[i++];
+                v0 = i;
+                while (i < n && s[i] != q) i++;
+                v1 = i;
+                if (i < n) i++;
+            } else {
+                v0 = i;
+                while (i < n && s[i] != ' ' && s[i] != '\t' && s[i] != '\n' && s[i] != '>') i++;
+                v1 = i;
+            }
+        }
+        if (k1 == k0) { if (i == k0) i++; continue; }
+        bool match = (k1 - k0 == kl);
+        for (int j = 0; match && j < kl; j++) if (lower(s[k0 + j]) != key[j]) match = false;
         if (match) {
-            for (int k = 0; k < nlen; k++)
-                if (to_lower(tag_body[ns + k]) != attr[k]) { match = false; break; }
-        }
-        /* skip ws */
-        while (i < tlen && (tag_body[i] == ' ' || tag_body[i] == '\t')) i++;
-        if (i < tlen && tag_body[i] == '=') {
-            i++;
-            while (i < tlen && (tag_body[i] == ' ' || tag_body[i] == '\t')) i++;
-            char quote = 0;
-            if (i < tlen && (tag_body[i] == '"' || tag_body[i] == '\'')) {
-                quote = tag_body[i]; i++;
-            }
-            int vs = i;
-            while (i < tlen) {
-                char c = tag_body[i];
-                if (quote && c == quote) break;
-                if (!quote && (c == ' ' || c == '\t' || c == '>')) break;
-                i++;
-            }
-            int vlen = i - vs;
-            if (match) {
-                if (vlen > cap - 1) vlen = cap - 1;
-                for (int k = 0; k < vlen; k++) out[k] = tag_body[vs + k];
-                out[vlen] = 0;
-                return 1;
-            }
-            if (quote && i < tlen && tag_body[i] == quote) i++;
-        } else if (match) {
-            /* attribute without value */
-            if (cap > 0) out[0] = 0;
-            return 1;
+            if (out) decode_entities(s + v0, v1 - v0, out, cap);
+            return true;
         }
     }
-    return 0;
+    return false;
 }
 
-static void handle_tag(pstate_t* st, const char* tag, int tlen) {
-    if (tlen <= 0) return;
-    bool closing = false;
+static bool tag_is(const char* t, const char* const* list) {
+    for (; *list; list++) if (!strcmp(t, *list)) return true;
+    return false;
+}
+static const char* const T_BLOCK[] = { "div", "section", "article", "header", "footer", "nav", "main",
+    "aside", "table", "tr", "center", "figure", "figcaption", "address", "fieldset", "details",
+    "summary", "dd", "dt", "dl", "tbody", "thead", "caption", "legend", "html", "body", 0 };
+static const char* const T_SKIP[] = { "script", "style", "svg", "template", "select", "noembed",
+    "object", "math", "datalist", 0 };
+
+static int add_field(lay_t* L, int type, attrs_t A) {
+    if (n_fields >= MAX_FIELDS) return -1;
+    int i = n_fields++;
+    field_t* f = &fields[i];
+    char name[64];
+    if (!get_attr(A, "name", name, sizeof name)) name[0] = 0;
+    bool keep = keep_fields && i < n_fields_prev && !strcmp(f->name, name) && f->type == type;
+    f->form = L->form;
+    f->type = (uint8_t)type;
+    scpy(f->name, sizeof f->name, name);
+    if (!keep) {
+        if (!get_attr(A, "value", f->value, sizeof f->value)) f->value[0] = 0;
+        f->len = (int)strlen(f->value);
+        f->cur = f->len;
+    }
+    return i;
+}
+
+static void do_input(lay_t* L, attrs_t A) {
+    char type[16];
+    if (!get_attr(A, "type", type, sizeof type)) type[0] = 0;
+    for (char* p = type; *p; p++) *p = lower(*p);
+    char tmp[80];
+    bool css_hidden = (get_attr(A, "style", tmp, sizeof tmp) && find_ci(tmp, (int)strlen(tmp), "none")) ||
+                      (get_attr(A, "name", tmp, sizeof tmp) && find_ci(tmp, (int)strlen(tmp), "hidden"));
+    if (!strcmp(type, "hidden") || (css_hidden && strcmp(type, "submit"))) { add_field(L, FT_HIDDEN, A); return; }
+    if (!strcmp(type, "checkbox") || !strcmp(type, "radio")) {
+        if (get_attr(A, "checked", NULL, 0)) {
+            int i = add_field(L, FT_HIDDEN, A);
+            if (i >= 0 && !fields[i].value[0]) { scpy(fields[i].value, FIELD_MAX, "on"); fields[i].len = 2; }
+        }
+        return;
+    }
+    if (!strcmp(type, "submit") || !strcmp(type, "image")) {
+        int i = add_field(L, FT_SUBMIT, A);
+        if (i < 0) return;
+        static char lab[64];
+        if (fields[i].value[0]) scpy(lab, sizeof lab, fields[i].value);
+        else if (!get_attr(A, "title", lab, sizeof lab) && !get_attr(A, "alt", lab, sizeof lab)) lab[0] = 0;
+        if (!lab[0]) scpy(lab, sizeof lab, "Submit");
+        const char* label = lab;
+        int n = (int)strlen(label);
+        int off = pool_put(label, n);
+        emit_box(L, RK_BUTTON, uif_width_n(UIF_MED, label, n) + 28, FIELD_H, i, off, n);
+        return;
+    }
+    if (type[0] && strcmp(type, "text") && strcmp(type, "search") && strcmp(type, "email") &&
+        strcmp(type, "url") && strcmp(type, "password") && strcmp(type, "tel") && strcmp(type, "number"))
+        return;                                        /* reset, file, button, ... */
+    int i = add_field(L, !strcmp(type, "password") ? FT_PASSWORD : FT_TEXT, A);
+    if (i < 0) return;
+    char sz[8];
+    int w = 280;
+    if (get_attr(A, "size", sz, sizeof sz)) { w = atoi(sz) * 9 + 20; }
+    if (w < 120) w = 120;
+    if (w > 480) w = 480;
+    int avail = L->view_w - PAD - left_x(L);
+    if (w > avail) w = avail;
+    emit_box(L, RK_FIELD, w, FIELD_H, i, 0, 0);
+}
+
+/* Returns the position right after "</name...>" (or n). */
+static int skip_to_close(const char* s, int i, int n, const char* name, int* inner_end) {
+    char pat[16] = "</";
+    scat(pat, sizeof pat, name);
+    const char* e = find_ci(s + i, n - i, pat);
+    if (!e) { if (inner_end) *inner_end = n; return n; }
+    if (inner_end) *inner_end = (int)(e - s);
+    int j = (int)(e - s);
+    while (j < n && s[j] != '>') j++;
+    return j < n ? j + 1 : n;
+}
+
+/* Text without tags, collapsed (for <title>, <button>, <textarea>). */
+static void inner_text(const char* s, int n, char* out, int cap, bool keep_ws) {
+    static char tmp[1024];
     int t = 0;
-    if (tag[0] == '/') { closing = true; t = 1; }
-    int ns = t;
-    while (t < tlen && tag[t] != ' ' && tag[t] != '\t' && tag[t] != '/' &&
-           tag[t] != '\r' && tag[t] != '\n') t++;
-    int nlen = t - ns;
-    const char* name = tag + ns;
-    const char* body = tag + t;
-    int blen = tlen - t;
-
-    /* If we're inside a <script>/<style>/<title>, only react to its closer.
-       These have to be FIRST or else </title> falls through to the title
-       handler below — which is a no-op for closers — and skip_until_tag=3
-       stays set forever, swallowing the entire page body. */
-    if (st->skip_until_tag == 1) {
-        if (closing && tag_eq(name, nlen, "script")) st->skip_until_tag = 0;
-        return;
+    for (int i = 0; i < n && t < (int)sizeof tmp - 1; i++) {
+        if (s[i] == '<') { while (i < n && s[i] != '>') i++; continue; }
+        tmp[t++] = s[i];
     }
-    if (st->skip_until_tag == 2) {
-        if (closing && tag_eq(name, nlen, "style")) st->skip_until_tag = 0;
-        return;
+    int m = decode_entities(tmp, t, tmp, sizeof tmp);
+    int o = 0;
+    bool sp = false;
+    for (int i = 0; i < m && o < cap - 1; i++) {
+        char c = tmp[i];
+        if (!keep_ws && (c == ' ' || c == '\n' || c == '\r' || c == '\t')) { sp = o > 0; continue; }
+        if (sp) { out[o++] = ' '; sp = false; if (o >= cap - 1) break; }
+        out[o++] = c;
     }
-    if (st->skip_until_tag == 3) {
-        if (closing && tag_eq(name, nlen, "title")) st->skip_until_tag = 0;
-        return;
-    }
-
-    if (!closing && tag_eq(name, nlen, "script")) { st->skip_until_tag = 1; return; }
-    if (!closing && tag_eq(name, nlen, "style"))  { st->skip_until_tag = 2; return; }
-
-    if (tag_eq(name, nlen, "br")) { parser_newline(st, 0); return; }
-    if (tag_eq(name, nlen, "hr")) {
-        if (st->line_dirty) parser_newline(st, 0);
-        st->cy += 4;
-        /* emit a fake "rule" using a thin string of spaces with underline trick — skip */
-        return;
-    }
-    if (tag_eq(name, nlen, "p")) {
-        if (st->line_dirty) parser_newline(st, 8);
-        else st->cy += 8;
-        return;
-    }
-    if (tag_eq(name, nlen, "div") || tag_eq(name, nlen, "section") ||
-        tag_eq(name, nlen, "article") || tag_eq(name, nlen, "header") ||
-        tag_eq(name, nlen, "footer") || tag_eq(name, nlen, "main") ||
-        tag_eq(name, nlen, "nav")    || tag_eq(name, nlen, "aside")) {
-        if (st->line_dirty) parser_newline(st, 0);
-        return;
-    }
-    if (tag_eq(name, nlen, "li")) {
-        if (!closing) {
-            if (st->line_dirty) parser_newline(st, 0);
-            emit_word(st, "* ", 2);
-        }
-        return;
-    }
-    if (tag_eq(name, nlen, "ul") || tag_eq(name, nlen, "ol")) {
-        if (st->line_dirty) parser_newline(st, 0);
-        return;
-    }
-    if (tag_eq(name, nlen, "h1") || tag_eq(name, nlen, "h2") ||
-        tag_eq(name, nlen, "h3") || tag_eq(name, nlen, "h4") ||
-        tag_eq(name, nlen, "h5") || tag_eq(name, nlen, "h6")) {
-        if (!closing) {
-            if (st->line_dirty) parser_newline(st, 6);
-            else st->cy += 6;
-            st->fg = COL_HEAD;
-            st->h_level = (name[1] - '0');
-            st->line_h = HEAD_H;
-            st->bold = true;
-        } else {
-            parser_newline(st, 4);
-            st->fg = COL_TEXT;
-            st->h_level = 0;
-            st->line_h = LINE_H;
-            st->bold = false;
-        }
-        return;
-    }
-    if (tag_eq(name, nlen, "title")) {
-        /* Skip <title> content — it goes in window title, not body. The
-           matching close is intercepted by the skip_until_tag==3 guard at
-           the top of this function. */
-        if (!closing) st->skip_until_tag = 3;
-        return;
-    }
-    if (tag_eq(name, nlen, "a")) {
-        if (!closing) {
-            char href[URL_MAX]; href[0] = 0;
-            if (find_attr(body, blen, "href", href, sizeof(href)) && href[0]) {
-                char abs_url[URL_MAX];
-                if (resolve_href(href, abs_url, sizeof(abs_url)) && n_links < MAX_LINKS) {
-                    int li = n_links++;
-                    str_set(links[li].url, URL_MAX, abs_url);
-                    st->link_idx = li;
-                    st->fg = COL_LINK;
-                    st->underline = true;
-                }
-            }
-        } else {
-            st->link_idx = -1;
-            st->fg = (st->h_level > 0) ? COL_HEAD : COL_TEXT;
-            st->underline = false;
-        }
-        return;
-    }
-    if (tag_eq(name, nlen, "img")) {
-        char alt[64]; alt[0] = 0;
-        if (find_attr(body, blen, "alt", alt, sizeof(alt)) && alt[0]) {
-            emit_word(st, "[img:", 5);
-            int al = 0; while (alt[al]) al++;
-            if (al > 40) al = 40;
-            emit_word(st, alt, al);
-            emit_word(st, "]", 1);
-        } else {
-            emit_word(st, "[img]", 5);
-        }
-        return;
-    }
-    if (tag_eq(name, nlen, "tr") || tag_eq(name, nlen, "table")) {
-        if (st->line_dirty) parser_newline(st, 0);
-        return;
-    }
-    if (tag_eq(name, nlen, "td") || tag_eq(name, nlen, "th")) {
-        st->pending_space = true;
-        return;
-    }
-    if (tag_eq(name, nlen, "pre")) { st->pre = !closing; if (st->line_dirty) parser_newline(st, 0); return; }
-    if (tag_eq(name, nlen, "b") || tag_eq(name, nlen, "strong")) { st->bold = !closing; return; }
-    /* otherwise ignore tag */
-    (void)word_break;
+    out[o] = 0;
 }
 
-/* Parse HTML body and lay out runs. The page title (from <title>) is captured
-   into title_out (cap chars). */
-static void parse_html(const char* body, int body_len, int view_w,
-                       char* title_out, int title_cap) {
-    n_runs = 0; n_links = 0; doc_text_used = 0; doc_height = 0;
-    if (title_out && title_cap > 0) title_out[0] = 0;
-
-    pstate_t st;
-    st.view_w = view_w;
-    st.cx = 0; st.cy = 0;
-    st.line_h = LINE_H;
-    st.fg = COL_TEXT;
-    st.link_idx = -1;
-    st.underline = false;
-    st.pre = false;
-    st.indent = 0;
-    st.pending_space = false;
-    st.line_dirty = false;
-    st.skip_until_tag = 0;
-    st.h_level = 0;
-    st.bold = false;
-
-    char word[256];
-    int  word_len = 0;
-    int  title_len = 0;
-    bool capturing_title = false;
-
-    int i = 0;
-    while (i < body_len) {
-        char c = body[i];
-        if (c == '<') {
-            /* flush pending word */
-            if (word_len > 0) {
-                if (capturing_title && title_out && title_len < title_cap - 1) {
-                    int can = word_len;
-                    if (title_len + can > title_cap - 1) can = title_cap - 1 - title_len;
-                    for (int k = 0; k < can; k++) title_out[title_len++] = word[k];
-                    title_out[title_len] = 0;
-                } else if (st.skip_until_tag == 0) {
-                    emit_word(&st, word, word_len);
+static void do_text(lay_t* L, const char* s, int n) {
+    static char buf[8192];
+    while (n > 0) {
+        int chunk = n > 4000 ? 4000 : n;
+        if (chunk < n) while (chunk > 1 && s[chunk - 1] != ' ' && s[chunk - 1] != '\n') chunk--;
+        int m = decode_entities(s, chunk, buf, sizeof buf);
+        s += chunk; n -= chunk;
+        if (L->pre) {
+            int a = 0;
+            for (int i = 0; i <= m; i++) {
+                if (i < m && buf[i] != '\n') continue;
+                if (i > a) {                          /* expand tabs, keep spaces */
+                    static char line[1024];
+                    int o = 0;
+                    for (int k = a; k < i && o < 1000; k++) {
+                        if (buf[k] == '\t') { do line[o++] = ' '; while (o % 8 && o < 1000); }
+                        else if (buf[k] != '\r') line[o++] = buf[k];
+                    }
+                    L->space = false;
+                    emit_word(L, line, o);
                 }
-                word_len = 0;
-            }
-            /* read tag */
-            int j = i + 1;
-            /* HTML comment */
-            if (j + 2 < body_len && body[j] == '!' && body[j+1] == '-' && body[j+2] == '-') {
-                int k = j + 3;
-                while (k + 2 < body_len && !(body[k]=='-' && body[k+1]=='-' && body[k+2]=='>')) k++;
-                i = (k + 3 <= body_len) ? (k + 3) : body_len;
-                continue;
-            }
-            /* doctype or processing instruction */
-            if (j < body_len && (body[j] == '!' || body[j] == '?')) {
-                while (j < body_len && body[j] != '>') j++;
-                i = (j < body_len) ? (j + 1) : body_len;
-                continue;
-            }
-            int ts = j;
-            while (j < body_len && body[j] != '>') j++;
-            int tlen = j - ts;
-            /* self-closing slash at end? leave it — handle_tag tolerates */
-            /* detect <title>/</title> for capture mode */
-            int t0 = ts;
-            bool closing = false;
-            if (t0 < ts + tlen && body[t0] == '/') { closing = true; t0++; }
-            int nlen = 0;
-            while (t0 + nlen < ts + tlen && body[t0+nlen] != ' ' && body[t0+nlen] != '\t' &&
-                   body[t0+nlen] != '/' && body[t0+nlen] != '>') nlen++;
-            if (nlen == 5) {
-                bool is_title = true;
-                const char* tn = "title";
-                for (int k = 0; k < 5; k++)
-                    if (to_lower(body[t0+k]) != tn[k]) { is_title = false; break; }
-                if (is_title) {
-                    capturing_title = !closing;
+                if (i < m) {
+                    if (!L->dirty) { need_line(L); L->cy += 16 + 3; }
+                    else end_line(L);
                 }
+                a = i + 1;
             }
-            handle_tag(&st, body + ts, tlen);
-            i = (j < body_len) ? (j + 1) : body_len;
             continue;
         }
-        if (c == '&') {
-            char ent[8];
-            int wrote = decode_entity(body, body_len, &i, ent, sizeof(ent));
-            if (wrote > 0) {
-                for (int k = 0; k < wrote; k++) {
-                    char ch = ent[k];
-                    if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') {
-                        if (word_len > 0) {
-                            if (capturing_title && title_out) {
-                                if (title_len < title_cap - 1) {
-                                    int can = word_len;
-                                    if (title_len + can > title_cap - 1) can = title_cap - 1 - title_len;
-                                    for (int q = 0; q < can; q++) title_out[title_len++] = word[q];
-                                    title_out[title_len] = 0;
-                                }
-                            } else if (st.skip_until_tag == 0) {
-                                emit_word(&st, word, word_len);
-                            }
-                            word_len = 0;
-                        }
-                        if (st.skip_until_tag == 0) st.pending_space = true;
-                    } else if (word_len < (int)sizeof(word) - 1) {
-                        word[word_len++] = ch;
-                    }
-                }
-                continue;
-            }
-            /* malformed entity — treat & as regular char */
-        }
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-            if (word_len > 0) {
-                if (capturing_title && title_out) {
-                    if (title_len < title_cap - 1) {
-                        int can = word_len;
-                        if (title_len + can > title_cap - 1) can = title_cap - 1 - title_len;
-                        for (int k = 0; k < can; k++) title_out[title_len++] = word[k];
-                        title_out[title_len] = 0;
-                    }
-                    if (c == ' ' && title_len < title_cap - 1) {
-                        title_out[title_len++] = ' ';
-                        title_out[title_len] = 0;
-                    }
-                } else if (st.skip_until_tag == 0) {
-                    emit_word(&st, word, word_len);
-                }
-                word_len = 0;
-            }
-            if (st.skip_until_tag == 0) {
-                if (st.pre && (c == '\n' || c == '\r')) {
-                    parser_newline(&st, 0);
-                } else {
-                    st.pending_space = true;
-                }
-            }
-            i++;
-            continue;
-        }
-        /* normal char */
-        if (word_len < (int)sizeof(word) - 1) word[word_len++] = c;
-        i++;
-    }
-    if (word_len > 0 && st.skip_until_tag == 0) emit_word(&st, word, word_len);
-
-    if (st.line_dirty) st.cy += st.line_h;
-    doc_height = st.cy + 20;
-}
-
-/* ---------- Networking ---------- */
-
-static int do_fetch(const char* url) {
-    uint32_t ip; uint16_t port; char path[URL_MAX];
-    if (!parse_url(url, &ip, &port, path, sizeof(path))) {
-        set_status("error: bad URL: ", url);
-        int p = 0; while (status_text[p]) p++;
-        const char* hint = "  (use http://host/  or  http://10.0.2.2:8080/)";
-        for (int i = 0; hint[i] && p + 1 < (int)sizeof(status_text); i++)
-            status_text[p++] = hint[i];
-        status_text[p] = 0;
-        return -1;
-    }
-    if (!net_ready()) {
-        if (net_init() != 0) {
-            set_status("error: net init failed", NULL);
-            return -1;
+        int i = 0;
+        while (i < m) {
+            char c = buf[i];
+            if (c == ' ' || c == '\n' || c == '\r' || c == '\t' || c == '\f') { L->space = true; i++; continue; }
+            int j = i;
+            while (j < m && buf[j] != ' ' && buf[j] != '\n' && buf[j] != '\r' && buf[j] != '\t' && buf[j] != '\f') j++;
+            emit_word(L, buf + i, j - i);
+            i = j;
         }
     }
-
-    /* compose a host string from the IP literal so the server gets a Host */
-    char host[32]; int hp = 0; char num[8];
-    for (int oct = 0; oct < 4; oct++) {
-        int n = int_to_str((ip >> (24 - oct*8)) & 0xFF, num);
-        for (int i = 0; i < n; i++) host[hp++] = num[i];
-        if (oct < 3) host[hp++] = '.';
-    }
-    if (port != 80) {
-        host[hp++] = ':';
-        int n = int_to_str(port, num);
-        for (int i = 0; i < n; i++) host[hp++] = num[i];
-    }
-    host[hp] = 0;
-
-    set_status("loading ", url);
-    loading = true;
-
-    int n = net_http_get(ip, port, host, path, resp_buf, RESP_CAP);
-    loading = false;
-    if (n < 0) {
-        set_status_num("error: net_http_get returned ", n, NULL);
-        return -1;
-    }
-    if (n == 0) {
-        set_status("error: empty response (0 bytes)", NULL);
-        return -1;
-    }
-    return n;
 }
 
-
-/* The parsed document stays in resp_buf (CP866 already), so a window
-   resize can re-flow it at the new width without refetching. */
-static int laid_off, laid_len, laid_w;
-static uint32_t relayout_since;
-
-/* Derive view_w from the live window size — content_rect is only valid
-   once br_paint has run at least once, and the first navigate happens
-   during browser_open before any paint. */
-static int live_view_w(void) {
-    int view_w = 800;
-    if (g_browser_win) {
-        int cx, cy, cw, ch;
-        wm_client_rect(g_browser_win, &cx, &cy, &cw, &ch);
-        view_w = cw - 8 - 24 - 14;     /* scrollbar + margins */
+static void do_tag(lay_t* L, const char* src, int n, int* pos, const char* t, bool close, attrs_t A) {
+    static char v[URL_MAX], abs[URL_MAX];
+    if (tag_is(t, T_BLOCK)) {
+        block(L, 0);
+        if (!strcmp(t, "center")) L->center += close ? -1 : 1;
+        if (L->center < 0) L->center = 0;
+        return;
     }
-    if (view_w < 240) view_w = 240;
-    return view_w;
-}
-
-static void browser_navigate(const char* url, bool push_history) {
-    if (!url || !*url) return;
-    if (push_history && cur_url[0]) {
-        if (hist_top < HIST_MAX) {
-            str_set(hist[hist_top++], URL_MAX, cur_url);
+    if (t[0] == 'h' && t[1] >= '1' && t[1] <= '6' && !t[2]) {
+        block(L, close ? 8 : (t[1] <= '2' ? 18 : 12));
+        L->h = close ? 0 : t[1] - '0';
+        return;
+    }
+    if (!strcmp(t, "p")) { block(L, 10); return; }
+    if (!strcmp(t, "br")) {
+        if (L->dirty) end_line(L);
+        else { need_line(L); L->cy += font_h(cur_font(L)) / 2; }
+        return;
+    }
+    if (!strcmp(t, "hr")) { emit_rule(L); return; }
+    if (!strcmp(t, "ul") || !strcmp(t, "ol") || !strcmp(t, "menu")) {
+        block(L, L->list_depth ? 0 : 8);
+        if (!close) {
+            if (L->list_depth < 9) L->list_num[++L->list_depth] = (t[0] == 'o') ? 1 : 0;
+            L->indent += 26;
+        } else if (L->list_depth > 0) {
+            L->list_depth--;
+            L->indent -= 26;
+            if (L->indent < 0) L->indent = 0;
+        }
+        return;
+    }
+    if (!strcmp(t, "li")) {
+        block(L, 3);
+        if (close) return;
+        need_line(L);
+        int f = cur_font(L), fh = font_h(f);
+        int d = L->list_depth;
+        if (d > 0 && L->list_num[d] > 0) {
+            char num[12];
+            itoa(L->list_num[d]++, num, 10);
+            scat(num, sizeof num, ".");
+            int nl = (int)strlen(num);
+            int w = text_w(f, num, nl), off = pool_put(num, nl);
+            if (off >= 0) add_run(RK_TEXT, L->cx - w - 6, L->cy, w, fh, f, C_INK_DIM, -1, -1, off, nl);
         } else {
-            for (int i = 1; i < HIST_MAX; i++)
-                memcpy(hist[i-1], hist[i], URL_MAX);
-            str_set(hist[HIST_MAX - 1], URL_MAX, cur_url);
+            add_run(RK_BULLET, L->cx - 14, L->cy, 6, fh, 0, d > 1 ? C_GLYPH_DIM : C_GLYPH, -1, -1, 0, 0);
         }
+        L->dirty = true;
+        if (fh > L->line_h) L->line_h = fh;
+        L->space = false;
+        return;
     }
-    str_set(cur_url, URL_MAX, url);
-    str_set(edit_url, URL_MAX, url);
-    edit_len = 0; while (edit_url[edit_len]) edit_len++;
-    edit_cur = edit_len;
-
-    int n = do_fetch(url);
-    if (n <= 0) { n_runs = 0; n_links = 0; doc_height = 0; scroll_y = 0; laid_len = 0; return; }
-
-    /* Find the body (skip headers up to \r\n\r\n) */
-    int body_off = 0;
-    for (int i = 0; i + 3 < n; i++) {
-        if (resp_buf[i] == '\r' && resp_buf[i+1] == '\n' &&
-            resp_buf[i+2] == '\r' && resp_buf[i+3] == '\n') {
-            body_off = i + 4; break;
+    if (!strcmp(t, "blockquote")) {
+        block(L, 8);
+        L->indent += close ? -24 : 24;
+        if (L->indent < 0) L->indent = 0;
+        return;
+    }
+    if (!strcmp(t, "pre")) {
+        block(L, 8);
+        L->pre += close ? -1 : 1;
+        if (L->pre < 0) L->pre = 0;
+        if (!close && *pos < n && src[*pos] == '\n') (*pos)++;
+        return;
+    }
+    if (!strcmp(t, "code") || !strcmp(t, "tt") || !strcmp(t, "kbd") || !strcmp(t, "samp")) {
+        L->mono += close ? -1 : 1; if (L->mono < 0) L->mono = 0; return;
+    }
+    if (!strcmp(t, "b") || !strcmp(t, "strong") || !strcmp(t, "th")) {
+        if (t[1] == 'h') { if (!close && L->dirty) { L->cx += 16; L->space = false; } }
+        L->bold += close ? -1 : 1; if (L->bold < 0) L->bold = 0; return;
+    }
+    if (!strcmp(t, "small") || !strcmp(t, "sub") || !strcmp(t, "sup")) {
+        L->small += close ? -1 : 1; if (L->small < 0) L->small = 0; return;
+    }
+    if (!strcmp(t, "td")) {
+        if (!close && L->dirty) { L->cx += 16; L->space = false; }
+        return;
+    }
+    if (!strcmp(t, "a")) {
+        if (close) { L->link = -1; return; }
+        if (L->dirty && n_runs > L->line_first && runs[n_runs - 1].link >= 0) L->space = true;
+        L->link = -1;
+        if (get_attr(A, "href", v, sizeof v) && n_links < MAX_LINKS && resolve_url(base_url, v, abs)) {
+            int off = url_put(abs);
+            if (off >= 0) { link_off[n_links] = off; L->link = n_links++; }
         }
+        return;
     }
-    int body_len = n - body_off;
-
-    /* Convert UTF-8 to CP866 in place — our 8x16 font is single-byte. */
-    body_len = utf8_to_cp866_inplace(resp_buf + body_off, body_len);
-
-    /* Inspect HTTP status line for non-200 responses (informational) */
-    int status_code = 0;
-    if (n >= 12 && resp_buf[0]=='H' && resp_buf[1]=='T' && resp_buf[2]=='T' && resp_buf[3]=='P') {
-        int sp = 0; while (sp < n && resp_buf[sp] != ' ') sp++;
-        sp++;
-        while (sp < n && resp_buf[sp] >= '0' && resp_buf[sp] <= '9') {
-            status_code = status_code*10 + (resp_buf[sp] - '0');
-            sp++;
+    if (!strcmp(t, "img")) {
+        if (!close && get_attr(A, "alt", v, 200) && v[0]) {
+            bool sp = L->space;
+            L->small++;
+            L->space = sp;
+            do_text(L, v, (int)strlen(v));
+            L->small--;
         }
+        return;
     }
-
-    int view_w = live_view_w();
-    char page_title[96];
-    parse_html((const char*)(resp_buf + body_off), body_len, view_w,
-               page_title, sizeof(page_title));
-    scroll_y = 0;
-    laid_off = body_off;
-    laid_len = body_len;
-    laid_w = view_w;
-    relayout_since = 0;
-
-    if (g_browser_win) {
-        const char* base = "Browser - ";
-        int p = 0;
-        for (int i = 0; base[i] && p < 63; i++) g_browser_win->title[p++] = base[i];
-        for (int i = 0; page_title[i] && p < 63; i++) g_browser_win->title[p++] = page_title[i];
-        if (p == 10) {
-            const char* fb = "SamaraOS";
-            for (int i = 0; fb[i] && p < 63; i++) g_browser_win->title[p++] = fb[i];
+    if (!strcmp(t, "form")) {
+        block(L, 6);
+        if (close) { L->form = -1; return; }
+        if (n_forms >= MAX_FORMS) { L->form = -1; return; }
+        form_t* f = &forms[n_forms];
+        f->post = get_attr(A, "method", v, 16) && (v[0] == 'p' || v[0] == 'P');
+        if (!get_attr(A, "action", v, sizeof v) || !resolve_url(base_url, v, abs)) scpy(abs, URL_MAX, base_url);
+        f->action = url_put(abs);
+        L->form = n_forms++;
+        return;
+    }
+    if (!strcmp(t, "input")) { if (!close) do_input(L, A); return; }
+    if (!strcmp(t, "button")) {
+        if (close) return;
+        int inner_end;
+        int after = skip_to_close(src, *pos, n, "button", &inner_end);
+        char type[16];
+        if (!get_attr(A, "type", type, sizeof type)) scpy(type, sizeof type, "submit");
+        if (lower(type[0]) != 's') { *pos = after; return; }
+        int i = add_field(L, FT_SUBMIT, A);
+        if (i < 0) { *pos = after; return; }
+        inner_text(src + *pos, inner_end - *pos, v, 64, false);
+        if (!v[0]) scpy(v, 64, fields[i].value[0] ? fields[i].value : "Submit");
+        int ln = (int)strlen(v), off = pool_put(v, ln);
+        emit_box(L, RK_BUTTON, uif_width_n(UIF_MED, v, ln) + 28, FIELD_H, i, off, ln);
+        *pos = after;
+        return;
+    }
+    if (!strcmp(t, "textarea")) {
+        if (close) return;
+        int inner_end;
+        int after = skip_to_close(src, *pos, n, "textarea", &inner_end);
+        int i = add_field(L, FT_TEXT, A);
+        if (i >= 0) {
+            if (!(keep_fields && i < n_fields_prev)) {
+                inner_text(src + *pos, inner_end - *pos, fields[i].value, FIELD_MAX, false);
+                fields[i].len = fields[i].cur = (int)strlen(fields[i].value);
+            }
+            int avail = L->view_w - PAD - left_x(L);
+            block(L, 4);
+            emit_box(L, RK_FIELD, avail < 480 ? avail : 480, FIELD_H, i, 0, 0);
+            block(L, 4);
         }
-        g_browser_win->title[p] = 0;
+        *pos = after;
+        return;
     }
+    if (!strcmp(t, "title")) {
+        int inner_end;
+        int after = skip_to_close(src, *pos, n, "title", &inner_end);
+        if (!page_title[0]) inner_text(src + *pos, inner_end - *pos, page_title, sizeof page_title, false);
+        *pos = after;
+        return;
+    }
+    if (!strcmp(t, "base")) {
+        if (get_attr(A, "href", v, sizeof v) && resolve_url(base_url, v, abs)) scpy(base_url, URL_MAX, abs);
+        return;
+    }
+    if (!strcmp(t, "meta")) {
+        if (get_attr(A, "http-equiv", v, 32) && starts_ci(v, "refresh") && get_attr(A, "content", v, sizeof v)) {
+            const char* u = find_ci(v, (int)strlen(v), "url=");
+            if (atoi(v) <= 5 && u) {
+                u += 4;
+                if (*u == '\'' || *u == '"') u++;
+                scpy(abs, URL_MAX, u);
+                int k = (int)strlen(abs);
+                if (k && (abs[k - 1] == '\'' || abs[k - 1] == '"')) abs[k - 1] = 0;
+                if (!resolve_url(base_url, abs, refresh_url)) refresh_url[0] = 0;
+            }
+        }
+        return;
+    }
+    if (tag_is(t, T_SKIP) && !close) { *pos = skip_to_close(src, *pos, n, t, NULL); return; }
+}
 
-    if (status_code && status_code != 200) {
-        set_status_num("loaded (HTTP ", status_code, "), bytes:");
-        int p = 0; while (status_text[p]) p++;
-        char num[16]; int nn = int_to_str(body_len, num);
-        if (p + 1 < (int)sizeof(status_text)) status_text[p++] = ' ';
-        for (int i = 0; i < nn && p + 1 < (int)sizeof(status_text); i++) status_text[p++] = num[i];
-        status_text[p] = 0;
+static void layout(int view_w) {
+    static lay_t L;
+    memset(&L, 0, sizeof L);
+    L.view_w = view_w;
+    L.cy = 14;
+    L.cx = PAD;
+    L.link = -1;
+    L.form = -1;
+    n_fields_prev = n_fields;
+    n_runs = n_links = n_fields = n_forms = 0;
+    pool_used = url_used = 0;
+    page_title[0] = 0;
+    refresh_url[0] = 0;
+
+    const char* s = (const char*)resp;
+    int n = resp_len;
+    if (plain_text) {
+        L.pre = 1;
+        do_text(&L, s, n);
     } else {
-        set_status_num("loaded ", body_len, " bytes");
-    }
-}
-
-/* ---------- Drawing ---------- */
-
-static void draw_button(const char* label, int x, int y, int w, int h, bool active, bool enabled) {
-    uint32_t bg = enabled ? (active ? COL_BTN_DOWN : COL_BTN) : COL_BTN_DIM;
-    gfx_rect_fill(x, y, w, h, bg);
-    gfx_rect(x, y, w, h, COL_CHROME_HI);
-    int lw = 0; while (label[lw]) lw++;
-    int tx = x + (w - lw * 8) / 2;
-    int ty = y + (h - 16) / 2;
-    gfx_string(tx, ty, label, enabled ? COL_CHROME_FG : COL_DIM, bg, false);
-}
-
-static void draw_url_bar(int x, int y, int w, int h) {
-    url_rect.x = x; url_rect.y = y; url_rect.w = w; url_rect.h = h;
-    gfx_rect_fill(x, y, w, h, COL_URL_BG);
-    uint32_t border = url_focused ? COL_URL_BORDER : COL_BTN_DIM;
-    gfx_rect(x, y, w, h, border);
-    gfx_rect(x - 1, y - 1, w + 2, h + 2, border);
-
-    /* Render the editable URL. If too long, scroll so the cursor is visible. */
-    int max_chars = (w - 12) / 8;
-    if (max_chars < 1) max_chars = 1;
-    int off = 0;
-    if (edit_cur > max_chars - 2) off = edit_cur - (max_chars - 2);
-    int visible = edit_len - off;
-    if (visible > max_chars) visible = max_chars;
-    char tmp[URL_MAX];
-    for (int i = 0; i < visible; i++) tmp[i] = edit_url[off + i];
-    tmp[visible] = 0;
-    gfx_string(x + 6, y + (h - 16) / 2, tmp, COL_URL_FG, COL_URL_BG, false);
-
-    if (url_focused) {
-        bool blink_on = ((blink_ms / 500) & 1) == 0;
-        if (blink_on) {
-            int cx = x + 6 + (edit_cur - off) * 8;
-            gfx_rect_fill(cx, y + 4, 2, h - 8, COL_URL_FG);
+        int i = 0;
+        while (i < n) {
+            if (s[i] != '<') {
+                int j = i;
+                while (j < n && s[j] != '<') j++;
+                do_text(&L, s + i, j - i);
+                i = j;
+                continue;
+            }
+            if (i + 3 < n && s[i + 1] == '!' && s[i + 2] == '-' && s[i + 3] == '-') {
+                const char* e = find_ci(s + i + 4, n - i - 4, "-->");
+                i = e ? (int)(e - s) + 3 : n;
+                continue;
+            }
+            int j = i + 1;
+            bool close = false;
+            if (j < n && s[j] == '/') { close = true; j++; }
+            if (j >= n || !((s[j] >= 'a' && s[j] <= 'z') || (s[j] >= 'A' && s[j] <= 'Z') || s[j] == '!' || s[j] == '?')) {
+                do_text(&L, s + i, 1);                /* a literal '<' */
+                i++;
+                continue;
+            }
+            char t[16];
+            int tl = 0;
+            while (j < n && s[j] != '>' && s[j] != ' ' && s[j] != '/' && s[j] != '\n' && s[j] != '\t' && s[j] != '\r') {
+                if (tl < 15) t[tl++] = lower(s[j]);
+                j++;
+            }
+            t[tl] = 0;
+            int a0 = j;
+            char q = 0;
+            while (j < n && (q || s[j] != '>')) {
+                if (q) { if (s[j] == q) q = 0; }
+                else if (s[j] == '"' || s[j] == '\'') q = s[j];
+                j++;
+            }
+            attrs_t A = { s + a0, j - a0 };
+            int pos = j < n ? j + 1 : n;
+            if (t[0] != '!' && t[0] != '?') do_tag(&L, s, n, &pos, t, close, A);
+            i = pos;
         }
     }
+    end_line(&L);
+    doc_h = L.cy + PAD;
+    keep_fields = false;
 }
 
-static void draw_chrome(window_t* w) {
+/* ======================================================================
+   Pages: fetch through curl, history, forms
+   ====================================================================== */
+
+#define DOC_MAX_W 940
+static bool load_push, load_rerouted;
+
+static const char HOME_HTML[] =
+    "<title>Start</title><center><h1>SamaraOS Browser</h1>"
+    "<p><small>HTTPS through curl + mbedTLS. Plain HTML only, no JavaScript.</small></p>"
+    "<form action=\"https://html.duckduckgo.com/html/\"><input name=q size=36> "
+    "<input type=submit value=\"Search\"></form>"
+    "<p><a href=\"https://www.google.com/\">Google</a> &nbsp; "
+    "<a href=\"https://ru.wikipedia.org/\">Wikipedia</a> &nbsp; "
+    "<a href=\"https://news.ycombinator.com/\">Hacker News</a> &nbsp; "
+    "<a href=\"https://lite.cnn.com/\">CNN Lite</a> &nbsp; "
+    "<a href=\"https://text.npr.org/\">NPR Text</a></p></center>"
+    "<hr><h3>Simple sites that work well</h3><ul>"
+    "<li><a href=\"https://example.com/\">example.com</a>"
+    "<li><a href=\"http://info.cern.ch/hypertext/WWW/TheProject.html\">info.cern.ch</a> - the first web page"
+    "<li><a href=\"https://en.wikipedia.org/wiki/Samara\">Samara on Wikipedia</a>"
+    "<li><a href=\"https://wiby.me/\">wiby.me</a> - search engine for the old web"
+    "<li><a href=\"https://lite.duckduckgo.com/lite/\">DuckDuckGo Lite</a>"
+    "<li><a href=\"http://host:8080/\">http://host:8080/</a> - a server on the host machine"
+    "</ul><p><small>Type an address (google.com) or words to search in the bar above. "
+    "Backspace = back, Tab = next field, PgUp/PgDn = scroll.</small></p>";
+
+static int client_w(void) {
+    int cx, cy, cw, ch;
+    wm_client_rect(g_win, &cx, &cy, &cw, &ch);
+    return cw;
+}
+static int layout_w(void) {
+    int w = client_w() - 8;
+    return w > DOC_MAX_W ? DOC_MAX_W : w;
+}
+
+static void set_edit(const char* s) {
+    scpy(edit, URL_MAX, s);
+    edit_len = (int)strlen(edit);
+    edit_cur = edit_len;
+}
+
+static void focus_url(void) {
+    focus = FOCUS_URL;
+    set_edit(starts_ci(cur_url, HOME_URL) ? "" : cur_url);
+    edit_all = edit_len > 0;
+}
+
+static void push_stack(char (*st)[URL_MAX], int* n, const char* u) {
+    if (!u[0]) return;
+    if (*n == HIST_MAX) { memmove(st[0], st[1], (size_t)(HIST_MAX - 1) * URL_MAX); (*n)--; }
+    scpy(st[(*n)++], URL_MAX, u);
+}
+
+static void update_title(void) {
+    if (!g_win) return;
+    scpy(g_win->title, sizeof g_win->title, page_title[0] ? page_title : "Browser");
+    if (page_title[0]) scat(g_win->title, sizeof g_win->title, " - Browser");
+}
+
+static void navigate(const char* url, const char* post, bool push);
+
+/* resp[] holds the new page (CP866): lay it out and make it current. */
+static void commit(const char* url, bool push) {
+    if (push && strcmp(cur_url, url)) { push_stack(back_stack, &n_back, cur_url); n_fwd = 0; }
+    scpy(cur_url, URL_MAX, url);
+    scpy(base_url, URL_MAX, url);
+    set_edit(starts_ci(url, HOME_URL) ? "" : url);
+    scroll_y = 0;
+    hover_link = hover_run = -1;
+    focus = starts_ci(url, HOME_URL) ? FOCUS_URL : FOCUS_NONE;
+    n_fields = 0;
+    laid_w = layout_w();
+    layout(laid_w);
+    update_title();
+    if (refresh_url[0] && auto_redirects < 4) {
+        auto_redirects++;
+        static char r[URL_MAX];
+        scpy(r, URL_MAX, refresh_url);
+        navigate(r, NULL, false);
+    }
+    if (g_win) g_win->needs_repaint = true;
+}
+
+static void show_html(const char* html, const char* url, bool push) {
+    int n = (int)strlen(html);
+    if (n > RESP_CAP - 1) n = RESP_CAP - 1;
+    memcpy(resp, html, (size_t)n);
+    resp_len = n;
+    plain_text = false;
+    commit(url, push);
+}
+
+static void show_error(const char* url, const char* title, const char* msg) {
+    static char h[2048];
+    scpy(h, sizeof h, "<title>");
+    scat(h, sizeof h, title);
+    scat(h, sizeof h, "</title><h2>");
+    scat(h, sizeof h, title);
+    scat(h, sizeof h, "</h2><p><code>");
+    int p = (int)strlen(h);
+    for (int i = 0; url[i] && p < 1400; i++) h[p++] = (url[i] == '<' || url[i] == '&') ? ' ' : url[i];
+    h[p] = 0;
+    scat(h, sizeof h, "</code></p><p>");
+    p = (int)strlen(h);
+    for (int i = 0; msg[i] && p < 1900; i++) h[p++] = (msg[i] == '<' || msg[i] == '&') ? ' ' : msg[i];
+    h[p] = 0;
+    scat(h, sizeof h, "</p><p><a href=\"about:home\">Start page</a></p>");
+    show_html(h, url, load_push);
+}
+
+static void kill_fetch(void) {
+    if (fetch_pid > 0 && proc_alive(fetch_pid)) {
+        proc_t* p = proc_by_pid(fetch_pid);
+        if (p) proc_send_signal(p, 9);
+    }
+    fetch_pid = -1;
+    loading = false;
+}
+
+static void start_fetch(const char* url, const char* post) {
+    kill_fetch();
+    fs_node_t* root = fs_root();
+    fs_unlink(root, PAGE_FILE);
+    fs_unlink(root, META_FILE);
+    fs_unlink(root, ERR_FILE);
+
+    static char wire[URL_MAX * 3], data[4096];
+    wire_url(url, wire, sizeof wire);
+    char* argv[40];
+    int a = 0;
+    argv[a++] = (char*)"curl";
+    argv[a++] = (char*)"-sS";
+    argv[a++] = (char*)"-L";
+    argv[a++] = (char*)"--max-redirs";   argv[a++] = (char*)"10";
+    argv[a++] = (char*)"-m";             argv[a++] = (char*)"45";
+    argv[a++] = (char*)"--connect-timeout"; argv[a++] = (char*)"15";
+    argv[a++] = (char*)"-A";             argv[a++] = (char*)USER_AGENT;
+    argv[a++] = (char*)"-H";             argv[a++] = (char*)"Accept-Language: ru,en;q=0.8";
+    argv[a++] = (char*)"-H";             argv[a++] = (char*)"Accept: text/html,text/plain;q=0.9,*/*;q=0.5";
+    argv[a++] = (char*)"-o";             argv[a++] = (char*)PAGE_FILE;
+    argv[a++] = (char*)"--stderr";       argv[a++] = (char*)ERR_FILE;
+    argv[a++] = (char*)"-w";
+    argv[a++] = (char*)"%output{" META_FILE "}%{http_code}\\n%{content_type}\\n%{url_effective}\\n";
+    if (post) {
+        scpy(data, sizeof data, post);
+        argv[a++] = (char*)"--data-raw";
+        argv[a++] = data;
+    }
+    argv[a++] = wire;
+    argv[a] = NULL;
+    char* envp[] = { (char*)"PATH=/bin:/usr/bin", (char*)"HOME=/root",
+                     (char*)"CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt", NULL };
+    fetch_pid = proc_spawn_detached(CURL, argv, envp);
+    if (fetch_pid < 0) {
+        fetch_pid = -1;
+        show_error(url, "Browser can't fetch pages", "/usr/bin/curl is missing (userland/build-curl.sh).");
+        return;
+    }
+    loading = true;
+    now_ms = load_start = pit_uptime_ms();
+    scpy(load_url, URL_MAX, url);
+    char host[128];
+    url_host(url, host, sizeof host);
+    set_status("Connecting to ", host);
+}
+
+static int read_file(const char* path, char* out, int cap) {
+    fs_node_t* n = fs_resolve(fs_root(), path);
+    if (!n || !n->data) return n ? 0 : -1;
+    int len = (int)n->size < cap ? (int)n->size : cap;
+    memcpy(out, n->data, (size_t)len);
+    return len;
+}
+
+static void finish_fetch(void) {
+    loading = false;
+    fetch_pid = -1;
+    static char meta[URL_MAX * 3 + 256];
+    int ml = read_file(META_FILE, meta, sizeof meta - 1);
+    if (ml < 0) ml = 0;
+    meta[ml] = 0;
+    char* line[3] = { meta, NULL, NULL };
+    for (int i = 0, k = 1; i < ml && k < 3; i++)
+        if (meta[i] == '\n') { meta[i] = 0; line[k++] = meta + i + 1; }
+    for (char* p = line[2] ? line[2] : meta; *p; p++) if (*p == '\n') *p = 0;
+    int code = atoi(meta);
+    const char* ctype = line[1] ? line[1] : "";
+    const char* eff = (line[2] && line[2][0]) ? line[2] : load_url;
+
+    if (code == 0) {
+        static char err[512];
+        int el = read_file(ERR_FILE, err, sizeof err - 1);
+        err[el > 0 ? el : 0] = 0;
+        for (char* p = err; *p; p++) if (*p == '\n') *p = ' ';
+        char* msg = strstr(err, ") ");
+        show_error(load_url, "Can't open this page", msg ? msg + 2 : (err[0] ? err : "no answer (network down?)"));
+        set_status("Failed: ", load_url);
+        return;
+    }
+    int n = read_file(PAGE_FILE, (char*)resp, RESP_CAP - 1);
+    if (n < 0) n = 0;
+    fs_node_t* root = fs_root();
+    fs_unlink(root, PAGE_FILE);
+    fs_unlink(root, META_FILE);
+    fs_unlink(root, ERR_FILE);
+
+    static char eff_u[URL_MAX];
+    scpy(eff_u, URL_MAX, eff);
+    bool html = !ctype[0] || find_ci(ctype, (int)strlen(ctype), "html") || find_ci(ctype, (int)strlen(ctype), "xml");
+    bool text = find_ci(ctype, (int)strlen(ctype), "text/") || find_ci(ctype, (int)strlen(ctype), "json");
+    if (!html && !text) {
+        static char m[200];
+        scpy(m, sizeof m, "This is not a web page: ");
+        scat(m, sizeof m, ctype);
+        char num[16];
+        itoa(n, num, 10);
+        scat(m, sizeof m, ", ");
+        scat(m, sizeof m, num);
+        scat(m, sizeof m, " bytes. Use wget in the terminal to save it.");
+        show_error(eff_u, "File", m);
+        return;
+    }
+    const char* cs = find_ci(ctype, (int)strlen(ctype), "charset=");
+    bool w1251 = cs && (find_ci(cs, (int)strlen(cs), "1251") != NULL);
+    if (!cs) {                                   /* <meta charset> in the head */
+        int k = n < 4096 ? n : 4096;
+        const char* mc = find_ci((const char*)resp, k, "charset=");
+        if (mc && find_ci(mc, 24, "1251")) w1251 = true;
+    }
+    resp_len = w1251 ? cp1251_to_cp866(resp, n) : utf8_to_cp866(resp, n);
+    plain_text = !html;
+    commit(eff_u, load_push);
+    int32_t ms = (int32_t)(pit_uptime_ms() - load_start);
+    if (ms < 0) ms = 0;
+    static char st[160];
+    char num[16];
+    scpy(st, sizeof st, code >= 400 ? "HTTP error " : "Done  ");
+    if (code >= 400) { itoa(code, num, 10); scat(st, sizeof st, num); scat(st, sizeof st, "  "); }
+    itoa((n + 1023) / 1024, num, 10); scat(st, sizeof st, num); scat(st, sizeof st, " KB in ");
+    itoa((int)(ms / 1000), num, 10); scat(st, sizeof st, num); scat(st, sizeof st, ".");
+    itoa((int)(ms % 1000) / 100, num, 10); scat(st, sizeof st, num); scat(st, sizeof st, " s");
+    if (load_rerouted) scat(st, sizeof st, "   (Google search needs JavaScript - results by DuckDuckGo)");
+    if (n >= RESP_CAP - 1) scat(st, sizeof st, "   (page truncated)");
+    set_status(st, NULL);
+}
+
+static void navigate(const char* in, const char* post, bool push) {
+    static char u[URL_MAX];
+    scpy(u, URL_MAX, in);
+    load_rerouted = reroute_search(u);
+    load_push = push;
+    if (starts_ci(u, "about:")) {
+        kill_fetch();
+        show_html(HOME_HTML, HOME_URL, push);
+        set_status("Start page", NULL);
+        return;
+    }
+    set_edit(u);
+    focus = FOCUS_NONE;
+    start_fetch(u, post);
+    if (g_win) g_win->needs_repaint = true;
+}
+
+static void go(const char* url, const char* post) {
+    auto_redirects = 0;
+    navigate(url, post, true);
+}
+
+static void go_back(void) {
+    if (!n_back) return;
+    push_stack(fwd_stack, &n_fwd, cur_url);
+    static char u[URL_MAX];
+    scpy(u, URL_MAX, back_stack[--n_back]);
+    auto_redirects = 4;
+    navigate(u, NULL, false);
+}
+static void go_forward(void) {
+    if (!n_fwd) return;
+    push_stack(back_stack, &n_back, cur_url);
+    static char u[URL_MAX];
+    scpy(u, URL_MAX, fwd_stack[--n_fwd]);
+    auto_redirects = 0;
+    navigate(u, NULL, false);
+}
+static void reload(void) {
+    if (loading) { kill_fetch(); set_status("Stopped", NULL); return; }
+    auto_redirects = 0;
+    navigate(cur_url[0] ? cur_url : HOME_URL, NULL, false);
+}
+
+static void submit_form(int form, int submitter) {
+    if (form < 0 || form >= n_forms || forms[form].action < 0) return;
+    static char q[4096];
+    int p = 0;
+    q[0] = 0;
+    for (int i = 0; i < n_fields; i++) {
+        field_t* f = &fields[i];
+        if (f->form != form || !f->name[0]) continue;
+        if (f->type == FT_SUBMIT && i != submitter) continue;
+        if (p && p < (int)sizeof q - 2) q[p++] = '&';
+        form_encode(f->name, (int)strlen(f->name), q, &p, sizeof q);
+        if (p < (int)sizeof q - 2) q[p++] = '=';
+        form_encode(f->value, f->len, q, &p, sizeof q);
+    }
+    q[p] = 0;
+    static char u[URL_MAX];
+    scpy(u, URL_MAX, url_pool + forms[form].action);
+    if (forms[form].post) { go(u, q); return; }
+    char* qm = strchr(u, '?');
+    if (qm) *qm = 0;
+    scat(u, URL_MAX, "?");
+    scat(u, URL_MAX, q);
+    go(u, NULL);
+}
+
+/* ======================================================================
+   Drawing
+   ====================================================================== */
+
+#define COL_UNDERLINE RGB(0xB4, 0xC6, 0xE4)
+#define COL_BTN_HOT   RGB(0xEE, 0xB0, 0x55)
+
+static int clip_x, clip_y, clip_w, clip_h;       /* the WM's clip for this paint */
+
+static void clip_to(int x, int y, int w, int h) {
+    int x0 = x > clip_x ? x : clip_x, y0 = y > clip_y ? y : clip_y;
+    int x1 = (x + w < clip_x + clip_w) ? x + w : clip_x + clip_w;
+    int y1 = (y + h < clip_y + clip_h) ? y + h : clip_y + clip_h;
+    if (x1 < x0) x1 = x0;
+    if (y1 < y0) y1 = y0;
+    gfx_set_clip(x0, y0, x1 - x0, y1 - y0);
+}
+static void clip_restore(void) { gfx_set_clip(clip_x, clip_y, clip_w, clip_h); }
+
+static void thick_line(int x0, int y0, int x1, int y1, uint32_t c) {
+    gfx_line(x0, y0, x1, y1, c);
+    gfx_line(x0 + 1, y0, x1 + 1, y1, c);
+    gfx_line(x0, y0 + 1, x1, y1 + 1, c);
+}
+
+static void draw_icon(int i, box_t b, bool enabled) {
+    bool hov = enabled && hover_btn == i;
+    uint32_t bg = hov ? C_BTN_HOVER : C_SURFACE;
+    if (hov) gfx_rrect_fill(b.x, b.y, b.w, b.h, 7, GFX_CORNERS_ALL, bg);
+    uint32_t c = !enabled ? C_GLYPH_DIM : hov ? C_INK : C_GLYPH;
+    int mx = b.x + b.w / 2, my = b.y + b.h / 2;
+    switch (i) {
+    case B_BACK:
+    case B_FWD: {
+        int d = (i == B_BACK) ? 1 : -1;
+        thick_line(mx - 7 * d, my, mx + 7 * d, my, c);
+        thick_line(mx - 7 * d, my, mx - 2 * d, my - 5, c);
+        thick_line(mx - 7 * d, my, mx - 2 * d, my + 5, c);
+        break;
+    }
+    case B_RELOAD:
+        if (loading) {
+            thick_line(mx - 6, my - 6, mx + 6, my + 6, c);
+            thick_line(mx - 6, my + 6, mx + 6, my - 6, c);
+        } else {
+            gfx_circle(mx, my, 7, c);
+            gfx_circle(mx, my, 6, c);
+            gfx_rect_fill(mx + 1, my - 8, 8, 7, bg);            /* gap at the top right */
+            for (int k = 0; k < 5; k++) gfx_rect_fill(mx + 1 + k, my - 8 + k, 6 - k * 1, 1, c);
+            gfx_rect_fill(mx + 1, my - 8, 1, 5, c);
+        }
+        break;
+    case B_HOME:
+        thick_line(mx - 8, my, mx, my - 8, c);
+        thick_line(mx, my - 8, mx + 8, my, c);
+        gfx_rect_fill(mx - 5, my - 1, 2, 9, c);
+        gfx_rect_fill(mx + 4, my - 1, 2, 9, c);
+        gfx_rect_fill(mx - 5, my + 7, 11, 2, c);
+        gfx_rect_fill(mx - 1, my + 2, 3, 6, c);
+        break;
+    }
+}
+
+/* Rounded text box; caret at `cur` when focused. Text scrolls to keep it visible. */
+static void draw_textbox(int x, int y, int w, int h, const char* s, int len, int cur,
+                         bool foc, const char* placeholder) {
+    gfx_rrect_fill(x, y, w, h, 8, GFX_CORNERS_ALL, foc ? C_ACCENT : C_RULE);
+    int t = foc ? 2 : 1;
+    gfx_rrect_fill(x + t, y + t, w - 2 * t, h - 2 * t, 8 - t, GFX_CORNERS_ALL, C_WHITE);
+    int tx = x + 12, avail = w - 24;
+    int cw = uif_width_n(UIF_REG, s, cur);
+    int off = cw > avail ? cw - avail : 0;
+    clip_to(x + 4, y + 2, w - 8, h - 4);
+    if (!len && placeholder) uif_draw_mid(tx, y + h / 2, UIF_REG, placeholder, C_INK_DIM);
+    if (foc && s == edit && edit_all)
+        gfx_rrect_fill(tx - 2 - off, y + 6, uif_width_n(UIF_REG, s, len) + 4, h - 12, 3, GFX_CORNERS_ALL, RGB(0xF6, 0xDC, 0xB0));
+    static char tmp[URL_MAX];
+    int n = len < URL_MAX - 1 ? len : URL_MAX - 1;
+    memcpy(tmp, s, (size_t)n);
+    tmp[n] = 0;
+    uif_draw_mid(tx - off, y + h / 2, UIF_REG, tmp, C_INK);
+    if (foc && !(s == edit && edit_all) && (now_ms / 530) % 2 == 0) gfx_rect_fill(tx - off + cw, y + 7, 2, h - 14, C_ACCENT);
+    clip_restore();
+}
+
+/* Address bar while not editing: host dark, the rest dimmed. */
+static void draw_url_view(int x, int y, int w, int h) {
+    gfx_rrect_fill(x, y, w, h, 8, GFX_CORNERS_ALL, C_RULE);
+    gfx_rrect_fill(x + 1, y + 1, w - 2, h - 2, 7, GFX_CORNERS_ALL, C_WHITE);
+    clip_to(x + 4, y + 2, w - 8, h - 4);
+    int tx = x + 12, mid = y + h / 2;
+    const char* u = edit;
+    if (!u[0]) {
+        uif_draw_mid(tx, mid, UIF_REG, "Search or type an address", C_INK_DIM);
+    } else {
+        int se, he;
+        if (url_parts(u, &se, &he)) {
+            if (!strncmp(u, "https", 5)) {                     /* small padlock */
+                gfx_rect(tx + 2, mid - 6, 6, 6, C_ONLINE);
+                gfx_rrect_fill(tx, mid - 1, 10, 8, 2, GFX_CORNERS_ALL, C_ONLINE);
+                tx += 16;
+            }
+            static char part[URL_MAX];
+            int hl = he - se - 3;
+            memcpy(part, u + se + 3, (size_t)hl);
+            part[hl] = 0;
+            tx = uif_draw_mid(tx, mid, UIF_REG, part, C_INK);
+            uif_draw_mid(tx, mid, UIF_REG, u + he, C_INK_DIM);
+        } else {
+            uif_draw_mid(tx, mid, UIF_REG, u, C_INK);
+        }
+    }
+    clip_restore();
+}
+
+static int doc_ox(void) { int d = (view_box.w - 8 - laid_w) / 2; return view_box.x + (d > 0 ? d : 0); }
+static int doc_oy(void) { return view_box.y - scroll_y; }
+
+static void clamp_scroll(void) {
+    int mx = doc_h - view_box.h;
+    if (mx < 0) mx = 0;
+    if (scroll_y > mx) scroll_y = mx;
+    if (scroll_y < 0) scroll_y = 0;
+}
+
+static void draw_run(int idx, int ox, int oy) {
+    run_t* r = &runs[idx];
+    int x = ox + r->x, y = oy + r->y;
+    switch (r->kind) {
+    case RK_TEXT: {
+        bool hov = r->link >= 0 && r->link == hover_link;
+        uint32_t c = hov ? COL_LINK_HOV : r->fg;
+        const char* s = pool + r->off;
+        int asc;
+        if (r->font == F_MONO) {
+            for (int i = 0; i < r->len; i++) uif_mono_char(x + i * 8, y, (uint8_t)s[i], c, 0, false);
+            asc = 13;
+        } else {
+            uif_draw(x, y, (uif_t)r->font, s, c);
+            asc = uif_face((uif_t)r->font)->ascent;
+        }
+        if (r->link >= 0) gfx_rect_fill(x, y + asc + 2, r->w, 1, hov ? COL_LINK_HOV : COL_UNDERLINE);
+        break;
+    }
+    case RK_RULE:
+        gfx_rect_fill(x, y, r->w, 1, C_RULE);
+        break;
+    case RK_BULLET:
+        if (r->fg == C_GLYPH) gfx_disc(x + 3, y + r->h / 2 + 1, 3, r->fg);
+        else gfx_circle(x + 3, y + r->h / 2 + 1, 3, C_GLYPH);
+        break;
+    case RK_FIELD: {
+        field_t* f = &fields[r->field];
+        static char stars[FIELD_MAX];
+        const char* s = f->value;
+        if (f->type == FT_PASSWORD) {
+            for (int i = 0; i < f->len; i++) stars[i] = '*';
+            stars[f->len] = 0;
+            s = stars;
+        }
+        draw_textbox(x, y, r->w, r->h, s, f->len, f->cur, focus == r->field, NULL);
+        clip_to(view_box.x, view_box.y, view_box.w, view_box.h);
+        break;
+    }
+    case RK_BUTTON: {
+        bool hov = hover_run == idx;
+        gfx_rrect_fill(x, y, r->w, r->h, 8, GFX_CORNERS_ALL, hov ? COL_BTN_HOT : C_ACCENT);
+        uif_draw_center(x, y, r->w, r->h, UIF_MED, pool + r->off, C_INK);
+        break;
+    }
+    }
+}
+
+static void br_paint(window_t* w) {
     int cx, cy, cw, ch;
     wm_client_rect(w, &cx, &cy, &cw, &ch);
+    gfx_get_clip(&clip_x, &clip_y, &clip_w, &clip_h);
+    view_box = (box_t){ cx, cy + TB_H, cw, ch - TB_H - SB_H };
+    if (resp_len && layout_w() != laid_w) {
+        laid_w = layout_w();
+        keep_fields = true;
+        layout(laid_w);
+    }
 
-    int top_h = 44;
-    int status_h = 24;
+    /* toolbar */
+    gfx_rect_fill(cx, cy, cw, TB_H, C_SURFACE);
+    gfx_rect_fill(cx, cy + TB_H - 1, cw, 1, C_RULE);
+    int bx = cx + 10, by = cy + (TB_H - BTN) / 2;
+    bool en[B_COUNT] = { n_back > 0, n_fwd > 0, true, true };
+    for (int i = 0; i < B_COUNT; i++) {
+        btn_box[i] = (box_t){ bx, by, BTN, BTN };
+        draw_icon(i, btn_box[i], en[i]);
+        bx += BTN + 2;
+    }
+    int ux = bx + 8, uw = cx + cw - 12 - ux;
+    url_box = (box_t){ ux, by, uw, BTN };
+    if (focus == FOCUS_URL) draw_textbox(ux, by, uw, BTN, edit, edit_len, edit_cur, true, "Search or type an address");
+    else draw_url_view(ux, by, uw, BTN);
+    if (loading) {
+        int seg = cw / 4, span = cw + seg;
+        int el = (int32_t)(now_ms - load_start);
+        int p = (el < 0 ? 0 : el) / 2 % span - seg;
+        int x0 = p < 0 ? 0 : p, x1 = p + seg > cw ? cw : p + seg;
+        if (x1 > x0) gfx_rect_fill(cx + x0, cy + TB_H - 2, x1 - x0, 2, C_ACCENT);
+    }
 
-    /* top chrome */
-    gfx_rect_fill(cx, cy, cw, top_h, COL_CHROME);
-    gfx_rect_fill(cx, cy + top_h - 2, cw, 2, COL_CHROME_HI);
-
-    int bx = cx + 8, by = cy + 8;
-    int bh = top_h - 16;
-    int bw = 60;
-
-    btn_back.x = bx;        btn_back.y = by; btn_back.w = bw; btn_back.h = bh;
-    bx += bw + 4;
-    btn_reload.x = bx;      btn_reload.y = by; btn_reload.w = bw + 14; btn_reload.h = bh;
-    bx += bw + 14 + 4;
-    btn_home.x = bx;        btn_home.y = by; btn_home.w = bw; btn_home.h = bh;
-    bx += bw + 4;
-
-    int go_w = 50;
-    int url_x = bx + 6;
-    int url_w = (cx + cw) - url_x - go_w - 16;
-    if (url_w < 100) url_w = 100;
-
-    btn_go.x = url_x + url_w + 6;
-    btn_go.y = by; btn_go.w = go_w; btn_go.h = bh;
-
-    draw_button("Back",   btn_back.x,   btn_back.y,   btn_back.w,   btn_back.h, false, hist_top > 0);
-    draw_button("Reload", btn_reload.x, btn_reload.y, btn_reload.w, btn_reload.h, false, cur_url[0] != 0);
-    draw_button("Home",   btn_home.x,   btn_home.y,   btn_home.w,   btn_home.h, false, true);
-    draw_url_bar(url_x, by, url_w, bh);
-    draw_button("Go",     btn_go.x,     btn_go.y,     btn_go.w,     btn_go.h, false, edit_len > 0);
-
-    /* content area */
-    content_rect.x = cx + 4;
-    content_rect.y = cy + top_h + 4;
-    content_rect.w = cw - 8;
-    content_rect.h = ch - top_h - status_h - 8;
-
-    gfx_rect_fill(content_rect.x, content_rect.y, content_rect.w, content_rect.h, COL_PAGE_BG);
-    gfx_rect(content_rect.x, content_rect.y, content_rect.w, content_rect.h, COL_RULE);
-
-    /* render runs */
-    int doc_left = content_rect.x + 12;
-    int doc_top  = content_rect.y + 8;
-    int view_h   = content_rect.h - 16;
+    /* page */
+    gfx_rect_fill(view_box.x, view_box.y, view_box.w, view_box.h, COL_PAPER);
+    clamp_scroll();
+    clip_to(view_box.x, view_box.y, view_box.w, view_box.h);
+    int ox = doc_ox(), oy = doc_oy();
     for (int i = 0; i < n_runs; i++) {
         run_t* r = &runs[i];
-        int sy = doc_top + r->y - scroll_y;
-        if (sy + LINE_H < content_rect.y) continue;
-        if (sy > content_rect.y + content_rect.h) continue;
-        uint32_t fg = r->fg;
-        if (r->link_idx >= 0 && hover_link == r->link_idx) fg = COL_LINK_HOV;
-        gfx_string(doc_left + r->x, sy, doc_text_pool + r->text_off, fg, COL_PAGE_BG, false);
-        if (r->underline) {
-            gfx_rect_fill(doc_left + r->x, sy + 15, r->w, 1, fg);
-        }
+        if (r->y + r->h < scroll_y || r->y > scroll_y + view_box.h) continue;
+        draw_run(i, ox, oy);
     }
-    (void)view_h;
-
-    /* scrollbar */
-    int sb_w = 8;
-    int sb_x = content_rect.x + content_rect.w - sb_w - 2;
-    int sb_y = content_rect.y + 2;
-    int sb_h = content_rect.h - 4;
-    gfx_rect_fill(sb_x, sb_y, sb_w, sb_h, RGB(0xEE, 0xEE, 0xF4));
-    if (doc_height > 0) {
-        int thumb_h = sb_h * (sb_h) / (doc_height > sb_h ? doc_height : sb_h);
-        if (thumb_h < 16) thumb_h = 16;
-        int max_scroll = doc_height - sb_h;
-        if (max_scroll < 1) max_scroll = 1;
-        int thumb_y = sb_y + (sb_h - thumb_h) * scroll_y / max_scroll;
-        gfx_rect_fill(sb_x + 1, thumb_y, sb_w - 2, thumb_h, COL_CHROME_HI);
+    if (doc_h > view_box.h) {
+        int th = view_box.h * view_box.h / doc_h;
+        if (th < 30) th = 30;
+        int ty = view_box.y + (view_box.h - th) * scroll_y / (doc_h - view_box.h);
+        gfx_rrect_fill(cx + cw - 9, ty + 3, 5, th - 6, 2, GFX_CORNERS_ALL, C_GLYPH_DIM);
     }
+    clip_restore();
 
     /* status bar */
-    int statx = cx;
-    int staty = cy + ch - status_h;
-    gfx_rect_fill(statx, staty, cw, status_h, COL_STATUS_BG);
-    gfx_rect_fill(statx, staty, cw, 1, COL_CHROME_HI);
-    const char* st = status_text[0] ? status_text : "Ready";
-    gfx_string(statx + 8, staty + 4, st, COL_STATUS_FG, COL_STATUS_BG, false);
-    if (loading) {
-        gfx_string(statx + cw - 80, staty + 4, "(loading...)", COL_CHROME_HI, COL_STATUS_BG, false);
+    int sy = cy + ch - SB_H;
+    gfx_rect_fill(cx, sy, cw, SB_H, C_SURFACE);
+    gfx_rect_fill(cx, sy, cw, 1, C_RULE);
+    int mid = sy + SB_H / 2 + 1;
+    if (hover_link >= 0 && hover_link < n_links) {
+        uif_draw_fit(cx + 12, uif_top_for_mid(UIF_SMALL, mid), UIF_SMALL, url_pool + link_off[hover_link], cw - 24, COL_LINK);
+    } else {
+        if (loading) gfx_disc(cx + 16, mid, 3, (now_ms / 300) % 2 ? C_ACCENT : C_GLYPH_DIM);
+        uif_draw_fit(cx + (loading ? 26 : 12), uif_top_for_mid(UIF_SMALL, mid), UIF_SMALL, status, cw - 40, C_INK_DIM);
     }
 }
 
-/* ---------- Hit testing helpers ---------- */
+/* ======================================================================
+   Input
+   ====================================================================== */
 
-static bool in_rect(int x, int y, int rx, int ry, int rw, int rh) {
-    return x >= rx && x < rx + rw && y >= ry && y < ry + rh;
-}
-
-static int hit_link(int sx, int sy) {
-    int doc_left = content_rect.x + 12;
-    int doc_top  = content_rect.y + 8;
-    if (!in_rect(sx, sy, content_rect.x, content_rect.y, content_rect.w, content_rect.h))
-        return -1;
+static int hit_run(int sx, int sy) {
+    if (!in_box(view_box, sx, sy)) return -1;
+    int dx = sx - doc_ox(), dy = sy - doc_oy();
     for (int i = 0; i < n_runs; i++) {
         run_t* r = &runs[i];
-        if (r->link_idx < 0) continue;
-        int x0 = doc_left + r->x;
-        int y0 = doc_top + r->y - scroll_y;
-        if (sx >= x0 && sx < x0 + r->w && sy >= y0 && sy < y0 + LINE_H) {
-            return r->link_idx;
-        }
+        if (r->link < 0 && r->kind != RK_FIELD && r->kind != RK_BUTTON) continue;
+        if (dx >= r->x && dx < r->x + r->w && dy >= r->y - 1 && dy < r->y + r->h + 1) return i;
     }
     return -1;
 }
 
-/* ---------- WM callbacks ---------- */
-
-static void br_paint(window_t* w) {
-    draw_chrome(w);
-}
-
-static void clamp_scroll(window_t* w);
-
-/* Re-flow once the width has been stable for a moment (not on every
-   pixel of a drag), keeping the reading position proportionally. */
-static void relayout_if_resized(window_t* w, uint32_t now) {
-    if (laid_len <= 0) return;
-    int vw = live_view_w();
-    if (vw == laid_w) { relayout_since = 0; return; }
-    if (!relayout_since) { relayout_since = now | 1; return; }
-    if (now - relayout_since < 150) return;
-    int old_h = doc_height;
-    char title[96];
-    parse_html((const char*)(resp_buf + laid_off), laid_len, vw, title, sizeof(title));
-    if (old_h > 0) scroll_y = (int)((int64_t)scroll_y * doc_height / old_h);
-    laid_w = vw;
-    relayout_since = 0;
-    hover_link = -1;
-    clamp_scroll(w);
-    w->needs_repaint = true;
-}
-
-static void br_scroll(window_t* w, int dz) {
-    scroll_y += dz * SCROLL_STEP * 3;
-    clamp_scroll(w);
-    w->needs_repaint = true;
+static void update_hover(window_t* w) {
+    static int lmx = -1, lmy = -1, lscroll = -1, lruns = -1;
+    int mx, my; uint8_t btn;
+    mouse_get(&mx, &my, &btn);
+    if (mx == lmx && my == lmy && scroll_y == lscroll && n_runs == lruns) return;
+    lmx = mx; lmy = my; lscroll = scroll_y; lruns = n_runs;
+    int hb = -1;
+    for (int i = 0; i < B_COUNT; i++) if (in_box(btn_box[i], mx, my)) hb = i;
+    int hr = hit_run(mx, my);
+    int hl = hr >= 0 ? runs[hr].link : -1;
+    if (hb != hover_btn || hr != hover_run || hl != hover_link) {
+        hover_btn = hb; hover_run = hr; hover_link = hl;
+        w->needs_repaint = true;
+    }
 }
 
 static void br_tick(window_t* w, uint32_t now) {
-    relayout_if_resized(w, now);
-    if (url_focused && (now / 500) != (blink_ms / 500)) {
+    uint32_t prev = now_ms;
+    now_ms = now;
+    if (loading) {
+        if (fetch_pid < 0 || !proc_alive(fetch_pid)) finish_fetch();
+        else if ((int32_t)(now - load_start) > 60000) {
+            set_status("Timed out", NULL);
+            kill_fetch();
+            show_error(load_url, "The site took too long", "No complete answer in 60 seconds.");
+        }
         w->needs_repaint = true;
     }
-    blink_ms = now;
-
-    /* Cheap hover detection: poll mouse every tick. The WM doesn't deliver
-       move-without-press events to apps so this is how we get hover. */
-    int mx, my; uint8_t btn;
-    mouse_get(&mx, &my, &btn);
-    int hl = hit_link(mx, my);
-    if (hl != hover_link) { hover_link = hl; w->needs_repaint = true; }
+    if (focus != FOCUS_NONE && (now / 530) != (prev / 530)) w->needs_repaint = true;
+    update_hover(w);
 }
 
-static void br_release(window_t* w) {
-    (void)w;
-    click_consumed = false;
+static void br_scroll(window_t* w, int dz) {
+    scroll_y += dz * 54;
+    clamp_scroll();
+    w->needs_repaint = true;
 }
 
-static void clamp_scroll(window_t* w) {
-    int max_s = doc_height - content_rect.h + 16;
-    if (max_s < 0) max_s = 0;
-    if (scroll_y > max_s) scroll_y = max_s;
-    if (scroll_y < 0) scroll_y = 0;
-    (void)w;
-}
+static void br_release(window_t* w) { (void)w; click_consumed = false; }
 
-static void browser_go_edit(void) {
-    edit_url[edit_len] = 0;
-    browser_navigate(edit_url, true);
-}
-
-static void browser_back(void) {
-    if (hist_top <= 0) return;
-    char prev[URL_MAX];
-    str_set(prev, URL_MAX, hist[--hist_top]);
-    /* navigate without pushing the current page back onto the stack */
-    browser_navigate(prev, false);
-}
-
-static void browser_home(void) {
-    browser_navigate("http://host:8080/", true);
+static int caret_from_x(const char* s, int len, int x0, int x) {
+    int best = 0, bd = 1 << 30;
+    for (int k = 0; k <= len; k++) {
+        int d = x0 + uif_width_n(UIF_REG, s, k) - x;
+        if (d < 0) d = -d;
+        if (d < bd) { bd = d; best = k; }
+    }
+    return best;
 }
 
 static void br_click(window_t* w, int rx, int ry) {
-    if (click_consumed) {
-        /* Still update hover on drag so links highlight, but don't act */
-        int sx = rx + w->x + 4;
-        int sy = ry + w->y + WM_TITLE_H + 2;
-        int hl = hit_link(sx, sy);
-        if (hl != hover_link) { hover_link = hl; w->needs_repaint = true; }
-        return;
-    }
+    if (click_consumed) return;
     click_consumed = true;
-
-    /* relative coords are inside client area; convert to absolute screen coords */
     int cx, cy, cw, ch;
     wm_client_rect(w, &cx, &cy, &cw, &ch);
-    int sx = rx + cx;
-    int sy = ry + cy;
+    int sx = rx + cx, sy = ry + cy;
+    w->needs_repaint = true;
+    if (in_box(btn_box[B_BACK], sx, sy))   { go_back(); return; }
+    if (in_box(btn_box[B_FWD], sx, sy))    { go_forward(); return; }
+    if (in_box(btn_box[B_RELOAD], sx, sy)) { reload(); return; }
+    if (in_box(btn_box[B_HOME], sx, sy))   { go(HOME_URL, NULL); return; }
+    if (in_box(url_box, sx, sy)) {
+        if (focus != FOCUS_URL) focus_url();
+        else {
+            edit_all = false;
+            int cwid = uif_width_n(UIF_REG, edit, edit_cur), avail = url_box.w - 24;
+            int off = cwid > avail ? cwid - avail : 0;
+            edit_cur = caret_from_x(edit, edit_len, url_box.x + 12 - off, sx);
+        }
+        return;
+    }
+    int r = hit_run(sx, sy);
+    if (r < 0) { focus = FOCUS_NONE; return; }
+    run_t* rr = &runs[r];
+    if (rr->kind == RK_FIELD) {
+        field_t* f = &fields[rr->field];
+        focus = rr->field;
+        if (f->type != FT_PASSWORD) f->cur = caret_from_x(f->value, f->len, doc_ox() + rr->x + 12, sx);
+        else f->cur = f->len;
+        return;
+    }
+    if (rr->kind == RK_BUTTON) { submit_form(fields[rr->field].form, rr->field); return; }
+    if (rr->link >= 0) go(url_pool + link_off[rr->link], NULL);
+}
 
-    if (in_rect(sx, sy, btn_back.x, btn_back.y, btn_back.w, btn_back.h)) {
-        browser_back(); return;
+/* Line editing shared by the address bar and form fields. */
+static bool edit_key(char* s, int* len, int* cur, int cap, uint8_t c, bool text_mode) {
+    if (c == '\b') {
+        if (*cur > 0) { memmove(s + *cur - 1, s + *cur, (size_t)(*len - *cur + 1)); (*len)--; (*cur)--; }
+        return true;
     }
-    if (in_rect(sx, sy, btn_reload.x, btn_reload.y, btn_reload.w, btn_reload.h)) {
-        if (cur_url[0]) browser_navigate(cur_url, false);
-        return;
+    if (!text_mode) {
+        if (c == K_DEL)   { if (*cur < *len) { memmove(s + *cur, s + *cur + 1, (size_t)(*len - *cur)); (*len)--; } return true; }
+        if (c == K_LEFT)  { if (*cur > 0) (*cur)--; return true; }
+        if (c == K_RIGHT) { if (*cur < *len) (*cur)++; return true; }
+        if (c == K_HOME)  { *cur = 0; return true; }
+        if (c == K_END)   { *cur = *len; return true; }
+        if (c >= 0x80 && c < 0xA0) return false;             /* other special keys */
     }
-    if (in_rect(sx, sy, btn_home.x, btn_home.y, btn_home.w, btn_home.h)) {
-        browser_home(); return;
+    if (c >= 0x20 && c != 0x7F && *len < cap - 1) {
+        memmove(s + *cur + 1, s + *cur, (size_t)(*len - *cur + 1));
+        s[(*cur)++] = (char)c;
+        (*len)++;
+        return true;
     }
-    if (in_rect(sx, sy, btn_go.x, btn_go.y, btn_go.w, btn_go.h)) {
-        browser_go_edit(); return;
-    }
-    if (in_rect(sx, sy, url_rect.x, url_rect.y, url_rect.w, url_rect.h)) {
-        url_focused = true;
-        /* set cursor based on click x */
-        int rx_in = sx - url_rect.x - 6;
-        if (rx_in < 0) rx_in = 0;
-        int new_cur = rx_in / 8;
-        if (new_cur > edit_len) new_cur = edit_len;
-        edit_cur = new_cur;
-        return;
-    }
+    return false;
+}
 
-    /* content area? */
-    int hl = hit_link(sx, sy);
-    if (hl >= 0) {
-        url_focused = false;
-        browser_navigate(links[hl].url, true);
-        return;
+static void focus_next_field(void) {
+    int start = focus >= 0 ? focus + 1 : 0;
+    for (int k = 0; k < n_fields; k++) {
+        int i = (start + k) % n_fields;
+        if (fields[i].type == FT_TEXT || fields[i].type == FT_PASSWORD) {
+            focus = i;
+            fields[i].cur = fields[i].len;
+            for (int r = 0; r < n_runs; r++)                  /* scroll it into view */
+                if (runs[r].kind == RK_FIELD && runs[r].field == i) {
+                    if (runs[r].y < scroll_y || runs[r].y + runs[r].h > scroll_y + view_box.h)
+                        scroll_y = runs[r].y - view_box.h / 3;
+                    clamp_scroll();
+                }
+            return;
+        }
     }
-    url_focused = false;
+    focus = FOCUS_URL;
 }
 
 static void br_key(window_t* w, char ch) {
-    unsigned char c = (unsigned char)ch;     /* K_* codes live in 0x81..0x9F */
+    uint8_t c = (uint8_t)ch;
+    w->needs_repaint = true;
+    /* In the RU layout, 0x80.. are Cyrillic letters, not arrow keys. */
+    bool typing = focus != FOCUS_NONE;
+    bool ru_text = typing && kbd_is_ru() && ((c >= 0x80 && c <= 0xAF) || (c >= 0xE0 && c <= 0xF1));
     if (c == 0x1B) {
-        if (url_focused) { url_focused = false; w->needs_repaint = true; return; }
-        wm_close(w); return;
-    }
-    /* navigation keys are not stolen by URL bar */
-    if (c == K_PGUP) { scroll_y -= PAGE_STEP; clamp_scroll(w); w->needs_repaint = true; return; }
-    if (c == K_PGDN) { scroll_y += PAGE_STEP; clamp_scroll(w); w->needs_repaint = true; return; }
-    if (c == K_HOME && !url_focused) { scroll_y = 0; w->needs_repaint = true; return; }
-    if (c == K_END  && !url_focused) { scroll_y = 1 << 30; clamp_scroll(w); w->needs_repaint = true; return; }
-    if (!url_focused) {
-        if (c == K_UP)    { scroll_y -= SCROLL_STEP;   clamp_scroll(w); w->needs_repaint = true; return; }
-        if (c == K_DOWN)  { scroll_y += SCROLL_STEP;   clamp_scroll(w); w->needs_repaint = true; return; }
-        if (c == ' ')     { scroll_y += PAGE_STEP;     clamp_scroll(w); w->needs_repaint = true; return; }
-        /* press '/' or 'l' to jump to URL bar */
-        if (c == '/' || c == 'l' || c == 'L') { url_focused = true; w->needs_repaint = true; return; }
-        if (c == 'r' || c == 'R') { if (cur_url[0]) browser_navigate(cur_url, false); return; }
-        if (c == '\b') { browser_back(); return; }
+        if (loading) { kill_fetch(); set_status("Stopped", NULL); return; }
+        if (typing) { focus = FOCUS_NONE; set_edit(starts_ci(cur_url, HOME_URL) ? "" : cur_url); return; }
+        wm_close(w);
         return;
     }
-    /* URL bar editing */
-    if (c == '\n') {
-        url_focused = false;
-        browser_go_edit();
-        return;
+    if (c == '\t') { focus_next_field(); return; }
+    if (!ru_text) {
+        int page = view_box.h - 60;
+        if (c == K_PGUP) { scroll_y -= page; clamp_scroll(); return; }
+        if (c == K_PGDN) { scroll_y += page; clamp_scroll(); return; }
+        if (c == K_F1 + 4) { reload(); return; }             /* F5 */
     }
-    if (c == '\b') {
-        if (edit_cur > 0) {
-            for (int i = edit_cur - 1; i < edit_len; i++) edit_url[i] = edit_url[i + 1];
-            edit_len--; edit_cur--;
-            edit_url[edit_len] = 0;
-            w->needs_repaint = true;
+    if (focus == FOCUS_URL) {
+        if (c == '\n' || c == '\r') {
+            static char u[URL_MAX];
+            edit[edit_len] = 0;
+            normalize_typed(edit, u);
+            go(u, NULL);
+            return;
         }
+        if (edit_all) {
+            edit_all = false;
+            if (c == '\b' || c == K_DEL || c >= 0x20) { edit_len = edit_cur = 0; edit[0] = 0; }
+            if (c == '\b' || c == K_DEL) return;
+        }
+        edit_key(edit, &edit_len, &edit_cur, URL_MAX, c, ru_text);
         return;
     }
-    if (c == K_DEL) {
-        if (edit_cur < edit_len) {
-            for (int i = edit_cur; i < edit_len; i++) edit_url[i] = edit_url[i + 1];
-            edit_len--;
-            edit_url[edit_len] = 0;
-            w->needs_repaint = true;
-        }
+    if (focus >= 0 && focus < n_fields) {
+        field_t* f = &fields[focus];
+        if (c == '\n' || c == '\r') { submit_form(f->form, -1); return; }
+        edit_key(f->value, &f->len, &f->cur, FIELD_MAX, c, ru_text);
         return;
     }
-    if (c == K_LEFT)  { if (edit_cur > 0)        edit_cur--; w->needs_repaint = true; return; }
-    if (c == K_RIGHT) { if (edit_cur < edit_len) edit_cur++; w->needs_repaint = true; return; }
-    if (c == K_HOME)  { edit_cur = 0;            w->needs_repaint = true; return; }
-    if (c == K_END)   { edit_cur = edit_len;     w->needs_repaint = true; return; }
-    if (c == K_UP || c == K_DOWN || c == K_PGUP || c == K_PGDN) return;
-
-    /* Accept any printable byte including CP866 high bytes so the user can
-       SEE that the RU layout produced Cyrillic. The URL itself must end up
-       ASCII to be parseable, but the visible feedback matters. */
-    if (c >= 0x20) {
-        if (edit_len < URL_MAX - 1) {
-            for (int i = edit_len; i > edit_cur; i--) edit_url[i] = edit_url[i - 1];
-            edit_url[edit_cur++] = (char)c;
-            edit_len++;
-            edit_url[edit_len] = 0;
-            w->needs_repaint = true;
-        }
-    }
+    /* page focused: navigation keys */
+    if (c == K_UP)   { scroll_y -= 40; clamp_scroll(); return; }
+    if (c == K_DOWN) { scroll_y += 40; clamp_scroll(); return; }
+    if (c == ' ')    { scroll_y += view_box.h - 60; clamp_scroll(); return; }
+    if (c == K_HOME) { scroll_y = 0; return; }
+    if (c == K_END)  { scroll_y = doc_h; clamp_scroll(); return; }
+    if (c == '\b' || c == K_LEFT) { go_back(); return; }
+    if (c == K_RIGHT) { go_forward(); return; }
+    if (c == '/' || c == 'l' || c == 'L') { focus_url(); return; }
+    if (c == 'r' || c == 'R') { reload(); return; }
 }
 
 static void br_close(window_t* w) {
     (void)w;
-    g_browser_win = NULL;
+    kill_fetch();
+    g_win = NULL;
 }
 
-/* ---------- public entry ---------- */
+/* ======================================================================
+   Entry
+   ====================================================================== */
 
 int browser_open(const char* url) {
     if (!gfx_ready()) return -1;
-    if (g_browser_win && g_browser_win->open) {
-        if (url && *url) {
-            str_set(edit_url, URL_MAX, url);
-            edit_len = 0; while (edit_url[edit_len]) edit_len++;
-            edit_cur = edit_len;
-            browser_navigate(url, true);
-        }
+    if (g_win && g_win->open) {
+        if (url && *url) { static char u[URL_MAX]; normalize_typed(url, u); go(u, NULL); }
         return 0;
     }
-
-    /* one-time init */
-    cur_url[0] = 0;
-    edit_url[0] = 0;
-    edit_len = edit_cur = 0;
-    url_focused = true;
-    status_text[0] = 0;
-    n_runs = n_links = doc_text_used = 0;
-    doc_height = 0; scroll_y = 0;
-    hist_top = 0;
-    hover_link = -1;
+    if (!resp) {
+        resp     = kmalloc_big(RESP_CAP);
+        pool     = kmalloc_big(POOL_CAP);
+        url_pool = kmalloc_big(URLPOOL_CAP);
+        runs     = kmalloc_big(sizeof(run_t) * MAX_RUNS);
+        if (!resp || !pool || !url_pool || !runs) {
+            if (resp) kfree(resp);
+            if (pool) kfree(pool);
+            if (url_pool) kfree(url_pool);
+            if (runs) kfree(runs);
+            resp = NULL; pool = NULL; url_pool = NULL; runs = NULL;
+            return -1;
+        }
+    }
+    cur_url[0] = base_url[0] = 0;
+    n_back = n_fwd = 0;
+    resp_len = n_runs = n_links = n_fields = n_forms = 0;
+    doc_h = scroll_y = 0;
+    hover_link = hover_btn = hover_run = -1;
     click_consumed = false;
+    fetch_pid = -1;
+    loading = false;
+    set_edit("");
 
     int W = gfx_w(), H = gfx_h();
-    int ww = 1200, wh = 800;
+    int ww = 1100, wh = 780;
     if (ww > W - 80) ww = W - 80;
     if (wh > H - 120) wh = H - 120;
-    int wx = (W - ww) / 2;
-    int wy = (H - wh) / 2 - 24;
+    int wx = (W - ww) / 2, wy = (H - wh) / 2 - 24;
     if (wy < 30) wy = 30;
 
-    g_browser_win = wm_open_app_ex(wx, wy, ww, wh, "Browser - SamaraOS",
-                                    br_paint, br_key, br_click, br_tick,
-                                    true, NULL);
-    if (!g_browser_win) return -1;
-    g_browser_win->on_release = br_release;
-    g_browser_win->on_close   = br_close;
-    g_browser_win->on_scroll  = br_scroll;
-    g_browser_win->min_w = 480;
-    g_browser_win->min_h = 240;
+    g_win = wm_open_app_ex(wx, wy, ww, wh, "Browser", br_paint, br_key, br_click, br_tick, true, NULL);
+    if (!g_win) return -1;
+    g_win->on_release = br_release;
+    g_win->on_close   = br_close;
+    g_win->on_scroll  = br_scroll;
+    g_win->opaque     = true;
+    g_win->min_w = 520;
+    g_win->min_h = 300;
 
-    set_status("ready - type http://host:8080/ then Enter (or click Home)", NULL);
-    /* prefill URL bar with the default home so user just hits Enter */
-    str_set(edit_url, URL_MAX, "http://host:8080/");
-    edit_len = 0; while (edit_url[edit_len]) edit_len++;
-    edit_cur = edit_len;
-
-    if (url && *url) {
-        str_set(edit_url, URL_MAX, url);
-        edit_len = 0; while (edit_url[edit_len]) edit_len++;
-        edit_cur = edit_len;
-        browser_navigate(url, true);
-    }
+    wm_client_rect(g_win, &view_box.x, &view_box.y, &view_box.w, &view_box.h);
+    view_box.y += TB_H;
+    view_box.h -= TB_H + SB_H;
+    auto_redirects = 0;
+    load_push = false;
+    show_html(HOME_HTML, HOME_URL, false);
+    set_status("Start page", NULL);
+    if (url && *url) { static char u[URL_MAX]; normalize_typed(url, u); go(u, NULL); }
     return 0;
 }

@@ -111,7 +111,11 @@ There is no root password. Ports are open only on the host loopback.
 * own stack: Ethernet, ARP, IPv4, ICMP, TCP, UDP, loopback
 * static address `10.0.2.15`, gateway `10.0.2.2` (the host in QEMU)
 * BSD sockets for programs
-* SSH server and client (dropbear), telnet, `nc`, `wget`
+* SSH server and client (dropbear), telnet, `nc`, `wget`, `curl`
+* HTTPS: `curl` and an `openssl s_client` stand-in (used by busybox `wget`)
+  on mbedTLS, CA roots in `/etc/ssl/certs` (`userland/build-curl.sh`)
+* `make run-internet`: internet over QEMU NAT, host is `10.0.2.2`
+  (`ssh user@10.0.2.2`), guest :80 on host `localhost:8080`
 * `sshd` and `telnetd` start on boot
 
 ## Shell

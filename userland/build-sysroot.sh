@@ -296,6 +296,15 @@ if [ -n "$DB" ]; then
         ln -f "$OUT/usr/bin/dropbearmulti" "$OUT/usr/bin/$n"
     done
 fi
+# HTTPS: curl + `openssl s_client` shim (busybox wget uses it) on mbedTLS,
+# and CA roots. Built by userland/build-curl.sh into build/tls/.
+TLS=$ROOT/build/tls
+if [ -x "$TLS/curl" ]; then
+    cp "$TLS/curl" "$TLS/openssl" "$OUT/usr/bin/"
+    mkdir -p "$OUT/etc/ssl/certs"
+    cp "$TLS/ca-certificates.crt" "$OUT/etc/ssl/certs/"
+    ln -f "$OUT/etc/ssl/certs/ca-certificates.crt" "$OUT/etc/ssl/cert.pem"
+fi
 
 cd "$OUT"
 tar --format=ustar --owner=0 --group=0 -cf "$ROOT/userland/sysroot.tar" usr $( [ -d etc ] && echo etc )

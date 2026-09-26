@@ -222,7 +222,7 @@ static void fill_stat_file(kstat64_t* st, file_t* f) {
     st->st_nlink = 1;
     st->st_blksize = 4096;
     if (f->type == F_PIPE_R || f->type == F_PIPE_W) st->st_mode = S_IFIFO | 0600;
-    else if (f->type == F_SOCKET) st->st_mode = 0140000 | 0777;          /* S_IFSOCK */
+    else if (f->type == F_SOCKET || f->type == F_SPAIR) st->st_mode = 0140000 | 0777;          /* S_IFSOCK */
     else { st->st_mode = S_IFCHR | 0666; st->st_rdev = f->type == F_TTY ? (5u << 8) : (1u << 8) | 3; }
     st->st_atime = st->st_mtime = st->st_ctime = clock_epoch();
 }
@@ -262,7 +262,7 @@ static int do_readlink(const char* path, char* buf, uint32_t n) {
         case F_NULL: strcpy(out, "/dev/null"); break;
         case F_ZERO: strcpy(out, "/dev/zero"); break;
         case F_RANDOM: strcpy(out, "/dev/urandom"); break;
-        case F_SOCKET: strcpy(out, "socket:[1]"); break;
+        case F_SOCKET: case F_SPAIR: strcpy(out, "socket:[1]"); break;
         default:     strcpy(out, "pipe:[1]"); break;
     }
     uint32_t l = strlen(out);
@@ -519,7 +519,7 @@ static int do_ioctl(int fd, uint32_t req, uint32_t arg) {
     if (req == 0x541B) {                                      /* FIONREAD */
         UCHK((void*)arg, 4);
         int n = 0;
-        if (f->type == F_PIPE_R) n = f->pipe->count;
+        if (f->type == F_PIPE_R || f->type == F_SPAIR) n = f->pipe->count;
         else if (f->type == F_NODE && f->node->type == FS_FILE && f->off < f->node->size)
             n = (int)(f->node->size - f->off);
         else if (f->type == F_TTY) n = tty_readable() ? 1 : 0;
@@ -713,6 +713,7 @@ static int poll_once(pollfd_t* fds, uint32_t n) {
         if ((fds[i].events & 0x4) && file_writable(f)) ev |= 0x4;
         if (f->type == F_PIPE_R && f->pipe->writers <= 0) ev |= 0x10; /* POLLHUP */
         if (f->type == F_SOCKET && sock_hup(f->sock)) ev |= 0x10;
+        if (f->type == F_SPAIR && f->pipe->writers <= 0) ev |= 0x10;
         if (f->type == F_PIPE_W && f->pipe->readers <= 0) ev |= 0x8;  /* POLLERR */
         fds[i].revents = ev;
         if (ev) ready++;
@@ -942,12 +943,61 @@ static int write_addr(uint32_t uaddr, uint32_t ulen, uint32_t ip, uint16_t port)
     return 0;
 }
 
+static int do_socketpair(uint32_t domain, uint32_t type, uint32_t proto, int* sv) {
+    if (domain != 1) return -97;                                      /* AF_UNIX only */
+    if ((type & 0xF) != 1) return -93;                                /* SOCK_STREAM only */
+    if (proto) return -93;
+    UCHK(sv, 8);
+    file_t *x, *y;
+    int e = spair_create(&x, &y);
+    if (e < 0) return e;
+    if (type & 04000) { x->flags |= O_NONBLOCK; y->flags |= O_NONBLOCK; }
+    bool cx = (type & 02000000) != 0;
+    int a = install_fd(x, 0, cx);
+    if (a < 0) { file_close(y); return a; }
+    int b = install_fd(y, 0, cx);
+    if (b < 0) { file_close(me()->fds[a]); me()->fds[a] = NULL; return b; }
+    sv[0] = a;
+    sv[1] = b;
+    return 0;
+}
+
+/* send/recv/shutdown/setsockopt on a socketpair end map onto the pipes. */
+static int spair_call(int call, file_t* f, uint32_t b, uint32_t c, uint32_t d) {
+    switch (call) {
+        case 9: case 11: {                                            /* send / sendto */
+            UCHK((void*)b, c);
+            int ofl = f->flags;
+            if (d & 0x40) f->flags |= O_NONBLOCK;
+            int r = file_write(f, (const char*)b, c);
+            f->flags = ofl;
+            return r;
+        }
+        case 10: case 12: {                                           /* recv / recvfrom */
+            UCHK((void*)b, c);
+            int ofl = f->flags;
+            if (d & 0x40) f->flags |= O_NONBLOCK;
+            int r = file_read(f, (char*)b, c);
+            f->flags = ofl;
+            return r;
+        }
+        case 13: return spair_shutdown(f, (int)b);
+        case 14: return 0;                                            /* setsockopt */
+        case 6: case 7: return 0;                                     /* get{sock,peer}name */
+    }
+    return -95;
+}
+
 static int32_t sys_socket_call(int call, uint32_t a, uint32_t b, uint32_t c,
                                uint32_t d, uint32_t e, uint32_t f6) {
     int err = 0;
     sock_t* s;
     uint32_t ip; uint16_t port;
     file_t* fl;
+    if (call != 1 && call != 8) {
+        file_t* pf = getf((int)a);
+        if (pf && pf->type == F_SPAIR) return spair_call(call, pf, b, c, d);
+    }
     switch (call) {
         case 1: {                                                     /* socket */
             if (a != AF_INET) return -97;
@@ -986,7 +1036,7 @@ static int32_t sys_socket_call(int call, uint32_t a, uint32_t b, uint32_t c,
             sock_name(s, call == 7, &ip, &port);
             if (call == 7 && !port) return -107;                      /* ENOTCONN */
             return write_addr(b, c, ip, port);
-        case 8: return -95;                                           /* socketpair: AF_UNIX only */
+        case 8: return do_socketpair(a, b, c, (int*)d);               /* socketpair */
         case 9: case 11: {                                            /* send / sendto */
             if (!(s = getsock((int)a, &err))) return err;
             UCHK((void*)b, c);
@@ -1060,7 +1110,8 @@ static int32_t dispatch(regs_t* r) {
     fs_node_t* n;
     switch (r->eax) {
         case 1: case 252: proc_exit((int)((a & 0xFF) << 8));
-        case 2: case 190: return proc_fork(r);
+        case 2:   return proc_fork(r);
+        case 190: return proc_vfork(r);
         case 120: {                                                  /* clone */
             int pid = proc_fork(r);
             (void)d; (void)e;
