@@ -61,6 +61,7 @@ bool     vmm_range_unmapped(uint32_t pd, uint32_t va, uint32_t len);
 uint32_t vmm_find_free(uint32_t pd, uint32_t from, uint32_t limit, uint32_t len);
 uint32_t vmm_pte(uint32_t pd, uint32_t va);            /* 0 = not mapped */
 void     vmm_set_writable(uint32_t pd, uint32_t va, uint32_t len, bool writable);
+void     vmm_set_user(uint32_t pd, uint32_t va, uint32_t len, bool user);
 
 /* Copy into / zero another space through the identity map (no CR3 switch). */
 int      vmm_copy_to(uint32_t pd, uint32_t va, const void* src, uint32_t len);

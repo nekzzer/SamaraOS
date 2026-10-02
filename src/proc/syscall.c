@@ -694,6 +694,7 @@ static int32_t do_mmap(uint32_t addr, uint32_t len, int prot, int flags, int fd,
         vmm_copy_to(p->pd, addr, f->node->data + off, n);
     }
     if (!(prot & PROT_WRITE)) vmm_set_writable(p->pd, addr, len, false);
+    if (!prot) vmm_set_user(p->pd, addr, len, false);
     vmm_flush();
     return (int32_t)addr;
 }
@@ -710,6 +711,7 @@ static int do_mprotect(uint32_t addr, uint32_t len, int prot) {
     if (addr & (PAGE_SIZE - 1)) return -EINVAL;
     if (addr < USER_BASE || addr >= USER_TOP) return 0;
     vmm_set_writable(me()->pd, addr, len, (prot & PROT_WRITE) != 0);
+    vmm_set_user(me()->pd, addr, len, prot != 0);
     vmm_flush();
     return 0;
 }
