@@ -84,8 +84,9 @@ static void grad_puts(const char *s, const uint32_t *stops, int k) {
   vga_set_color(VGA_LGREY, VGA_BLACK);
 }
 
-static const uint32_t G_SUNSET[] = {0xFF6A88, 0xFF9A5A, 0xFFD36E};   /* pink -> orange -> gold */
-static const uint32_t G_SEA[] = {0x6EE7D2, 0x8FB8F0, 0xB79CF2};      /* aqua -> sky -> lavender */
+// prompt: user@host amber, path grey. (was pink->gold and aqua->lavender)
+static const uint32_t G_WHO[] = {0xE39B32, 0xE8A443, 0xE39B32};
+static const uint32_t G_PATH[] = {0xA9AAAF, 0xC4C5C9, 0xA9AAAF};
 
 /* Block-letter "SAMARA OS" (CP866 half blocks), a horizontal gradient. */
 static void banner(void) {
@@ -94,7 +95,7 @@ static void banner(void) {
       " \xdf\xdf\xdc \xdb\xdf\xdf\xdb \xdb \xdf \xdb \xdb\xdf\xdf\xdb \xdb\xdf\xdb  \xdb\xdf\xdf\xdb    \xdb  \xdb  \xdf\xdf\xdc",
       "\xdf\xdf\xdf  \xdf  \xdf \xdf   \xdf \xdf  \xdf \xdf  \xdf \xdf  \xdf     \xdf\xdf  \xdf\xdf\xdf",
   };
-  static const uint32_t stops[] = {0xFF5E8A, 0xFF8A5B, 0xFFC857, 0x9BE38B, 0x5CC8F0};
+  static const uint32_t stops[] = {0x55565C, 0x8A8B90, 0xC4C5C9, 0xE6E6E6, 0xE39B32};   // grey -> white, "OS" goes amber
   const int w = 44;
   for (int r = 0; r < 3; r++) {
     vga_putc(' ');
@@ -119,11 +120,11 @@ static void prompt(void) {
     for (int i = 0; i < (int)hn->size && hn->data[i] != '\n' && k < 63; i++)
       who[k++] = hn->data[i];
   who[k] = 0;
-  grad_puts(who, G_SUNSET, 3);
+  grad_puts(who, G_WHO, 3);
   vga_set_color(VGA_DGREY, VGA_BLACK);
   vga_putc(':');
-  grad_puts(path, G_SEA, 3);
-  vga_set_rgb(0xFFD36E, term_bg());
+  grad_puts(path, G_PATH, 3);
+  vga_set_rgb(0x85868C, term_bg());
   vga_puts("$ ");
   vga_set_color(VGA_LGREY, VGA_BLACK);
 }

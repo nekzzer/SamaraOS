@@ -48,6 +48,7 @@ void fs_init(void) {
     }
 
     link_child(dev, node_new("pts", FS_DIR, dev));      /* pty slaves appear here */
+    link_child(dev, node_new("shm", FS_DIR, dev));      /* shm_open, MAP_SHARED for real (yutani) */
 
     fs_node_t* user = node_new("user", FS_DIR, home);
     link_child(home, user);

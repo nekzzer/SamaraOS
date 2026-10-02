@@ -1,5 +1,6 @@
 /* Analog + digital clock widget. */
 
+#include "gui/theme.h"
 #include "apps/clock.h"
 #include "gui/wm.h"
 #include "gfx/gfx.h"
@@ -36,16 +37,17 @@ static void read_rtc(int* h, int* m, int* s) {
     *h = hh; *m = mm; *s = ss;
 }
 
-#define BG  RGB(0x14, 0x18, 0x28)
-#define FACE RGB(0xF4, 0xF4, 0xF8)
-#define FRAME RGB(0x6E, 0xA8, 0xFE)
-#define MARK RGB(0x20, 0x22, 0x32)
-#define HOUR_C RGB(0x10, 0x14, 0x28)
-#define MIN_C  RGB(0x2A, 0x36, 0x60)
-#define SEC_C  RGB(0xE0, 0x50, 0x50)
-#define CENTRE RGB(0x10, 0x14, 0x28)
-#define FG     RGB(0xE6, 0xE8, 0xF2)
-#define DIM    RGB(0x88, 0x90, 0xB0)
+// dark dial to match the desktop, amber second hand
+#define BG     C_SURFACE
+#define FACE   C_PANEL
+#define FRAME  C_OUTLINE
+#define MARK   RGB(0x8A, 0x8B, 0x90)
+#define HOUR_C C_INK
+#define MIN_C  RGB(0xB5, 0xB6, 0xBB)
+#define SEC_C  C_ACCENT
+#define CENTRE C_INK
+#define FG     C_INK
+#define DIM    C_INK_DIM
 
 static void draw_hand(int cx, int cy, int len, int deg, int thick, uint32_t col) {
     int s = sin_q10(deg);   /* Q10 */

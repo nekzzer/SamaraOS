@@ -124,6 +124,15 @@ void vmm_set_writable(uint32_t pd, uint32_t va, uint32_t len, bool writable) {
     }
 }
 
+int vmm_map_frame(uint32_t pd, uint32_t va, uint32_t fr, bool rw) {
+    uint32_t* p = pte_slot(pd, va, true);
+    if (!p) return -1;
+    pmm_ref(fr);
+    if (*p & PTE_P) pmm_unref(*p & ~0xFFFu);
+    *p = fr | PTE_P | PTE_US | (rw ? PTE_RW : 0);
+    return 0;
+}
+
 // PROT_NONE = present but supervisor only, so user access faults
 void vmm_set_user(uint32_t pd, uint32_t va, uint32_t len, bool user) {
     uint32_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);

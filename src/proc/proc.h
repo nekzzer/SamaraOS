@@ -94,6 +94,7 @@ proc_t* proc_at(int i);
 
 /* Fault plumbing called from the exception handlers. */
 bool    proc_handle_fault(uint32_t addr, uint32_t err);
+void    proc_fault_stack(uint32_t esp);
 void    proc_fault_kill(const char* what, int sig, uint32_t eip, uint32_t addr) __attribute__((noreturn));
 
 /* Syscall-level operations (syscall.c calls these). */

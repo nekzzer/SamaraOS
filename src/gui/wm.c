@@ -30,10 +30,8 @@
    ======================================================================== */
 
 #define TASKBAR_H  40
-#define WIN_R      6
-#define MENU_R     8
-#define SH_SIZE    16
-#define SH_DY      3
+#define SH_SIZE    10
+#define SH_DY      2
 #define MENU_W     248
 #define MENU_HEAD  38
 #define MENU_ITEM  30
@@ -446,9 +444,10 @@ static void text_fit(int x, int mid, uif_t f, const char* s, int max_px, uint32_
 static int text_w(uif_t f, const char* s) { return uif_width(f, s); }
 
 /* ========================================================================
-   Desktop background — rendered once into a cache: dithered vertical
-   gradient, faint dot grid, low-contrast wordmark.
+   Desktop background, rendered once into a cache: near-black gradient + a
+   wordmark you only see if you look for it. Or the user's wallpaper.
    ======================================================================== */
+
 
 static const uint8_t bayer4[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
 
@@ -521,6 +520,7 @@ static void build_background(int W, int H, bool force) {
     bg_w = W; bg_h = H;
     if (load_wallpaper(bg_cache, W, H)) return;
 
+    // vertical gradient, barely there. bayer dither or 8 bit steps show as bands
     int tr = (C_DESK_TOP >> 16) & 0xFF, tg = (C_DESK_TOP >> 8) & 0xFF, tb = C_DESK_TOP & 0xFF;
     int br = (C_DESK_BOT >> 16) & 0xFF, bgc = (C_DESK_BOT >> 8) & 0xFF, bb = C_DESK_BOT & 0xFF;
     for (int y = 0; y < H; y++) {
@@ -533,14 +533,6 @@ static void build_background(int W, int H, bool force) {
             row[x] = RGB((r16 + t) >> 4, (g16 + t) >> 4, (b16 + t) >> 4);
         }
     }
-
-    for (int y = 28; y + 1 < H; y += 32)
-        for (int x = 28; x + 1 < W; x += 32)
-            for (int dy = 0; dy < 2; dy++)
-                for (int dx = 0; dx < 2; dx++) {
-                    uint32_t* p = bg_cache + (size_t)(y + dy) * W + x + dx;
-                    *p += 0x070707;
-                }
 
     /* Wordmark in Golos ExtraBold, blended straight into the cache. */
     const char* mark = "samara";
@@ -644,7 +636,7 @@ static int group_count(int g) {
 
 static void layout_taskbar(void) {
     int W = gfx_w(), top = gfx_h() - TASKBAR_H;
-    tb_start = R(8, top + 6, 32 + text_w(UIF_BIG, "samara") + 14, 28);
+    tb_start = R(8, top + 6, text_w(UIF_MED, "samara") + 36, 28);
     tb_clock = R(W - 12 - 88, top + 4, 88, 32);
     tb_lang  = R(tb_clock.x0 - 14 - 34, top + 9, 34, 22);
     tb_net   = R(tb_lang.x0 - 14 - 136, top + 6, 136, 28);
@@ -967,81 +959,67 @@ static void ring(int cx, int cy, int r, int t, uint32_t c) {
     for (int k = 0; k < t; k++) gfx_circle(cx, cy, r - k, c);
 }
 
-static void draw_icon_glyph(int g, int x, int y) {
+// tiles are all the same: dark square, thin border, white line art inside.
+// the colourful ones looked like a phone, not like this desktop anymore
+static void draw_icon_glyph(int g, int x, int y, bool sel) {
     const int S = ICON_TILE, cx = x + S / 2, cy = y + S / 2;
-    uint32_t bg;
-    switch (g) {
-        case IG_TERM:  bg = RGB(0x2A, 0x2E, 0x35); break;
-        case IG_WEB:   bg = RGB(0x3E, 0x7C, 0xCF); break;
-        case IG_MUSIC: bg = RGB(0xB0, 0x5E, 0xC8); break;
-        case IG_PAINT: bg = RGB(0x5E, 0x9E, 0x4C); break;
-        case IG_CLOCK: bg = RGB(0x33, 0x37, 0x3F); break;
-        case IG_PY:    bg = RGB(0x30, 0x69, 0x98); break;
-        default:       bg = RGB(0xCF, 0x4A, 0x3E); break;
-    }
-    gfx_shadow(x, y + 2, S, S, 10, 8, 110);
-    gfx_rrect_fill(x, y, S, S, 10, GFX_CORNERS_ALL, bg);
-    gfx_rect_blend(x + 4, y + 1, S - 8, 1, C_WHITE, 40);           /* top sheen */
+    const uint32_t bg = C_SURFACE, fg = C_BAR_TEXT, dim = C_BAR_DIM;
+    gfx_rect_fill(x, y, S, S, sel ? C_ACCENT : C_OUTLINE);
+    gfx_rect_fill(x + 1, y + 1, S - 2, S - 2, bg);
 
     switch (g) {
     case IG_TERM:
-        gfx_rect_fill(x + 6, y + 10, S - 12, 1, RGB(0x40, 0x45, 0x4E));
-        gfx_disc(x + 10, y + 6, 1, C_DANGER);
-        gfx_disc(x + 15, y + 6, 1, C_ACCENT);
-        thick_line(x + 11, y + 18, x + 19, y + 25, 3, C_BAR_TEXT);
-        thick_line(x + 11, y + 32, x + 19, y + 25, 3, C_BAR_TEXT);
-        gfx_rect_fill(x + 23, y + 31, 13, 3, C_ACCENT);
+        thick_line(x + 13, y + 17, x + 20, y + 24, 2, fg);
+        thick_line(x + 13, y + 31, x + 20, y + 24, 2, fg);
+        gfx_rect_fill(x + 24, y + 30, 11, 2, fg);
         break;
     case IG_WEB: {
-        ring(cx, cy, 16, 2, C_WHITE);
-        gfx_rect_fill(cx - 15, cy - 1, 30, 2, C_WHITE);
-        gfx_rect_fill(cx - 1, cy - 15, 2, 30, C_WHITE);
-        int ch = isqrt_i(256 - 64);
-        gfx_rect_fill(cx - ch + 1, cy - 8, 2 * ch - 2, 1, C_WHITE);
-        gfx_rect_fill(cx - ch + 1, cy + 8, 2 * ch - 2, 1, C_WHITE);
-        for (int dy = -15; dy <= 15; dy++) {                    /* meridian ellipse */
-            int ex = 8 * isqrt_i(225 - dy * dy) / 15;
-            gfx_rect_fill(cx - ex - 1, cy + dy, 2, 1, C_WHITE);
-            gfx_rect_fill(cx + ex, cy + dy, 2, 1, C_WHITE);
+        ring(cx, cy, 15, 1, fg);
+        gfx_rect_fill(cx - 14, cy, 29, 1, dim);
+        gfx_rect_fill(cx, cy - 14, 1, 29, dim);
+        for (int dy = -14; dy <= 14; dy++) {                     /* meridian ellipse */
+            int ex = 7 * isqrt_i(196 - dy * dy) / 14;
+            gfx_rect_fill(cx - ex, cy + dy, 1, 1, dim);
+            gfx_rect_fill(cx + ex, cy + dy, 1, 1, dim);
         }
         break;
     }
     case IG_MUSIC:
-        gfx_disc(x + 17, y + 34, 5, C_WHITE);
-        gfx_disc(x + 32, y + 31, 5, C_WHITE);
-        gfx_rect_fill(x + 20, y + 13, 3, 21, C_WHITE);
-        gfx_rect_fill(x + 35, y + 10, 3, 21, C_WHITE);
-        thick_line(x + 20, y + 13, x + 37, y + 10, 4, C_WHITE);
+        gfx_disc(x + 17, y + 33, 4, fg);
+        gfx_disc(x + 31, y + 30, 4, fg);
+        gfx_rect_fill(x + 20, y + 14, 2, 19, fg);
+        gfx_rect_fill(x + 34, y + 11, 2, 19, fg);
+        thick_line(x + 20, y + 14, x + 35, y + 11, 3, fg);
         break;
     case IG_PAINT:
-        gfx_disc(cx, cy + 1, 16, RGB(0xEE, 0xEB, 0xE5));
-        gfx_disc(cx + 8, cy + 8, 4, bg);
-        gfx_disc(cx - 8, cy - 5, 3, C_DANGER);
-        gfx_disc(cx, cy - 9, 3, RGB(0xF2, 0xC9, 0x4C));
-        gfx_disc(cx + 8, cy - 4, 3, RGB(0x3E, 0x7C, 0xCF));
-        gfx_disc(cx - 8, cy + 5, 3, RGB(0x2A, 0x2E, 0x35));
+        ring(cx, cy, 14, 1, fg);
+        gfx_disc(cx - 6, cy - 5, 2, fg);
+        gfx_disc(cx + 1, cy - 8, 2, dim);
+        gfx_disc(cx + 7, cy - 3, 2, fg);
+        gfx_disc(cx - 6, cy + 4, 2, dim);
+        gfx_disc(cx + 6, cy + 7, 3, bg);
+        ring(cx + 6, cy + 7, 3, 1, fg);
         break;
     case IG_CLOCK:
-        gfx_disc(cx, cy, 17, RGB(0xEE, 0xEB, 0xE5));
-        for (int k = 0; k < 12; k++) {
-            static const int8_t tx[12] = { 0, 7, 12, 14, 12, 7, 0, -7, -12, -14, -12, -7 };
-            static const int8_t ty[12] = { -14, -12, -7, 0, 7, 12, 14, 12, 7, 0, -7, -12 };
-            gfx_rect_fill(cx + tx[k], cy + ty[k], 1 + (k % 3 == 0), 1 + (k % 3 == 0), C_GLYPH);
+        ring(cx, cy, 15, 1, fg);
+        for (int k = 0; k < 12; k += 3) {
+            static const int8_t tx[12] = { 0, 7, 12, 12, 12, 7, 0, -7, -12, -12, -12, -7 };
+            static const int8_t ty[12] = { -12, -12, -7, 0, 7, 12, 12, 12, 7, 0, -7, -12 };
+            gfx_rect_fill(cx + tx[k], cy + ty[k], 1, 1, dim);
         }
-        thick_line(cx - 1, cy, cx - 1, cy - 11, 2, C_INK);
-        thick_line(cx, cy - 1, cx + 8, cy + 4, 2, C_INK);
-        gfx_disc(cx, cy, 2, C_ACCENT);
+        thick_line(cx, cy, cx, cy - 10, 1, fg);
+        thick_line(cx, cy, cx + 7, cy + 4, 1, fg);
         break;
     case IG_PY:
-        uif_draw_center(x, y, S, S, UIF_BIG, "Py", RGB(0xF2, 0xC9, 0x4C));
-        gfx_rect_fill(x + 12, y + S - 12, S - 24, 2, RGB(0xF2, 0xC9, 0x4C));
+        uif_draw_center(x, y, S, S, UIF_BIG, "py", fg);
         break;
     default:                                                     /* gamepad */
-        gfx_rrect_fill(x + 6, y + 15, S - 12, 19, 8, GFX_CORNERS_ALL, C_WHITE);
-        gfx_rect_fill(x + 12, y + 23, 10, 3, bg);
-        gfx_rect_fill(x + 15, y + 20, 4, 9, bg);
-        gfx_disc(x + 32, y + 22, 2, bg);
-        gfx_disc(x + 36, y + 27, 2, bg);
+        gfx_rect_fill(x + 8, y + 16, S - 16, 17, fg);
+        gfx_rect_fill(x + 9, y + 17, S - 18, 15, bg);
+        gfx_rect_fill(x + 13, y + 24, 9, 1, fg);
+        gfx_rect_fill(x + 17, y + 20, 1, 9, fg);
+        gfx_disc(x + 32, y + 22, 1, fg);
+        gfx_disc(x + 35, y + 27, 1, fg);
         break;
     }
 }
@@ -1051,18 +1029,14 @@ static void draw_icons(rect_t region) {
         icon_t* ic = &icons[i];
         rect_t r = ic->r;
         if (!r_overlap(R(r.x0 - 12, r.y0 - 8, ICON_W + 24, ICON_H + 20), region)) continue;
-        if (i == icon_sel) {
-            gfx_rect_blend(r.x0 + 2, r.y0, ICON_W - 4, ICON_H, C_ACCENT, 48);
-            gfx_rect_blend(r.x0 + 2, r.y0, ICON_W - 4, 1, C_ACCENT, 120);
-            gfx_rect_blend(r.x0 + 2, r.y1 - 1, ICON_W - 4, 1, C_ACCENT, 120);
-        }
+        bool sel = i == icon_sel;
         int gx = r.x0 + (ICON_W - ICON_TILE) / 2, gy = r.y0 + 6;
-        draw_icon_glyph(ic->glyph, gx, gy);
-        int ty = gy + ICON_TILE + 6;
+        draw_icon_glyph(ic->glyph, gx, gy, sel);
+        int ty = gy + ICON_TILE + 7;
         int tw = uif_width(UIF_SMALL, ic->label), maxw = ICON_W - 6;
         int tx = tw <= maxw ? r.x0 + (ICON_W - tw) / 2 : r.x0 + 3;
         uif_draw_fit(tx + 1, ty + 1, UIF_SMALL, ic->label, maxw, C_BLACK);   /* legible on photos */
-        uif_draw_fit(tx, ty, UIF_SMALL, ic->label, maxw, C_BAR_TEXT);
+        uif_draw_fit(tx, ty, UIF_SMALL, ic->label, maxw, sel ? C_WHITE : C_BAR_DIM);
     }
 }
 
@@ -1073,17 +1047,17 @@ static void draw_icons(rect_t region) {
 static void draw_close_glyph(rect_t b, uint32_t c) {
     int x = b.x0 + 7, y = b.y0 + 5;
     for (int i = 0; i < 8; i++) {
-        gfx_rect_fill(x + i, y + i, 2, 1, c);
-        gfx_rect_fill(x + 6 - i, y + i, 2, 1, c);
+        gfx_rect_fill(x + i, y + i, 1, 1, c);
+        gfx_rect_fill(x + 7 - i, y + i, 1, 1, c);
     }
 }
 
 static void draw_min_glyph(rect_t b, uint32_t c) {
-    gfx_rect_fill(b.x0 + 7, b.y0 + 11, 9, 2, c);
+    gfx_rect_fill(b.x0 + 7, b.y0 + 12, 8, 1, c);
 }
 
 static void outline(int x, int y, int w, int h, uint32_t c) {
-    gfx_rect_fill(x, y, w, 2, c);
+    gfx_rect_fill(x, y, w, 1, c);
     gfx_rect_fill(x, y + h - 1, w, 1, c);
     gfx_rect_fill(x, y, 1, h, c);
     gfx_rect_fill(x + w - 1, y, 1, h, c);
@@ -1116,21 +1090,23 @@ static void draw_window(int idx, rect_t region, bool client_only) {
         goto client;
     }
     if (w->fullscreen) goto client;               /* no frame at all */
+    // square, 1px border, focus = lighter border + white title. shadow only
+    // so overlapping black windows don't melt into each other
     if (!w->maximized)
-        gfx_shadow(w->x, w->y + SH_DY, w->w, w->h, WIN_R, SH_SIZE, foc ? 120 : 60);
-    gfx_rrect_fill(w->x, w->y, w->w, w->h, WIN_R, GFX_CORNERS_ALL, C_OUTLINE);
-    gfx_rrect_fill(w->x + 1, w->y + 1, w->w - 2, w->h - 2, WIN_R - 1, GFX_CORNERS_ALL, C_SURFACE);
+        gfx_shadow(w->x, w->y + SH_DY, w->w, w->h, 0, SH_SIZE, foc ? 160 : 90);
+    gfx_rect_fill(w->x, w->y, w->w, w->h, foc ? RGB(0x3E, 0x3F, 0x45) : C_OUTLINE);
+    gfx_rect_fill(w->x + 1, w->y + 1, w->w - 2, w->h - 2, C_SURFACE);
     gfx_rect_fill(w->x + 1, w->y + WM_TITLE_H, w->w - 2, 1, C_RULE);
+    if (foc) gfx_rect_fill(w->x + 1, w->y + 1, w->w - 2, 1, C_ACCENT);
 
-    gfx_rrect_fill(w->x + 10, w->y + 7, 8, 8, 2, GFX_CORNERS_ALL, foc ? C_ACCENT : C_RULE);
-    text_fit(w->x + 26, w->y + WM_TITLE_H / 2 + 1, UIF_MED, w->title,
-             w->w - 26 - (w->resizable ? 82 : 58), foc ? C_INK : C_INK_DIM);
+    text_fit(w->x + 12, w->y + WM_TITLE_H / 2 + 1, UIF_MED, w->title,
+             w->w - 12 - (w->resizable ? 82 : 58), foc ? C_INK : C_INK_DIM);
 
     rect_t mb = min_btn(w), cb = close_btn(w), xb = max_btn(w);
     uint32_t glyph = foc ? C_GLYPH : C_GLYPH_DIM;
     if (w->resizable) {
         bool hv = hovered(HOV_MAX, idx);
-        if (hv) gfx_rrect_fill(xb.x0, xb.y0, xb.x1 - xb.x0, xb.y1 - xb.y0, 4, GFX_CORNERS_ALL, C_BTN_HOVER);
+        if (hv) gfx_rect_fill(xb.x0, xb.y0, xb.x1 - xb.x0, xb.y1 - xb.y0, C_BTN_HOVER);
         /* the glyph's cut-out uses C_SURFACE: paint it on the hover colour too */
         if (hv && w->maximized) {
             outline(xb.x0 + 9, xb.y0 + 4, 7, 7, C_INK);
@@ -1141,13 +1117,13 @@ static void draw_window(int idx, rect_t region, bool client_only) {
         }
     }
     if (hovered(HOV_MIN, idx)) {
-        gfx_rrect_fill(mb.x0, mb.y0, mb.x1 - mb.x0, mb.y1 - mb.y0, 4, GFX_CORNERS_ALL, C_BTN_HOVER);
+        gfx_rect_fill(mb.x0, mb.y0, mb.x1 - mb.x0, mb.y1 - mb.y0, C_BTN_HOVER);
         draw_min_glyph(mb, C_INK);
     } else {
         draw_min_glyph(mb, glyph);
     }
     if (hovered(HOV_CLOSE, idx)) {
-        gfx_rrect_fill(cb.x0, cb.y0, cb.x1 - cb.x0, cb.y1 - cb.y0, 4, GFX_CORNERS_ALL, C_DANGER);
+        gfx_rect_fill(cb.x0, cb.y0, cb.x1 - cb.x0, cb.y1 - cb.y0, C_DANGER);
         draw_close_glyph(cb, C_WHITE);
     } else {
         draw_close_glyph(cb, glyph);
@@ -1195,18 +1171,14 @@ static void draw_taskbar(void) {
     gfx_rect_fill(0, top, W, TASKBAR_H, C_BAR);
     gfx_rect_fill(0, top, W, 1, C_BAR_RULE);
 
-    /* start */
-    uint32_t sbg = menu_open ? C_BAR_ACTIVE : hovered(HOV_START, 0) ? C_BAR_HOVER : C_BAR;
-    if (sbg != C_BAR)
-        gfx_rrect_fill(tb_start.x0, tb_start.y0, tb_start.x1 - tb_start.x0,
-                       tb_start.y1 - tb_start.y0, 4, GFX_CORNERS_ALL, sbg);
-    int lx = tb_start.x0 + 12, ly = tb_start.y0 + 9;
-    gfx_rrect_fill(lx, ly, 11, 11, 2, GFX_CORNERS_ALL, C_ACCENT);
-    gfx_rect_fill(lx + 6, ly + 6, 5, 5, sbg);
-    text(tb_start.x0 + 32, tb_start.y0 + 13, UIF_BIG, "samara", C_BAR_TEXT);
-    gfx_rect_fill(tb_start.x1 + 8, top + 12, 1, 16, C_BAR_RULE);
+    /* start: just the word */
+    bool sh = menu_open || hovered(HOV_START, 0);
+    if (sh) gfx_rect_fill(tb_start.x0, tb_start.y0, tb_start.x1 - tb_start.x0, tb_start.y1 - tb_start.y0,
+                          menu_open ? C_BAR_ACTIVE : C_BAR_HOVER);
+    gfx_rect_fill(tb_start.x0 + 12, tb_start.y0 + 11, 6, 6, C_ACCENT);
+    text(tb_start.x0 + 24, tb_start.y0 + 14, UIF_MED, "samara", sh ? C_WHITE : C_BAR_TEXT);
 
-    /* window buttons */
+    /* window buttons: text, white + underline when focused */
     for (int i = 0; i < n_tb; i++) {
         int idx = tb_btn_win[i];
         window_t* w = &windows[idx];
@@ -1215,21 +1187,18 @@ static void draw_taskbar(void) {
         bool foc = (idx == focused_idx && !w->minimized) ||
                    (cnt > 1 && focused_idx >= 0 && windows[focused_idx].group == w->group && !windows[focused_idx].minimized);
         bool hv = hovered(HOV_TASK, idx);
-        if (foc || hv)
-            gfx_rrect_fill(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0, 4, GFX_CORNERS_ALL,
-                           foc ? C_BAR_ACTIVE : C_BAR_HOVER);
+        if (hv) gfx_rect_fill(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0, C_BAR_HOVER);
         uint32_t tc = foc || hv ? C_BAR_TEXT : w->minimized ? C_BAR_FAINT : C_BAR_DIM;
         int tw = b.x1 - b.x0 - 24;
-        if (cnt > 1) {                                   /* stacked: a count pill on the right */
+        if (cnt > 1) {                                   // stacked: "3" on the right
             char num[8];
             itoa(cnt, num, 10);
-            int pw = text_w(UIF_SMALL, num) + 12;
-            gfx_rrect_fill(b.x1 - 10 - pw, b.y0 + 6, pw, 16, 8, GFX_CORNERS_ALL, foc ? C_ACCENT : C_BAR_PILL_HV);
-            uif_draw_center(b.x1 - 10 - pw, b.y0 + 6, pw, 16, UIF_SMALL, num, foc ? C_BAR : C_BAR_TEXT);
-            tw -= pw + 6;
+            int nw = text_w(UIF_SMALL, num);
+            text(b.x1 - 12 - nw, b.y0 + 14, UIF_SMALL, num, foc ? C_ACCENT : C_BAR_FAINT);
+            tw -= nw + 8;
         }
         text_fit(b.x0 + 12, b.y0 + 14, UIF_REG, cnt > 1 && w->group == WG_TERMINAL ? "Terminal" : w->title, tw, tc);
-        if (foc) gfx_rect_fill(b.x0 + 10, b.y1 - 2, b.x1 - b.x0 - 20, 2, C_ACCENT);
+        if (foc) gfx_rect_fill(b.x0 + 12, b.y1 - 1, b.x1 - b.x0 - 24, 1, C_ACCENT);
     }
 
     /* network */
@@ -1239,47 +1208,45 @@ static void draw_taskbar(void) {
     int tw = text_w(UIF_REG, label);
     int nx = tb_net.x1 - tw;
     int ncy = tb_net.y0 + 14;
-    gfx_rrect_fill(nx - 14, ncy - 3, 6, 6, 3, GFX_CORNERS_ALL, net_key ? C_ONLINE : C_BAR_FAINT);
+    gfx_rect_fill(nx - 12, ncy - 2, 4, 4, net_key ? C_ONLINE : C_BAR_FAINT);
     text(nx, ncy, UIF_REG, label, net_key ? C_BAR_DIM : C_BAR_FAINT);
 
-    /* keyboard layout pill (click toggles) */
+    /* keyboard layout (click toggles) */
     bool ru = kbd_is_ru();
-    gfx_rrect_fill(tb_lang.x0, tb_lang.y0, tb_lang.x1 - tb_lang.x0, tb_lang.y1 - tb_lang.y0, 4,
-                   GFX_CORNERS_ALL, hovered(HOV_LANG, 0) ? C_BAR_PILL_HV : C_BAR_ACTIVE);
+    if (hovered(HOV_LANG, 0))
+        gfx_rect_fill(tb_lang.x0, tb_lang.y0, tb_lang.x1 - tb_lang.x0, tb_lang.y1 - tb_lang.y0, C_BAR_HOVER);
     uif_draw_center(tb_lang.x0, tb_lang.y0, tb_lang.x1 - tb_lang.x0, tb_lang.y1 - tb_lang.y0,
-                    UIF_SMALL, ru ? "RU" : "EN", ru ? C_ACCENT : C_BAR_TEXT);
+                    UIF_SMALL, ru ? "RU" : "EN", ru || hovered(HOV_LANG, 0) ? C_BAR_TEXT : C_BAR_DIM);
 
     /* clock */
     text(tb_clock.x1 - text_w(UIF_MED, clock_time), tb_clock.y0 + 9, UIF_MED, clock_time, C_BAR_TEXT);
-    text(tb_clock.x1 - text_w(UIF_SMALL, clock_date), tb_clock.y0 + 25, UIF_SMALL, clock_date, C_BAR_DIM);
+    text(tb_clock.x1 - text_w(UIF_SMALL, clock_date), tb_clock.y0 + 25, UIF_SMALL, clock_date, C_BAR_FAINT);
 }
 
 static void draw_menu(void) {
     rect_t m = menu_r;
     int w = m.x1 - m.x0, h = m.y1 - m.y0;
-    gfx_shadow(m.x0, m.y0 + SH_DY, w, h, MENU_R, SH_SIZE, 150);
-    gfx_rrect_fill(m.x0, m.y0, w, h, MENU_R, GFX_CORNERS_ALL, C_MENU_EDGE);
-    gfx_rrect_fill(m.x0 + 1, m.y0 + 1, w - 2, h - 2, MENU_R - 1, GFX_CORNERS_ALL, C_MENU);
+    gfx_shadow(m.x0, m.y0 + SH_DY, w, h, 0, SH_SIZE, 160);
+    gfx_rect_fill(m.x0, m.y0, w, h, C_MENU_EDGE);
+    gfx_rect_fill(m.x0 + 1, m.y0 + 1, w - 2, h - 2, C_MENU);
 
-    int hx = m.x0 + 18, hy = m.y0 + MENU_PAD + 10;
-    gfx_rrect_fill(hx, hy + 2, 11, 11, 2, GFX_CORNERS_ALL, C_ACCENT);
-    gfx_rect_fill(hx + 6, hy + 8, 5, 5, C_MENU);
-    int ex = text(hx + 20, hy + 8, UIF_BIG, "SamaraOS", C_BAR_TEXT);
-    text(ex + 8, hy + 8, UIF_SMALL, "0.5", C_BAR_FAINT);
-    gfx_rect_fill(m.x0 + 12, m.y0 + MENU_PAD + MENU_HEAD - 1, w - 24, 1, C_MENU_EDGE);
+    int hx = m.x0 + 20, hy = m.y0 + MENU_PAD + 18;
+    int ex = text(hx, hy, UIF_MED, "samara", C_BAR_TEXT);
+    text(ex + 8, hy, UIF_SMALL, "0.5", C_BAR_FAINT);
+    gfx_rect_fill(m.x0 + 1, m.y0 + MENU_PAD + MENU_HEAD - 1, w - 2, 1, C_MENU_EDGE);
 
     for (int i = 0; i < n_menu_seps; i++)
-        gfx_rect_fill(m.x0 + 12, menu_sep_y[i], w - 24, 1, C_MENU_EDGE);
+        gfx_rect_fill(m.x0 + 1, menu_sep_y[i], w - 2, 1, C_MENU_EDGE);
 
     for (int k = 0; k < n_menu_items; k++) {
         rect_t r = menu_item_r[k];
         const menu_entry_t* e = &menu_entries[menu_item_entry[k]];
         bool hv = hovered(HOV_MENU, k);
         if (hv) {
-            gfx_rrect_fill(r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0, 4, GFX_CORNERS_ALL, C_MENU_HOVER);
-            gfx_rect_fill(r.x0, r.y0 + 7, 2, 16, C_ACCENT);
+            gfx_rect_fill(r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0, C_MENU_HOVER);
+            gfx_rect_fill(r.x0, r.y0 + 8, 2, MENU_ITEM - 16, C_ACCENT);
         }
-        text(r.x0 + 14, r.y0 + MENU_ITEM / 2, UIF_REG, e->label, hv ? C_WHITE : C_BAR_TEXT);
+        text(r.x0 + 14, r.y0 + MENU_ITEM / 2, UIF_REG, e->label, hv ? C_WHITE : C_BAR_DIM);
         if (e->hint)
             text(r.x1 - 12 - text_w(UIF_SMALL, e->hint), r.y0 + MENU_ITEM / 2, UIF_SMALL, e->hint, C_BAR_FAINT);
     }

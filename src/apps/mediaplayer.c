@@ -2,6 +2,7 @@
    (PIT channel 2). Runs as a WM_APP window with on_paint / on_tick / on_click /
    on_key callbacks. The window manager paces it via wm_run's frame pacer. */
 
+#include "gui/theme.h"
 #include "apps/mediaplayer.h"
 #include "gui/wm.h"
 #include "gfx/gfx.h"
@@ -233,21 +234,22 @@ static void player_prev(void) {
 /* ------------------------------------------------------------------ */
 /*  Colours                                                            */
 /* ------------------------------------------------------------------ */
-#define COL_BG       RGB(0x18, 0x1B, 0x2A)
-#define COL_PANEL    RGB(0x22, 0x26, 0x3A)
-#define COL_PANEL_HI RGB(0x2C, 0x32, 0x4A)
-#define COL_FG       RGB(0xE6, 0xE8, 0xF2)
-#define COL_DIM      RGB(0x88, 0x90, 0xB0)
-#define COL_ACCENT   RGB(0x6E, 0xA8, 0xFE)
-#define COL_ACCENT2  RGB(0x9B, 0x6E, 0xFE)
-#define COL_PROG_BG  RGB(0x10, 0x12, 0x1E)
-#define COL_PROG_FG  RGB(0x44, 0xC8, 0x9A)
-#define COL_BTN      RGB(0x30, 0x38, 0x58)
-#define COL_BTN_HOT  RGB(0x44, 0x52, 0x80)
-#define COL_OK       RGB(0x44, 0xC8, 0x9A)
-#define COL_BAR_LO   RGB(0x3C, 0xC0, 0x90)
-#define COL_BAR_HI   RGB(0xFF, 0xC8, 0x40)
-#define COL_RED      RGB(0xE0, 0x60, 0x60)
+// was navy + blue, now the desktop's graphite + amber
+#define COL_BG       C_SURFACE
+#define COL_PANEL    C_PANEL
+#define COL_PANEL_HI C_OUTLINE
+#define COL_FG       C_INK
+#define COL_DIM      C_INK_DIM
+#define COL_ACCENT   C_ACCENT
+#define COL_ACCENT2  C_ACCENT
+#define COL_PROG_BG  RGB(0x10, 0x11, 0x14)
+#define COL_PROG_FG  C_ACCENT
+#define COL_BTN      RGB(0x23, 0x24, 0x28)
+#define COL_BTN_HOT  RGB(0x2E, 0x2F, 0x34)
+#define COL_OK       C_ACCENT
+#define COL_BAR_LO   RGB(0x55, 0x56, 0x5C)
+#define COL_BAR_HI   C_ACCENT
+#define COL_RED      C_DANGER
 
 /* ------------------------------------------------------------------ */
 /*  Drawing helpers                                                    */
@@ -269,7 +271,7 @@ static void fmt_mmss(uint32_t ms, char* out) {
 static void draw_button(int x, int y, int w, int h, const char* label,
                         bool hot, uint32_t face) {
     gfx_rect_fill(x, y, w, h, hot ? COL_BTN_HOT : face);
-    gfx_rect(x, y, w, h, COL_ACCENT);
+    gfx_rect(x, y, w, h, COL_PANEL_HI);
     int lw = (int)strlen(label) * 8;
     gfx_string(x + (w - lw) / 2, y + (h - 16) / 2, label, COL_FG,
                hot ? COL_BTN_HOT : face, false);

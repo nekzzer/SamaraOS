@@ -63,7 +63,11 @@
 
 /* ---------- colours (theme family) ---------- */
 #define COL_PAPER    RGB(0xFB, 0xFA, 0xF7)
-#define COL_TEXT     C_INK
+// page defaults are web colours, not the (dark) desktop theme: dark ink on paper
+#define PAGE_INK     RGB(0x1D, 0x1E, 0x21)
+#define PAGE_DIM     RGB(0x8C, 0x88, 0x80)
+#define PAGE_RULE    RGB(0xD4, 0xCF, 0xC6)
+#define COL_TEXT     PAGE_INK
 #define COL_LINK     RGB(0x1F, 0x5C, 0xB8)
 #define COL_LINK_HOV RGB(0xC2, 0x6A, 0x12)
 
@@ -4083,7 +4087,7 @@ static int lay_node(int n, const style_t* P) {
         }
         goto out;
     }
-    if (!strcmp(t, "hr") && !S.bw[0] && !S.bw[2] && !S.bga) { S.bw[0] = 1; S.bs[0] = 1; S.bc[0] = C_RULE; }
+    if (!strcmp(t, "hr") && !S.bw[0] && !S.bw[2] && !S.bga) { S.bw[0] = 1; S.bs[0] = 1; S.bc[0] = PAGE_RULE; }
     switch (d) {
     case D_INLINE:
     case D_CONTENTS:
@@ -4776,7 +4780,7 @@ static void thick_line(int x0, int y0, int x1, int y1, uint32_t c) {
 static void draw_icon(int i, box_t b, bool enabled) {
     bool hov = enabled && hover_btn == i;
     uint32_t bg = hov ? C_BTN_HOVER : C_SURFACE;
-    if (hov) gfx_rrect_fill(b.x, b.y, b.w, b.h, 7, GFX_CORNERS_ALL, bg);
+    if (hov) gfx_rect_fill(b.x, b.y, b.w, b.h, bg);
     uint32_t c = !enabled ? C_GLYPH_DIM : hov ? C_INK : C_GLYPH;
     int mx = b.x + b.w / 2, my = b.y + b.h / 2;
     switch (i) {
@@ -4811,32 +4815,35 @@ static void draw_icon(int i, box_t b, bool enabled) {
     }
 }
 
-/* Rounded text box; caret at `cur` when focused. Text scrolls to keep it visible. */
+/* Text box; caret at `cur` when focused. Text scrolls to keep it visible.
+   dark = the address bar up in the chrome, else a field on the page */
+#define URL_BG RGB(0x10, 0x11, 0x13)
 static void draw_textbox(int x, int y, int w, int h, const char* s, int len, int cur,
-                         bool foc, const char* placeholder) {
-    gfx_rrect_fill(x, y, w, h, 8, GFX_CORNERS_ALL, foc ? C_ACCENT : C_RULE);
-    int t = foc ? 2 : 1;
-    gfx_rrect_fill(x + t, y + t, w - 2 * t, h - 2 * t, 8 - t, GFX_CORNERS_ALL, C_WHITE);
+                         bool foc, const char* placeholder, bool dark) {
+    gfx_rect_fill(x, y, w, h, foc ? C_ACCENT : dark ? C_OUTLINE : PAGE_RULE);
+    gfx_rect_fill(x + 1, y + 1, w - 2, h - 2, dark ? URL_BG : C_WHITE);
+    uint32_t ink = dark ? C_INK : PAGE_INK, dim = dark ? C_INK_DIM : PAGE_DIM;
     int tx = x + 12, avail = w - 24;
     int cw = uif_width_n(UIF_REG, s, cur);
     int off = cw > avail ? cw - avail : 0;
     clip_to(x + 4, y + 2, w - 8, h - 4);
-    if (!len && placeholder) uif_draw_mid(tx, y + h / 2, UIF_REG, placeholder, C_INK_DIM);
+    if (!len && placeholder) uif_draw_mid(tx, y + h / 2, UIF_REG, placeholder, dim);
     if (foc && s == edit && edit_all)
-        gfx_rrect_fill(tx - 2 - off, y + 6, uif_width_n(UIF_REG, s, len) + 4, h - 12, 3, GFX_CORNERS_ALL, RGB(0xF6, 0xDC, 0xB0));
+        gfx_rect_fill(tx - 2 - off, y + 6, uif_width_n(UIF_REG, s, len) + 4, h - 12,
+                      dark ? RGB(0x5A, 0x40, 0x18) : RGB(0xF6, 0xDC, 0xB0));
     static char tmp[URL_MAX];
     int n = len < URL_MAX - 1 ? len : URL_MAX - 1;
     memcpy(tmp, s, (size_t)n);
     tmp[n] = 0;
-    uif_draw_mid(tx - off, y + h / 2, UIF_REG, tmp, C_INK);
+    uif_draw_mid(tx - off, y + h / 2, UIF_REG, tmp, ink);
     if (foc && !(s == edit && edit_all) && (now_ms / 530) % 2 == 0) gfx_rect_fill(tx - off + cw, y + 7, 2, h - 14, C_ACCENT);
     clip_restore();
 }
 
 /* Address bar while not editing: host dark, the rest dimmed. */
 static void draw_url_view(int x, int y, int w, int h) {
-    gfx_rrect_fill(x, y, w, h, 8, GFX_CORNERS_ALL, C_RULE);
-    gfx_rrect_fill(x + 1, y + 1, w - 2, h - 2, 7, GFX_CORNERS_ALL, C_WHITE);
+    gfx_rect_fill(x, y, w, h, C_OUTLINE);
+    gfx_rect_fill(x + 1, y + 1, w - 2, h - 2, URL_BG);
     clip_to(x + 4, y + 2, w - 8, h - 4);
     int tx = x + 12, mid = y + h / 2;
     const char* u = edit;
@@ -4947,7 +4954,7 @@ static void draw_run(int idx, int ox, int oy) {
         break;
     }
     case RK_RULE:
-        gfx_rect_fill(x, y, r->w, 1, C_RULE);
+        gfx_rect_fill(x, y, r->w, 1, PAGE_RULE);
         break;
     case RK_BULLET: {
         int my = y + r->h / 2 + 1;
@@ -4965,7 +4972,7 @@ static void draw_run(int idx, int ox, int oy) {
             stars[f->len] = 0;
             s = stars;
         }
-        draw_textbox(x, y, r->w, r->h, s, f->len, f->cur, focus == r->field, NULL);
+        draw_textbox(x, y, r->w, r->h, s, f->len, f->cur, focus == r->field, NULL, false);
         clip_to(view_box.x, view_box.y, view_box.w, view_box.h);
         break;
     }
@@ -4973,14 +4980,14 @@ static void draw_run(int idx, int ox, int oy) {
         img_t* im = r->field >= 0 && r->field < n_imgs ? &imgs[r->field] : NULL;
         uint32_t* s = im && im->st == IM_OK ? img_scaled(im, r->w, r->h, r->fg) : NULL;
         if (s) gfx_blit_argb(x, y, r->w, r->h, s);
-        else if (r->w > 8 && r->h > 8 && im && im->st != IM_BAD) gfx_rect(x, y, r->w, r->h, C_RULE);   /* still coming */
+        else if (r->w > 8 && r->h > 8 && im && im->st != IM_BAD) gfx_rect(x, y, r->w, r->h, PAGE_RULE);   /* still coming */
         if (r->link >= 0 && r->link == hover_link) gfx_rect(x, y, r->w, r->h, COL_LINK_HOV);
         break;
     }
     case RK_BUTTON: {
         bool hov = hover_run == idx;
         gfx_rrect_fill(x, y, r->w, r->h, 8, GFX_CORNERS_ALL, hov ? COL_BTN_HOT : C_ACCENT);
-        uif_draw_center(x, y, r->w, r->h, UIF_MED, pool + r->off, C_INK);
+        uif_draw_center(x, y, r->w, r->h, UIF_MED, pool + r->off, PAGE_INK);
         break;
     }
     }
@@ -5084,7 +5091,7 @@ static void br_paint(window_t* w) {
     }
     int ux = bx + 8, uw = cx + cw - 12 - ux;
     url_box = (box_t){ ux, by, uw, BTN };
-    if (focus == FOCUS_URL) draw_textbox(ux, by, uw, BTN, edit, edit_len, edit_cur, true, "Search or type an address");
+    if (focus == FOCUS_URL) draw_textbox(ux, by, uw, BTN, edit, edit_len, edit_cur, true, "Search or type an address", true);
     else draw_url_view(ux, by, uw, BTN);
     if (loading) {
         int seg = cw / 4, span = cw + seg;

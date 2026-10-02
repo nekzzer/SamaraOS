@@ -424,6 +424,9 @@ static int do_getdents64(int fd, uint8_t* buf, uint32_t n) {
     return (int)pos;
 }
 
+static bool is_shm(fs_node_t* n);
+static void shm_drop(fs_node_t* n);
+
 static int do_unlink(int dirfd, const char* path, int flags) {
     UCHK(path, 1);
     int err;
@@ -442,6 +445,7 @@ static int do_unlink(int dirfd, const char* path, int flags) {
     }
     fs_node_t* parent = n->parent;
     if (!parent) return -EBUSY;
+    if (is_shm(n)) shm_drop(n);       // mappings keep their own refs
     fs_detach(n);
     if (n->refs > 0) n->unlinked = true;
     else { fs_data_free(n); kfree(n); }
@@ -657,6 +661,51 @@ static uint32_t do_brk(uint32_t want) {
     return want;
 }
 
+/* /dev/shm files: frames live here, every MAP_SHARED of the node maps the
+   same ones. the file itself stays empty, read()/write() don't see it.
+   TODO: fork copies these pages instead of sharing */
+#define SHM_MAX 128
+static struct { fs_node_t* node; uint32_t* fr; uint32_t n; } shm[SHM_MAX];
+
+static bool is_shm(fs_node_t* n) {
+    return n->parent && !strcmp(n->parent->name, "shm") && n->parent->parent &&
+           !strcmp(n->parent->parent->name, "dev");
+}
+
+static void shm_drop(fs_node_t* n) {
+    for (int i = 0; i < SHM_MAX; i++) {
+        if (shm[i].node != n) continue;
+        for (uint32_t k = 0; k < shm[i].n; k++) pmm_unref(shm[i].fr[k]);
+        kfree(shm[i].fr);
+        shm[i].node = NULL;
+        shm[i].n = 0;
+    }
+}
+
+static uint32_t* shm_frames(fs_node_t* n, uint32_t pages) {
+    int s = -1;
+    for (int i = 0; i < SHM_MAX; i++) {
+        if (shm[i].node == n) { s = i; break; }
+        if (s < 0 && !shm[i].node) s = i;
+    }
+    if (s < 0) return NULL;
+    if (shm[s].node == n && shm[s].n >= pages) return shm[s].fr;
+    uint32_t* fr = (uint32_t*)kmalloc(pages * 4);
+    if (!fr) return NULL;
+    uint32_t had = shm[s].node == n ? shm[s].n : 0;
+    if (had) memcpy(fr, shm[s].fr, had * 4);
+    for (uint32_t k = had; k < pages; k++) {
+        fr[k] = pmm_alloc();
+        if (!fr[k]) { while (k-- > had) pmm_unref(fr[k]); kfree(fr); return NULL; }
+    }
+    if (had) kfree(shm[s].fr);
+    shm[s].node = n;
+    shm[s].fr = fr;
+    shm[s].n = pages;
+    return fr;
+}
+
+#define MAP_SHARED 0x01
 #define MAP_FIXED 0x10
 #define MAP_ANON  0x20
 #define PROT_WRITE 2
@@ -682,6 +731,15 @@ static int32_t do_mmap(uint32_t addr, uint32_t len, int prot, int flags, int fd,
     } else {
         addr = vmm_find_free(p->pd, lo, hi, len);
         if (!addr) return -ENOMEM;
+    }
+    if (f && f->type == F_NODE && (flags & MAP_SHARED) && is_shm(f->node)) {
+        uint32_t first = off / PAGE_SIZE, np = len / PAGE_SIZE;
+        uint32_t* fr = shm_frames(f->node, first + np);
+        if (!fr) return -ENOMEM;
+        for (uint32_t k = 0; k < np; k++)
+            vmm_map_frame(p->pd, addr + k * PAGE_SIZE, fr[first + k], (prot & PROT_WRITE) != 0);
+        vmm_flush();
+        return (int32_t)addr;
     }
     if (vmm_alloc_range(p->pd, addr, len, true) < 0) {
         vmm_free_range(p->pd, addr, len);
@@ -1511,7 +1569,7 @@ static int32_t dispatch(regs_t* r) {
         // eventfd(2), timerfd, signalfd(4), epoll*, memfd: not here yet. glib/qemu fall back
         // to pipes and poll on ENOSYS, so just say no without spamming the log
         case 323: case 328: case 322: case 325: case 326: case 321: case 327:
-        case 254: case 329: case 255: case 256: case 319: case 356:
+        case 254: case 329: case 255: case 256: case 319: case 356: case 375:
             return -ENOSYS;
         case 242:                                                    /* sched_getaffinity: one cpu, no smp yet */
             if (c < 4) return -EINVAL;

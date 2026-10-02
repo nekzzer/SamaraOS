@@ -43,7 +43,7 @@ static bool alt_on;
    as CGA so shell colour choices keep their meaning, but tuned to sit on the
    near-black terminal background without the neon of the original. */
 static const uint32_t color16[16] = {
-    RGB(0x11,0x12,0x15),   /* black    */
+    RGB(0x17,0x18,0x1B),   /* black = window surface (theme C_SURFACE) */
     RGB(0x3E,0x6B,0xA8),   /* blue     */
     RGB(0x5F,0x93,0x4A),   /* green    */
     RGB(0x3F,0x8E,0x8A),   /* cyan     */

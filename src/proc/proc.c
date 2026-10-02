@@ -718,6 +718,20 @@ bool proc_handle_fault(uint32_t addr, uint32_t err) {
     return vmm_alloc_range(p->pd, addr & ~(PAGE_SIZE - 1), PAGE_SIZE, true) == 0;
 }
 
+// top of the user stack on a segfault, addr2line the return addresses by hand.
+// no gdb in here, this is how yutani got debugged
+void proc_fault_stack(uint32_t esp) {
+    proc_t* p = proc_current();
+    if (!p) return;
+    klog("[proc] stack @"); klog_num(esp, 16); klog(":");
+    for (int i = 0; i < 256; i++) {
+        uint32_t a = esp + i * 4;
+        if (!(vmm_pte(p->pd, a) & PTE_P)) break;
+        klog(i % 8 ? " " : "\r\n  "); klog_num(*(uint32_t*)a, 16);
+    }
+    klog("\r\n");
+}
+
 void proc_fault_kill(const char* what, int sig, uint32_t eip, uint32_t addr) {
     proc_t* p = proc_current();
     klog("[proc] pid ");

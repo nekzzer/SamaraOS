@@ -1,5 +1,6 @@
 /* Classic snake in a WM window. Arrows/WASD = direction, R = restart. */
 
+#include "gui/theme.h"
 #include "apps/snake.h"
 #include "gui/wm.h"
 #include "gfx/gfx.h"
@@ -14,13 +15,13 @@
 #define HDR_H   24
 #define TICK_MS 120
 
-#define COL_BG    RGB(0x10, 0x14, 0x20)
-#define COL_GRID  RGB(0x18, 0x1D, 0x2C)
-#define COL_SNAKE RGB(0x50, 0xD0, 0x60)
-#define COL_HEAD  RGB(0x80, 0xF0, 0x90)
-#define COL_FOOD  RGB(0xE0, 0x50, 0x60)
-#define COL_TEXT  RGB(0xE6, 0xEA, 0xF4)
-#define COL_DIM   RGB(0x80, 0x88, 0xA0)
+#define COL_BG    C_SURFACE
+#define COL_GRID  RGB(0x1C, 0x1D, 0x21)
+#define COL_SNAKE RGB(0xB5, 0xB6, 0xBB)
+#define COL_HEAD  C_WHITE
+#define COL_FOOD  C_ACCENT
+#define COL_TEXT  C_INK
+#define COL_DIM   C_INK_DIM
 
 typedef struct { int x, y; } pt_t;
 
@@ -140,7 +141,7 @@ static void on_paint(window_t* w) {
 
     if (S.dead) {
         gfx_string(cx + cw/2 - 60, cy + ch/2 - 10, "GAME OVER (R = restart)",
-                   RGB(0xFF, 0x90, 0x90), 0, false);
+                   C_ACCENT, 0, false);
     } else if (S.paused) {
         gfx_string(cx + cw/2 - 30, cy + ch/2 - 10, "PAUSED", COL_TEXT, 0, false);
     }

@@ -264,7 +264,7 @@ static void draw_icon(tool_t t, int x, int y, uint32_t c) {
         gfx_rect_fill(x + 2, y + 15, 3, 2, c);
         break;
     case T_ERASER:
-        gfx_rrect_fill(x + 1, y + 5, 16, 9, 2, GFX_CORNERS_ALL, c);
+        gfx_rect_fill(x + 1, y + 5, 16, 9, c);
         gfx_rect_fill(x + 8, y + 7, 7, 5, C_SURFACE);
         gfx_rect_fill(x + 1, y + 16, 16, 1, c);
         break;
@@ -299,7 +299,7 @@ static void draw_icon(tool_t t, int x, int y, uint32_t c) {
 
 static void button_bg(int x, int y, int w, int h, bool active) {
     if (active) {
-        gfx_rrect_fill(x, y, w, h, 5, GFX_CORNERS_ALL, C_PRESSED);
+        gfx_rect_fill(x, y, w, h, C_PRESSED);
         gfx_rect_fill(x + 8, y + h - 3, w - 16, 2, C_ACCENT);
     }
 }
@@ -325,16 +325,16 @@ static void pt_paint(window_t* w) {
 
     /* brush size: [-] preview [+] */
     S.minus = (box_t){ x, by + 6, 24, 24 };
-    gfx_rrect_fill(cx + x, cy + by + 6, 24, 24, 5, GFX_CORNERS_ALL, C_PRESSED);
+    gfx_rect_fill(cx + x, cy + by + 6, 24, 24, C_PRESSED);
     gfx_rect_fill(cx + x + 7, cy + by + 17, 10, 2, C_INK);
     x += 28;
     int pv = cx + x + BTN / 2, pvy = cy + TB_H / 2;
     int pr = S.brush > 15 ? 15 : S.brush;
-    gfx_rrect_fill(cx + x, cy + by, BTN, BTN, 5, GFX_CORNERS_ALL, PAPER);
+    gfx_rect_fill(cx + x, cy + by, BTN, BTN, PAPER);
     gfx_disc(pv, pvy, pr < 1 ? 1 : pr, S.tool == T_ERASER ? C_RULE : S.color);
     x += BTN + 4;
     S.plus = (box_t){ x, by + 6, 24, 24 };
-    gfx_rrect_fill(cx + x, cy + by + 6, 24, 24, 5, GFX_CORNERS_ALL, C_PRESSED);
+    gfx_rect_fill(cx + x, cy + by + 6, 24, 24, C_PRESSED);
     gfx_rect_fill(cx + x + 7, cy + by + 17, 10, 2, C_INK);
     gfx_rect_fill(cx + x + 11, cy + by + 13, 2, 10, C_INK);
     x += 30;
@@ -347,17 +347,17 @@ static void pt_paint(window_t* w) {
 
     /* colours: current + 2x8 grid */
     S.cur_swatch = (box_t){ x, by, BTN, BTN };
-    gfx_rrect_fill(cx + x, cy + by, BTN, BTN, 6, GFX_CORNERS_ALL, C_OUTLINE);
-    gfx_rrect_fill(cx + x + 2, cy + by + 2, BTN - 4, BTN - 4, 4, GFX_CORNERS_ALL, S.color);
+    gfx_rect_fill(cx + x, cy + by, BTN, BTN, C_OUTLINE);
+    gfx_rect_fill(cx + x + 2, cy + by + 2, BTN - 4, BTN - 4, S.color);
     x += BTN + 10;
     int gy = (TB_H - (2 * SW + SW_GAP)) / 2;
     for (int i = 0; i < N_COLORS; i++) {
         int sx = x + (i % 8) * (SW + SW_GAP), sy = gy + (i / 8) * (SW + SW_GAP);
         S.swatch[i] = (box_t){ sx, sy, SW, SW };
         bool sel = palette[i] == S.color;
-        gfx_rrect_fill(cx + sx, cy + sy, SW, SW, 3, GFX_CORNERS_ALL, sel ? C_ACCENT : C_RULE);
-        gfx_rrect_fill(cx + sx + (sel ? 2 : 1), cy + sy + (sel ? 2 : 1),
-                       SW - (sel ? 4 : 2), SW - (sel ? 4 : 2), 2, GFX_CORNERS_ALL, palette[i]);
+        gfx_rect_fill(cx + sx, cy + sy, SW, SW, sel ? C_ACCENT : C_RULE);
+        gfx_rect_fill(cx + sx + (sel ? 2 : 1), cy + sy + (sel ? 2 : 1),
+                       SW - (sel ? 4 : 2), SW - (sel ? 4 : 2), palette[i]);
     }
 
     /* actions, right-aligned */
@@ -368,10 +368,9 @@ static void pt_paint(window_t* w) {
         S.action[a] = (box_t){ ax, by + 4, bw, BTN - 8 };
         bool primary = (a == A_SAVE);
         bool dim = (a == A_UNDO && !S.can_undo);
-        gfx_rrect_fill(cx + ax, cy + by + 4, bw, BTN - 8, 5, GFX_CORNERS_ALL,
-                       primary ? C_ACCENT : C_RULE);
+        gfx_rect_fill(cx + ax, cy + by + 4, bw, BTN - 8, primary ? C_ACCENT : C_RULE);
         if (!primary)
-            gfx_rrect_fill(cx + ax + 1, cy + by + 5, bw - 2, BTN - 10, 4, GFX_CORNERS_ALL, C_SURFACE);
+            gfx_rect_fill(cx + ax + 1, cy + by + 5, bw - 2, BTN - 10, C_SURFACE);
         uif_draw_center(cx + ax, cy + by + 4, bw, BTN - 8, UIF_MED, action_label[a],
                         dim ? C_GLYPH_DIM : C_INK);
         ax -= 6;
@@ -410,7 +409,7 @@ static void pt_paint(window_t* w) {
     if (S.msg[0]) {
         int mw = uif_width(UIF_MED, S.msg);
         int mx = dx - 24 - mw;
-        gfx_rrect_fill(mx - 6, mid - 5, 6, 6, 3, GFX_CORNERS_ALL, C_ONLINE);
+        gfx_rect_fill(mx - 6, mid - 5, 6, 6, C_ONLINE);
         uif_draw_mid(mx + 6, mid, UIF_MED, S.msg, C_INK);
     }
 }

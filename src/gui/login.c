@@ -210,9 +210,11 @@ static void card(int w, int h) {
         bg_rect(cx - 40, cy - 40, cw + 80, ch + 80);
         cw = w; ch = h;
         cx = (W - w) / 2; cy = (H - h) / 2;
-        gfx_shadow(cx, cy, cw, ch, 12, 24, 160);
+        gfx_shadow(cx, cy, cw, ch, 0, 16, 160);
     }
-    gfx_rrect_fill(cx, cy, cw, ch, 12, GFX_CORNERS_ALL, C_SURFACE);
+    // square card + 1px edge, same as the windows
+    gfx_rect_fill(cx, cy, cw, ch, C_OUTLINE);
+    gfx_rect_fill(cx + 1, cy + 1, cw - 2, ch - 2, C_SURFACE);
 }
 
 typedef struct { const char* label; char* buf; int cap; bool secret; } fld_t;
@@ -220,8 +222,8 @@ typedef struct { const char* label; char* buf; int cap; bool secret; } fld_t;
 static void draw_field(int x, int y, int w, fld_t* f, bool focus) {
     gfx_rect_fill(x, y, w, 56, C_SURFACE);
     uif_draw(x, y, UIF_SMALL, f->label, C_INK_DIM);
-    gfx_rrect_fill(x, y + 18, w, 36, 6, GFX_CORNERS_ALL, focus ? C_ACCENT : C_RULE);
-    gfx_rrect_fill(x + 2, y + 20, w - 4, 32, 4, GFX_CORNERS_ALL, C_WHITE);
+    gfx_rect_fill(x, y + 18, w, 36, focus ? C_ACCENT : C_OUTLINE);
+    gfx_rect_fill(x + 1, y + 19, w - 2, 34, RGB(0x10, 0x11, 0x14));   // dark field, light text
     char tmp[64];
     int n = strlen(f->buf);
     if (f->secret) { for (int i = 0; i < n && i < 63; i++) tmp[i] = '*'; tmp[n < 63 ? n : 63] = 0; }
