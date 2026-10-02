@@ -48,3 +48,4 @@ compile_commands.json
 
 # claude code instructions (local only)
 CLAUDE.md
+*.d
