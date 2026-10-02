@@ -1,0 +1,45 @@
+<!DOCTYPE html><html><head><title>Layout</title><style>
+body{font-family:sans-serif;margin:16px}
+.row{display:flex;gap:8px;margin:8px 0;background:#eee;padding:6px}
+.row > div{background:#9cf;padding:6px}
+.c{justify-content:center}.e{justify-content:flex-end}.sb{justify-content:space-between}.sa{justify-content:space-around}
+.g > div{flex:1}
+.g2 > div:first-child{flex:2}
+.wr{flex-wrap:wrap}.wr > div{width:120px}
+.col{flex-direction:column;align-items:center}
+.ai{align-items:center;height:auto}.ai > div:first-child{padding:20px 6px}
+.push > div:last-child{margin-left:auto;background:#fc9}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin:8px 0}
+.grid > div{background:#cfc;padding:6px}
+.grid .span{grid-column:1 / -1;background:#9c9}
+.grid2{display:grid;grid-template-columns:100px 1fr 2fr;gap:6px;margin:8px 0}
+.grid2 > div{background:#fcf;padding:6px}
+.auto{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:6px}
+.auto > div{background:#ffc;padding:6px;border:1px solid #cc9}
+.ib{display:inline-block;width:100px;padding:6px;margin:3px;background:#fdb;vertical-align:middle}
+.ib2{display:inline-block;padding:2px 10px;background:#333;color:#fff;border-radius:8px}
+table{border-collapse:collapse;margin:8px 0}td,th{border:1px solid #888;padding:4px 8px}
+th{background:#ddd}.num{text-align:right}
+.tbl{display:table;width:100%}.tr{display:table-row}.td{display:table-cell;padding:4px;border:1px solid #aaa}
+</style></head><body>
+<div class="row"><div>start</div><div>two</div><div>three</div></div>
+<div class="row c"><div>center</div><div>two</div></div>
+<div class="row e"><div>end</div><div>two</div></div>
+<div class="row sb"><div>between</div><div>two</div><div>three</div></div>
+<div class="row sa"><div>around</div><div>two</div><div>three</div></div>
+<div class="row g"><div>flex:1</div><div>flex:1</div><div>flex:1</div></div>
+<div class="row g g2"><div>flex:2</div><div>flex:1</div></div>
+<div class="row wr"><div>wrap 1</div><div>wrap 2</div><div>wrap 3</div><div>wrap 4</div><div>wrap 5</div><div>wrap 6</div><div>wrap 7</div><div>wrap 8</div></div>
+<div class="row col"><div>column</div><div>centered items</div></div>
+<div class="row ai"><div>tall</div><div>align-items:center</div></div>
+<div class="row push"><div>logo</div><div>menu</div><div>margin-left:auto</div></div>
+<div class="grid"><div>1</div><div>2</div><div>3</div><div class="span">span full row</div><div>4</div><div>5</div></div>
+<div class="grid2"><div>100px</div><div>1fr</div><div>2fr</div></div>
+<div class="auto"><div>auto-fill</div><div>minmax</div><div>150px</div><div>1fr</div><div>five</div></div>
+<p>inline-block: <span class="ib">one</span><span class="ib">two</span><span class="ib">three</span> and a <span class="ib2">badge</span> in text.</p>
+<table><tr><th>Name</th><th>Qty</th><th>Price</th></tr>
+<tr><td>Apples</td><td class="num">3</td><td class="num">1.20</td></tr>
+<tr><td>Longer product name</td><td class="num">12</td><td class="num">10.00</td></tr>
+<tr><td colspan="2">colspan 2</td><td class="num">11.20</td></tr></table>
+<div class="tbl"><div class="tr"><div class="td">display:table-cell</div><div class="td">second</div></div></div>
+</body></html>

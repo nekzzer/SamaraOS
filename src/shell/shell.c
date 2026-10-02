@@ -16,6 +16,7 @@
 #include "gfx/gfx.h"
 #include "gfx/gfx_term.h"
 #include "gui/wm.h"
+#include "gui/login.h"
 #include "proc/proc.h"
 
 fs_node_t *cwd;
@@ -109,7 +110,16 @@ static void banner(void) {
 static void prompt(void) {
   char path[256];
   fs_path(cwd, path, sizeof(path));
-  grad_puts("user@samara", G_SUNSET, 3);
+  char who[64];
+  strcpy(who, login_user);
+  strcat(who, "@");
+  fs_node_t *hn = fs_resolve(fs_root(), "/etc/hostname");
+  int k = strlen(who);
+  if (hn && hn->data && hn->size)
+    for (int i = 0; i < (int)hn->size && hn->data[i] != '\n' && k < 63; i++)
+      who[k++] = hn->data[i];
+  who[k] = 0;
+  grad_puts(who, G_SUNSET, 3);
   vga_set_color(VGA_DGREY, VGA_BLACK);
   vga_putc(':');
   grad_puts(path, G_SEA, 3);
@@ -689,6 +699,7 @@ static cmd_t cmds[] = {{"help", cmd_help},
                        {"music", cmd_player},
                        {"paint", cmd_paint},
                        {"clock", cmd_clock},
+                       {"term", cmd_term},
                        {"playwav", cmd_playwav},
                        {"stopwav", cmd_stopwav},
                        {"sbinfo", cmd_sbinfo},

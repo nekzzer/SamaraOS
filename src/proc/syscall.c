@@ -20,6 +20,7 @@
 #include "drivers/ata.h"
 #include "net/sock.h"
 #include "fs/fatfs.h"
+#include "fs/ext2.h"
 #include "net/net.h"
 
 #define EPERM 1
@@ -78,9 +79,27 @@ static void klog_num(int32_t v) { char b[16]; itoa(v, b, 10); klog(b); }
 
 static bool uok(const void* p, uint32_t len) {
     uint32_t a = (uint32_t)p;
-    return a >= USER_BASE && a < USER_TOP && len <= USER_TOP - a;
+    if (a < USER_BASE || a >= USER_TOP || len > USER_TOP - a) return false;
+    /* pages have to be there too, otherwise teh kernel faults on them.
+       the stack is grown lazily by the fault handler so skip it */
+    uint32_t pd = proc_current()->pd;
+    for (uint32_t pg = a & ~(PAGE_SIZE - 1); pg < a + len; pg += PAGE_SIZE) {
+        if (pg >= USER_STACK_TOP - USER_STACK_MAX) break;
+        if (!(vmm_pte(pd, pg) & PTE_P)) return false;
+    }
+    return true;
 }
 #define UCHK(p, n) do { if (!uok((p), (n))) return -EFAULT; } while (0)
+
+/* user string: walk it page by page till the NUL */
+static bool ustr_ok(const char* s) {
+    uint32_t a = (uint32_t)s;
+    for (;;) {
+        if (!uok((const void*)a, 1)) return false;
+        uint32_t end = (a | (PAGE_SIZE - 1)) + 1;
+        for (; a < end; a++) if (!*(const char*)a) return true;
+    }
+}
 
 /* ---------------- fds + paths ---------------- */
 
@@ -88,25 +107,29 @@ static proc_t* me(void) { return proc_current(); }
 
 static file_t* getf(int fd) {
     if (fd < 0 || fd >= MAX_FDS) return NULL;
-    return me()->fds[fd];
+    return me()->sh->fds[fd];
 }
 
 static int alloc_fd(int from) {
     for (int i = from < 0 ? 0 : from; i < MAX_FDS; i++)
-        if (!me()->fds[i]) return i;
+        if (!me()->sh->fds[i]) return i;
     return -EMFILE;
 }
 
 static int install_fd(file_t* f, int from, bool cloexec) {
+    uint32_t fl = irq_save();                /* threads share the table */
     int fd = alloc_fd(from);
-    if (fd < 0) { file_close(f); return fd; }
-    me()->fds[fd] = f;
-    me()->cloexec[fd] = cloexec;
+    if (fd >= 0) {
+        me()->sh->fds[fd] = f;
+        me()->sh->cloexec[fd] = cloexec;
+    }
+    irq_restore(fl);
+    if (fd < 0) file_close(f);
     return fd;
 }
 
 static fs_node_t* dir_base(int dirfd, const char* path, int* err) {
-    if (path[0] == '/' || dirfd == AT_FDCWD) return me()->cwd;
+    if (path[0] == '/' || dirfd == AT_FDCWD) return me()->sh->cwd;
     file_t* f = getf(dirfd);
     if (!f) { *err = -EBADF; return NULL; }
     if (f->type != F_NODE || f->node->type != FS_DIR) { *err = -ENOTDIR; return NULL; }
@@ -125,20 +148,23 @@ static void maybe_refresh_proc(fs_node_t* base, const char* path) {
         procfs_refresh();
 }
 
-static fs_node_t* lookup(int dirfd, const char* path, int* err) {
+static fs_node_t* lookup_ex(int dirfd, const char* path, int* err, bool follow) {
     *err = -ENOENT;
+    if (!ustr_ok(path)) { *err = -EFAULT; return NULL; }
     if (!path[0]) return NULL;
     fs_node_t* base = dir_base(dirfd, path, err);
     if (!base) return NULL;
     maybe_refresh_proc(base, path);
-    fs_node_t* n = fs_resolve(base, path);
+    fs_node_t* n = follow ? fs_resolve(base, path) : fs_resolve_nf(base, path);
     if (!n) *err = -ENOENT;
     return n;
 }
+static fs_node_t* lookup(int dirfd, const char* path, int* err) { return lookup_ex(dirfd, path, err, true); }
 
 /* Split "a/b/c/" into parent node of "c" and the name "c". */
 static fs_node_t* lookup_parent(int dirfd, const char* path, char* name, int* err) {
     char tmp[256];
+    if (!ustr_ok(path)) { *err = -EFAULT; return NULL; }
     int len = (int)strlen(path);
     if (len == 0) { *err = -ENOENT; return NULL; }
     if (len >= (int)sizeof(tmp)) { *err = -ENAMETOOLONG; return NULL; }
@@ -189,7 +215,8 @@ static void fill_stat_node(kstat64_t* st, fs_node_t* n) {
     if (FS_DEV_IS_DISK(n->dev)) {
         int idx = n->dev - FS_DEV_DISK;
         st->st_mode = 0060000 | (n->mode & 07777);            /* S_IFBLK */
-        st->st_rdev = idx >= DISK_AHCI_BASE ? ((8u << 8) | (uint32_t)(idx - DISK_AHCI_BASE) * 16)
+        st->st_rdev = idx >= DISK_VIRTIO_BASE ? ((253u << 8) | (uint32_t)(idx - DISK_VIRTIO_BASE) * 16) :
+                      idx >= DISK_AHCI_BASE ? ((8u << 8) | (uint32_t)(idx - DISK_AHCI_BASE) * 16)
                                             : ((3u << 8) | (uint32_t)idx * 64);
         st->st_size = (int64_t)ata_drive_sectors(idx) * 512;
     } else if (n->dev) {
@@ -201,6 +228,9 @@ static void fill_stat_node(kstat64_t* st, fs_node_t* n) {
     } else if (n->type == FS_DIR) {
         st->st_mode = S_IFDIR | (n->mode & 07777);
         st->st_size = 4096;
+    } else if (n->type == FS_LINK) {
+        st->st_mode = 0120000 | 0777;                            /* S_IFLNK */
+        st->st_size = n->size;
     } else {
         st->st_mode = S_IFREG | (n->mode & 07777);
         st->st_size = n->size;
@@ -232,6 +262,15 @@ static void fill_stat_file(kstat64_t* st, file_t* f) {
 static int do_readlink(const char* path, char* buf, uint32_t n) {
     UCHK(path, 1);
     UCHK(buf, n);
+    {
+        int err;
+        fs_node_t* ln = lookup_ex(AT_FDCWD, path, &err, false);
+        if (ln && ln->type == FS_LINK) {
+            uint32_t k = ln->size < n ? (uint32_t)ln->size : n;
+            memcpy(buf, ln->data, k);
+            return (int)k;
+        }
+    }
     const char* p = path;
     if (strncmp(p, "/proc/", 6)) return -EINVAL;
     p += 6;
@@ -239,7 +278,7 @@ static int do_readlink(const char* path, char* buf, uint32_t n) {
     else {
         int pid = 0;
         while (*p >= '0' && *p <= '9') pid = pid * 10 + (*p++ - '0');
-        if (*p++ != '/' || pid != me()->pid) return -EINVAL;
+        if (*p++ != '/' || pid != me()->tgid) return -EINVAL;
     }
     if (strncmp(p, "fd/", 3)) return -EINVAL;
     p += 3;
@@ -285,7 +324,7 @@ static int do_open(int dirfd, const char* path, int flags, int mode) {
         if (!parent) return err;
         n = fs_create(parent, name, FS_FILE);
         if (!n) return -EACCES;
-        n->mode = (uint16_t)(mode & ~me()->umask & 07777);
+        n->mode = (uint16_t)(mode & ~me()->sh->umask & 07777);
     }
     if ((flags & O_DIRECTORY) && n->type != FS_DIR) return -ENOTDIR;
     if (n->type == FS_DIR && (flags & O_ACCMODE) != 0) return -EISDIR;
@@ -377,7 +416,7 @@ static int do_getdents64(int fd, uint8_t* buf, uint32_t n) {
         memcpy(d + 8, &next, 8);
         uint16_t rl = (uint16_t)reclen;
         memcpy(d + 16, &rl, 2);
-        d[18] = node->dev ? 2 : node->type == FS_DIR ? 4 : 8;
+        d[18] = node->dev ? 2 : node->type == FS_DIR ? 4 : node->type == FS_LINK ? 10 : 8;
         memcpy(d + 19, name, nl + 1);
         pos += reclen;
         f->off = idx + 1;
@@ -388,7 +427,7 @@ static int do_getdents64(int fd, uint8_t* buf, uint32_t n) {
 static int do_unlink(int dirfd, const char* path, int flags) {
     UCHK(path, 1);
     int err;
-    fs_node_t* n = lookup(dirfd, path, &err);
+    fs_node_t* n = lookup_ex(dirfd, path, &err, false);
     if (!n) return err;
     if (flags & AT_REMOVEDIR) {
         if (n->type != FS_DIR) return -ENOTDIR;
@@ -396,7 +435,7 @@ static int do_unlink(int dirfd, const char* path, int flags) {
         if (n == fs_root()) return -EBUSY;
         for (int i = 0; i < proc_count(); i++) {
             proc_t* p = proc_at(i);
-            if (p && p->cwd == n) return -EBUSY;
+            if (p && p->sh->cwd == n) return -EBUSY;
         }
     } else if (n->type == FS_DIR) {
         return -EISDIR;
@@ -418,7 +457,7 @@ static int do_mkdir(int dirfd, const char* path, int mode) {
     if (!parent) return err;
     fs_node_t* n = fs_create(parent, name, FS_DIR);
     if (!n) return -EEXIST;
-    n->mode = (uint16_t)(mode & ~me()->umask & 07777);
+    n->mode = (uint16_t)(mode & ~me()->sh->umask & 07777);
     return 0;
 }
 
@@ -430,7 +469,7 @@ static bool is_ancestor(fs_node_t* a, fs_node_t* n) {
 static int do_rename(int ofd, const char* from, int nfd, const char* to) {
     UCHK(from, 1); UCHK(to, 1);
     int err;
-    fs_node_t* src = lookup(ofd, from, &err);
+    fs_node_t* src = lookup_ex(ofd, from, &err, false);
     if (!src) return err;
     char name[FS_NAME_MAX];
     fs_node_t* parent = lookup_parent(nfd, to, name, &err);
@@ -470,10 +509,10 @@ static int do_dup2(int fd, int nfd, bool cloexec) {
     if (!f) return -EBADF;
     if (nfd < 0 || nfd >= MAX_FDS) return -EBADF;
     if (fd == nfd) return nfd;
-    if (me()->fds[nfd]) file_close(me()->fds[nfd]);
+    if (me()->sh->fds[nfd]) file_close(me()->sh->fds[nfd]);
     file_ref(f);
-    me()->fds[nfd] = f;
-    me()->cloexec[nfd] = cloexec;
+    me()->sh->fds[nfd] = f;
+    me()->sh->cloexec[nfd] = cloexec;
     return nfd;
 }
 
@@ -483,8 +522,8 @@ static int do_fcntl(int fd, int cmd, uint32_t arg) {
     switch (cmd) {
         case 0:    return do_dup(fd, (int)arg, false);          /* F_DUPFD */
         case 1030: return do_dup(fd, (int)arg, true);           /* F_DUPFD_CLOEXEC */
-        case 1:    return me()->cloexec[fd] ? 1 : 0;            /* F_GETFD */
-        case 2:    me()->cloexec[fd] = arg & 1; return 0;       /* F_SETFD */
+        case 1:    return me()->sh->cloexec[fd] ? 1 : 0;            /* F_GETFD */
+        case 2:    me()->sh->cloexec[fd] = arg & 1; return 0;       /* F_SETFD */
         case 3:    return f->flags;                              /* F_GETFL */
         case 4:    f->flags = (f->flags & O_ACCMODE) | (int)(arg & (O_APPEND | O_NONBLOCK)); return 0;
         case 5: case 6: case 7: case 12: case 13: case 14:       /* locks: always granted */
@@ -502,7 +541,7 @@ static int do_pipe(int* fds, int flags) {
     int a = install_fd(r, 0, (flags & O_CLOEXEC) != 0);
     if (a < 0) { file_close(w); return a; }
     int b = install_fd(w, 0, (flags & O_CLOEXEC) != 0);
-    if (b < 0) { file_close(me()->fds[a]); me()->fds[a] = NULL; return b; }
+    if (b < 0) { file_close(me()->sh->fds[a]); me()->sh->fds[a] = NULL; return b; }
     fds[0] = a;
     fds[1] = b;
     return 0;
@@ -600,21 +639,21 @@ static int do_ioctl(int fd, uint32_t req, uint32_t arg) {
 
 static uint32_t do_brk(uint32_t want) {
     proc_t* p = me();
-    if (want < p->brk_start || want >= USER_MMAP_BASE) return p->brk;
-    uint32_t old_top = (p->brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (want < p->sh->brk_start || want >= USER_MMAP_BASE) return p->sh->brk;
+    uint32_t old_top = (p->sh->brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     uint32_t new_top = (want + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     if (new_top > old_top) {
-        if (!vmm_range_unmapped(p->pd, old_top, new_top - old_top)) return p->brk;
+        if (!vmm_range_unmapped(p->pd, old_top, new_top - old_top)) return p->sh->brk;
         if (vmm_alloc_range(p->pd, old_top, new_top - old_top, true) < 0) {
             vmm_free_range(p->pd, old_top, new_top - old_top);
             vmm_flush();
-            return p->brk;
+            return p->sh->brk;
         }
     } else if (new_top < old_top) {
         vmm_free_range(p->pd, new_top, old_top - new_top);
         vmm_flush();
     }
-    p->brk = want;
+    p->sh->brk = want;
     return want;
 }
 
@@ -730,7 +769,7 @@ static int do_poll(pollfd_t* fds, uint32_t n, int timeout_ms) {
         int r = poll_once(fds, n);
         if (r || timeout_ms == 0) return r;
         if (timeout_ms > 0 && pit_uptime_ms() - start >= (uint32_t)timeout_ms) return 0;
-        task_yield();
+        task_sleep_ms(1);
     }
 }
 
@@ -770,7 +809,7 @@ static int do_select(int n, uint32_t* rd, uint32_t* wr, uint32_t* ex, int timeou
             }
             return ready;
         }
-        task_yield();
+        task_sleep_ms(1);
     }
 }
 
@@ -800,7 +839,7 @@ static int do_uname(char* u) {
 static int do_getcwd(char* buf, uint32_t size) {
     UCHK(buf, size);
     char path[256];
-    fs_path(me()->cwd, path, sizeof(path));
+    fs_path(me()->sh->cwd, path, sizeof(path));
     uint32_t n = strlen(path) + 1;
     if (n > size) return -ERANGE;
     memcpy(buf, path, n);
@@ -809,7 +848,7 @@ static int do_getcwd(char* buf, uint32_t size) {
 
 static int do_chdir(fs_node_t* n) {
     if (n->type != FS_DIR) return -ENOTDIR;
-    me()->cwd = n;
+    me()->sh->cwd = n;
     return 0;
 }
 
@@ -956,7 +995,7 @@ static int do_socketpair(uint32_t domain, uint32_t type, uint32_t proto, int* sv
     int a = install_fd(x, 0, cx);
     if (a < 0) { file_close(y); return a; }
     int b = install_fd(y, 0, cx);
-    if (b < 0) { file_close(me()->fds[a]); me()->fds[a] = NULL; return b; }
+    if (b < 0) { file_close(me()->sh->fds[a]); me()->sh->fds[a] = NULL; return b; }
     sv[0] = a;
     sv[1] = b;
     return 0;
@@ -1103,26 +1142,35 @@ static int32_t sys_socket_call(int call, uint32_t a, uint32_t b, uint32_t c,
 
 /* ---------------- dispatcher ---------------- */
 
+static int do_futex(uint32_t uaddr, uint32_t op, uint32_t val, uint32_t d, uint32_t uaddr2, uint32_t val3, bool t64) {
+    int cmd = op & 127;
+    uint32_t tmo = 0xFFFFFFFFu;
+    if (d && (cmd == 0 || cmd == 9)) {
+        UCHK((void*)d, t64 ? 16 : 8);
+        uint32_t* ts = (uint32_t*)d;
+        uint64_t ms = (uint64_t)ts[0] * 1000 + (t64 ? ts[2] : ts[1]) / 1000000;
+        if (cmd == 9) {                                    /* absolute deadline */
+            uint64_t now;
+            if (op & 256) { uint32_t s, ns; clock_now(&s, &ns); now = (uint64_t)s * 1000 + ns / 1000000; }
+            else now = pit_uptime_ms();
+            ms = ms > now ? ms - now : 0;
+        }
+        if (ms < 0xFFFFFFF0ull) tmo = (uint32_t)ms;
+    } else if (cmd == 3 || cmd == 4) tmo = d;              /* val2 */
+    return futex_op(uaddr, op, val, tmo, uaddr2, val3);
+}
+
 static int32_t dispatch(regs_t* r) {
     uint32_t a = r->ebx, b = r->ecx, c = r->edx, d = r->esi, e = r->edi, f6 = r->ebp;
     proc_t* p = me();
     int err;
     fs_node_t* n;
     switch (r->eax) {
-        case 1: case 252: proc_exit((int)((a & 0xFF) << 8));
+        case 1:   proc_thread_exit((int)((a & 0xFF) << 8));
+        case 252: proc_exit((int)((a & 0xFF) << 8));
         case 2:   return proc_fork(r);
         case 190: return proc_vfork(r);
-        case 120: {                                                  /* clone */
-            int pid = proc_fork(r);
-            (void)d; (void)e;
-            if (pid > 0 && b) {
-                /* The child starts on the caller-provided stack. */
-                proc_t* ch = proc_by_pid(pid);
-                task_t* t = ch ? task_at(ch->task) : NULL;
-                if (t) ((regs_t*)t->esp)->useresp = b;
-            }
-            return pid;
-        }
+        case 120: return proc_clone(r);
         case 3:   return do_read((int)a, (char*)b, c);
         case 4:   return do_write((int)a, (const char*)b, c);
         case 145: return do_rwv((int)a, (iovec_t*)b, (int)c, false);
@@ -1143,13 +1191,25 @@ static int32_t dispatch(regs_t* r) {
         case 6: {
             file_t* fl = getf((int)a);
             if (!fl) return -EBADF;
-            p->fds[a] = NULL;
+            p->sh->fds[a] = NULL;
             file_close(fl);
             return 0;
         }
         case 7:   return do_wait((int)a, (int*)b, (int)c);
         case 114: return do_wait((int)a, (int*)b, (int)c);
-        case 9: case 83: case 304: case 14: case 297: return -EPERM;   /* link/symlink/mknod */
+        case 83: case 304: {                                          /* symlink / symlinkat */
+            const char* tg = (const char*)a;
+            bool at = r->eax == 304;
+            const char* lp = at ? (const char*)c : (const char*)b;
+            int dfd = at ? (int)b : AT_FDCWD;
+            UCHK(tg, 1); UCHK(lp, 1);
+            char name[FS_NAME_MAX];
+            fs_node_t* par = lookup_parent(dfd, lp, name, &err);
+            if (!par) return err;
+            if (fs_child(par, name)) return -EEXIST;
+            return fs_symlink(par, name, tg) ? 0 : -ENOMEM;
+        }
+        case 9: case 14: case 297: return -EPERM;                     /* link/mknod */
         case 10:  return do_unlink(AT_FDCWD, (const char*)a, 0);
         case 301: return do_unlink((int)a, (const char*)b, (int)c);
         case 40:  return do_unlink(AT_FDCWD, (const char*)a, AT_REMOVEDIR);
@@ -1186,8 +1246,12 @@ static int32_t dispatch(regs_t* r) {
             if (fl->type == F_NODE) fl->node->mode = (uint16_t)(b & 07777);
             return 0;
         }
-        case 186: if (b) { UCHK((void*)b, 12); memset((void*)b, 0, 12); ((uint32_t*)b)[1] = 2; } return 0;  /* sigaltstack: SS_DISABLE */
+        case 186:                                                    /* sigaltstack */
+            if (a) UCHK((void*)a, 12);
+            if (b) UCHK((void*)b, 12);
+            return proc_sigaltstack((const uint32_t*)a, (uint32_t*)b, r->useresp);
         case 36: case 118: case 148: case 344:                       /* sync, fsync, fdatasync, syncfs */
+            ext2_sync_all();
             return fatfs_sync_all();
         case 21: {                                                   /* mount */
             UCHK((void*)b, 1);
@@ -1214,7 +1278,7 @@ static int32_t dispatch(regs_t* r) {
             if (FS_DEV_IS_DISK(n->dev)) return -EINVAL;              /* give the mount point */
             for (int i = 0; i < proc_count(); i++) {
                 proc_t* q = proc_at(i);
-                for (fs_node_t* w = q ? q->cwd : NULL; w; w = w->parent)
+                for (fs_node_t* w = q ? q->sh->cwd : NULL; w; w = w->parent)
                     if (w == n) return -EBUSY;
             }
             return fatfs_umount(n);
@@ -1232,9 +1296,9 @@ static int32_t dispatch(regs_t* r) {
             memcpy((void*)d, &res, 8);
             return 0;
         }
-        case 20:  return p->pid;
-        case 224: return p->pid;
-        case 64:  return p->ppid ? p->ppid : 1;
+        case 20:  return p->tgid;
+        case 224: return p->pid;                                     /* gettid */
+        case 64: { proc_t* l = p->is_thread ? proc_by_pid(p->tgid) : p; int pp = l ? l->ppid : p->ppid; return pp ? pp : 1; }
         case 24: case 47: case 49: case 50: case 199: case 200: case 201: case 202: return 0;
         case 29:                                                     /* pause */
             while (!proc_interrupted()) task_sleep_ms(10);
@@ -1245,7 +1309,7 @@ static int32_t dispatch(regs_t* r) {
         case 238: case 270: {                                        /* tkill / tgkill */
             int pid = r->eax == 238 ? (int)a : (int)b, sig = r->eax == 238 ? (int)b : (int)c;
             proc_t* t = proc_by_pid(pid);
-            return t ? proc_send_signal(t, sig) : -ESRCH;
+            return t ? proc_send_signal_tid(t, sig) : -ESRCH;
         }
         case 38:  return do_rename(AT_FDCWD, (const char*)a, AT_FDCWD, (const char*)b);
         case 302: case 353: return do_rename((int)a, (const char*)b, (int)c, (const char*)d);
@@ -1266,14 +1330,14 @@ static int32_t dispatch(regs_t* r) {
         case 57: {                                                   /* setpgid */
             proc_t* t = a ? proc_by_pid((int)a) : p;
             if (!t) return -ESRCH;
-            t->pgid = b ? (int)b : t->pid;
+            t->pgid = b ? (int)b : t->tgid;
             return 0;
         }
         case 65:  return p->pgid;
         case 132: { proc_t* t = a ? proc_by_pid((int)a) : p; return t ? t->pgid : -ESRCH; }
         case 147: { proc_t* t = a ? proc_by_pid((int)a) : p; return t ? t->sid : -ESRCH; }
-        case 66:  p->sid = p->pgid = p->pid; p->ctty = -1; return p->pid;   /* setsid: no terminal */
-        case 60:  { int old = p->umask; p->umask = (int)(a & 0777); return old; }
+        case 66:  p->sid = p->pgid = p->tgid; p->ctty = -1; return p->tgid;   /* setsid: no terminal */
+        case 60:  { int old = p->sh->umask; p->sh->umask = (int)(a & 0777); return old; }
         case 174: case 67:                                           /* rt_sigaction / sigaction */
             if (b) UCHK((void*)b, 20);
             if (c) UCHK((void*)c, 20);
@@ -1403,8 +1467,9 @@ static int32_t dispatch(regs_t* r) {
         case 340: {                                                  /* prlimit64 */
             if (d) {
                 UCHK((void*)d, 16);
-                uint32_t lim[2];
-                do_rlimit((int)b, lim);
+                uint32_t lim[2] = { 0xFFFFFFFFu, 0xFFFFFFFFu };   // do_rlimit UCHKs, a kernel stack ptr fails it
+                if (b == 3) lim[0] = lim[1] = USER_STACK_MAX;
+                if (b == 7) lim[0] = lim[1] = MAX_FDS;
                 uint32_t* o = (uint32_t*)d;
                 o[0] = lim[0]; o[1] = lim[0] == 0xFFFFFFFFu ? 0xFFFFFFFFu : 0;
                 o[2] = lim[1]; o[3] = lim[1] == 0xFFFFFFFFu ? 0xFFFFFFFFu : 0;
@@ -1413,7 +1478,7 @@ static int32_t dispatch(regs_t* r) {
         }
         case 195: case 196:                                          /* stat64 / lstat64 */
             UCHK((void*)a, 1); UCHK((void*)b, sizeof(kstat64_t));
-            n = lookup(AT_FDCWD, (const char*)a, &err);
+            n = lookup_ex(AT_FDCWD, (const char*)a, &err, r->eax == 195);
             if (!n) return err;
             fill_stat_node((kstat64_t*)b, n);
             return 0;
@@ -1432,14 +1497,21 @@ static int32_t dispatch(regs_t* r) {
                 fill_stat_file((kstat64_t*)c, fl);
                 return 0;
             }
-            n = lookup((int)a, (const char*)b, &err);
+            n = lookup_ex((int)a, (const char*)b, &err, !(d & 0x100));   /* AT_SYMLINK_NOFOLLOW */
             if (!n) return err;
             fill_stat_node((kstat64_t*)c, n);
             return 0;
         }
         case 220: return do_getdents64((int)a, (uint8_t*)b, c);
-        case 240: return 0;                                          /* futex: single-threaded */
+        case 240: return do_futex(a, b, c, d, e, f6, false);
+        case 422: return do_futex(a, b, c, d, e, f6, true);       /* futex_time64 */
         case 219: return 0;                                          /* madvise: advisory */
+        case 242:                                                    /* sched_getaffinity: one cpu, no smp yet */
+            if (c < 4) return -EINVAL;
+            UCHK((void*)d, c);
+            memset((void*)d, 0, c);
+            *(uint32_t*)d = 1;
+            return 4;
         case 243: {                                                  /* set_thread_area */
             UCHK((void*)a, 16);
             uint32_t* ud = (uint32_t*)a;

@@ -1,5 +1,6 @@
 #include "net/net.h"
 #include "drivers/rtl8139.h"
+#include "drivers/virtio.h"
 #include "core/string.h"
 #include "core/heap.h"
 #include "core/io.h"
@@ -36,11 +37,46 @@
 
 static bool      g_ready = false;
 static char      g_status[64] = "net: down";
-static uint32_t  g_ip = IP4(NET_IP_A, NET_IP_B, NET_IP_C, NET_IP_D);
-static uint32_t  g_gw = IP4(NET_IP_A, NET_IP_B, NET_IP_C, NET_GW_D);
-static uint32_t  g_mask = 0xFFFFFF00u;
 static uint8_t   g_gw_mac[6];
 static bool      g_gw_known = false;
+
+/* Network cards. eth0 is 10.0.2.15/24 (QEMU's default SLIRP net), ethN
+   gets 10.0.(2+N).15 with the gateway at .2, which is what
+   "-netdev user,net=10.0.(2+N).0/24" hands out. Packets leave through
+   the card whose subnet has the address, else through eth0. */
+#define NIF_MAX 6
+enum { NIC_RTL, NIC_VIRTIO };
+typedef struct { int kind, dev; uint8_t mac[6]; uint32_t ip, mask, gw, rx, tx; char name[8]; } nif_t;
+static nif_t nifs[NIF_MAX];
+static int   n_nifs;
+
+static int nic_send(nif_t* f, const void* d, int n) {
+    f->tx++;
+    return f->kind == NIC_RTL ? rtl8139_send(d, n) : vnet_send(f->dev, d, n);
+}
+static int nic_recv(nif_t* f, void* d, int max) {
+    int n = f->kind == NIC_RTL ? rtl8139_recv(d, max) : vnet_recv(f->dev, d, max);
+    if (n > 0) f->rx++;
+    return n;
+}
+
+/* the card for dst */
+static nif_t* route(uint32_t dst) {
+    for (int i = 0; i < n_nifs; i++) if ((dst & nifs[i].mask) == (nifs[i].ip & nifs[i].mask)) return &nifs[i];
+    return n_nifs ? &nifs[0] : NULL;
+}
+static nif_t* nif_by_ip(uint32_t ip) {
+    for (int i = 0; i < n_nifs; i++) if (nifs[i].ip == ip) return &nifs[i];
+    return NULL;
+}
+
+int net_ifcount(void) { return n_nifs; }
+bool net_ifinfo(int i, const char** name, const uint8_t** mac, uint32_t* ip, uint32_t* mask, uint32_t* gw, uint32_t* rx, uint32_t* tx) {
+    if (i < 0 || i >= n_nifs) return false;
+    nif_t* f = &nifs[i];
+    *name = f->name; *mac = f->mac; *ip = f->ip; *mask = f->mask; *gw = f->gw; *rx = f->rx; *tx = f->tx;
+    return true;
+}
 
 static void set_status(const char* s) {
     int i; for (i = 0; i < 63 && s[i]; i++) g_status[i] = s[i];
@@ -49,9 +85,9 @@ static void set_status(const char* s) {
 
 const char* net_status(void) { return g_status; }
 bool        net_ready(void)  { return g_ready; }
-const uint8_t* net_mac(void) { return rtl8139_mac(); }
-uint32_t    net_ip(void)     { return g_ip; }
-uint32_t    net_gw(void)     { return g_gw; }
+const uint8_t* net_mac(void) { static const uint8_t z[6]; return n_nifs ? nifs[0].mac : z; }
+uint32_t    net_ip(void)     { return n_nifs ? nifs[0].ip : 0; }
+uint32_t    net_gw(void)     { return n_nifs ? nifs[0].gw : 0; }
 
 /* === byte order helpers === */
 static inline uint16_t htons(uint16_t v) { return (v >> 8) | (v << 8); }
@@ -136,55 +172,54 @@ static void arp_store(uint32_t ip, const uint8_t* mac) {
     g_arp[slot].v = true;
 }
 
-static void send_eth(uint16_t type, const uint8_t* dst_mac, const void* payload, int len) {
+static void send_eth(nif_t* f, uint16_t type, const uint8_t* dst_mac, const void* payload, int len) {
     uint8_t frame[PKT_BUF];
-    if (len + ETH_HDR > PKT_BUF || !g_ready) return;
+    if (len + ETH_HDR > PKT_BUF || !g_ready || !f) return;
     eth_hdr_t* eh = (eth_hdr_t*)frame;
     for (int i = 0; i < 6; i++) eh->dst[i] = dst_mac[i];
-    const uint8_t* src = rtl8139_mac();
-    for (int i = 0; i < 6; i++) eh->src[i] = src[i];
+    for (int i = 0; i < 6; i++) eh->src[i] = f->mac[i];
     eh->type = htons(type);
     memcpy(frame + ETH_HDR, payload, len);
-    rtl8139_send(frame, ETH_HDR + len);
+    nic_send(f, frame, ETH_HDR + len);
 }
 
-static void send_arp_request(uint32_t target_ip) {
+static void send_arp_request(nif_t* f, uint32_t target_ip) {
     arp_hdr_t a;
     a.htype = htons(1);
     a.ptype = htons(ET_IPV4);
     a.hlen = 6; a.plen = 4;
     a.op = htons(ARP_REQ);
-    const uint8_t* mac = rtl8139_mac();
-    for (int i = 0; i < 6; i++) a.sha[i] = mac[i];
-    a.spa = htonl(g_ip);
+    for (int i = 0; i < 6; i++) a.sha[i] = f->mac[i];
+    a.spa = htonl(f->ip);
     for (int i = 0; i < 6; i++) a.tha[i] = 0;
     a.tpa = htonl(target_ip);
     static const uint8_t bcast[6] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };
-    send_eth(ET_ARP, bcast, &a, sizeof(a));
+    send_eth(f, ET_ARP, bcast, &a, sizeof(a));
 }
 
-static void send_arp_reply(const uint8_t* dst_mac, uint32_t dst_ip) {
+static void send_arp_reply(nif_t* f, const uint8_t* dst_mac, uint32_t dst_ip) {
     arp_hdr_t a;
     a.htype = htons(1);
     a.ptype = htons(ET_IPV4);
     a.hlen = 6; a.plen = 4;
     a.op = htons(ARP_REPLY);
-    const uint8_t* mac = rtl8139_mac();
-    for (int i = 0; i < 6; i++) a.sha[i] = mac[i];
-    a.spa = htonl(g_ip);
+    for (int i = 0; i < 6; i++) a.sha[i] = f->mac[i];
+    a.spa = htonl(f->ip);
     for (int i = 0; i < 6; i++) a.tha[i] = dst_mac[i];
     a.tpa = htonl(dst_ip);
-    send_eth(ET_ARP, dst_mac, &a, sizeof(a));
+    send_eth(f, ET_ARP, dst_mac, &a, sizeof(a));
 }
 
 /* Resolve next-hop MAC. If `ip` is off-net, resolves gateway. */
 static bool resolve_mac(uint32_t ip, uint8_t* out_mac, uint32_t timeout_ms) {
-    uint32_t want = ((ip & g_mask) == (g_ip & g_mask)) ? ip : g_gw;
+    nif_t* f = route(ip);
+    if (!f) return false;
+    uint32_t want = ((ip & f->mask) == (f->ip & f->mask)) ? ip : f->gw;
     if (arp_lookup(want, out_mac)) return true;
     if (!g_ready) return false;
     uint32_t t0 = pit_uptime_ms();
     for (int attempt = 0; attempt < 4; attempt++) {
-        send_arp_request(want);
+        send_arp_request(f, want);
         uint32_t deadline = pit_uptime_ms() + 250;
         while ((int32_t)(pit_uptime_ms() - deadline) < 0) {
             net_poll();
@@ -230,7 +265,7 @@ static uint8_t* g_loop[LOOP_SLOTS];
 static int      g_loop_len[LOOP_SLOTS];
 static int      g_loop_head, g_loop_tail;
 
-static bool is_local(uint32_t ip) { return (ip >> 24) == 127 || ip == g_ip; }
+static bool is_local(uint32_t ip) { return (ip >> 24) == 127 || nif_by_ip(ip) != NULL; }
 
 static void on_ipv4(const uint8_t* pkt, int len);
 
@@ -239,7 +274,8 @@ static void send_ip(uint32_t dst, uint8_t proto, const void* payload, int len) {
     int total = sizeof(ip4_hdr_t) + len;
     if (total > MTU) return;
     uint32_t irq = irq_save();
-    uint32_t src = is_local(dst) && (dst >> 24) == 127 ? dst : g_ip;
+    nif_t* out = route(dst);
+    uint32_t src = (dst >> 24) == 127 ? dst : nif_by_ip(dst) ? dst : out ? out->ip : 0;
 
     ip4_hdr_t* ih = (ip4_hdr_t*)frame;
     ih->vihl = 0x45;
@@ -271,7 +307,7 @@ static void send_ip(uint32_t dst, uint8_t proto, const void* payload, int len) {
         return;
     }
     uint8_t mac[6];
-    if (resolve_mac(dst, mac, 1000)) send_eth(ET_IPV4, mac, frame, total);
+    if (resolve_mac(dst, mac, 1000)) send_eth(out, ET_IPV4, mac, frame, total);
     irq_restore(irq);
 }
 
@@ -280,7 +316,9 @@ void net_send_ip(uint32_t dst, uint8_t proto, const void* payload, int len) {
 }
 
 uint32_t net_src_for(uint32_t dst) {
-    return (dst >> 24) == 127 ? dst : g_ip;
+    if ((dst >> 24) == 127) return dst;
+    nif_t* f = route(dst);
+    return f ? f->ip : 0;
 }
 
 static void send_tcp_segment(uint8_t flags, const void* data, int data_len) {
@@ -300,7 +338,7 @@ static void send_tcp_segment(uint8_t flags, const void* data, int data_len) {
     /* pseudo header for checksum */
     int tcp_len = sizeof(tcp_hdr_t) + data_len;
     uint8_t pseudo[12];
-    uint32_t src = htonl(g_ip), dst = htonl(tcp.peer_ip);
+    uint32_t src = htonl(net_src_for(tcp.peer_ip)), dst = htonl(tcp.peer_ip);
     memcpy(pseudo + 0, &src, 4);
     memcpy(pseudo + 4, &dst, 4);
     pseudo[8] = 0;
@@ -325,19 +363,19 @@ static void send_tcp_segment(uint8_t flags, const void* data, int data_len) {
 
 /* === dispatch === */
 
-static void on_arp(const uint8_t* pkt, int len) {
+static void on_arp(nif_t* f, const uint8_t* pkt, int len) {
     if (len < (int)sizeof(arp_hdr_t)) return;
     const arp_hdr_t* a = (const arp_hdr_t*)pkt;
     if (ntohs(a->ptype) != ET_IPV4 || a->plen != 4) return;
     uint16_t op = ntohs(a->op);
     uint32_t spa = ntohl(a->spa);
     uint32_t tpa = ntohl(a->tpa);
-    if (op == ARP_REQ && tpa == g_ip) {
-        send_arp_reply(a->sha, spa);
+    if (op == ARP_REQ && tpa == f->ip) {
+        send_arp_reply(f, a->sha, spa);
     } else if (op == ARP_REPLY) {
         arp_store(spa, a->sha);
     }
-    if (op == ARP_REQ && tpa == g_ip) arp_store(spa, a->sha);
+    if (op == ARP_REQ && tpa == f->ip) arp_store(spa, a->sha);
 }
 
 static void on_icmp(const ip4_hdr_t* ih, const uint8_t* pkt, int len) {
@@ -424,7 +462,7 @@ static void on_ipv4(const uint8_t* pkt, int len) {
     int ihl = (ih->vihl & 0x0F) * 4;
     if (ihl < 20 || ihl > len) return;
     uint32_t dst = ntohl(ih->dst);
-    if (dst != g_ip && dst != 0xFFFFFFFFu && (dst >> 24) != 127) return;
+    if (!nif_by_ip(dst) && dst != 0xFFFFFFFFu && (dst >> 24) != 127) return;
     int total = ntohs(ih->total);
     if (total > len) total = len;
     const uint8_t* payload = pkt + ihl;
@@ -446,29 +484,48 @@ void net_poll(void) {
         memcpy(buf, g_loop[slot], g_loop_len[slot]);
         on_ipv4(buf, g_loop_len[slot]);
     }
-    for (int i = 0; g_ready && i < 32; i++) {
-        int n = rtl8139_recv(buf, sizeof(buf));
-        if (n <= 0) break;
-        if (n < ETH_HDR) continue;
-        const eth_hdr_t* eh = (const eth_hdr_t*)buf;
-        uint16_t type = ntohs(eh->type);
-        if (type == ET_ARP) on_arp(buf + ETH_HDR, n - ETH_HDR);
-        else if (type == ET_IPV4) on_ipv4(buf + ETH_HDR, n - ETH_HDR);
-    }
+    for (int k = 0; g_ready && k < n_nifs; k++)
+        for (int i = 0; i < 32; i++) {
+            int n = nic_recv(&nifs[k], buf, sizeof(buf));
+            if (n <= 0) break;
+            if (n < ETH_HDR) continue;
+            const eth_hdr_t* eh = (const eth_hdr_t*)buf;
+            uint16_t type = ntohs(eh->type);
+            if (type == ET_ARP) on_arp(&nifs[k], buf + ETH_HDR, n - ETH_HDR);
+            else if (type == ET_IPV4) on_ipv4(buf + ETH_HDR, n - ETH_HDR);
+        }
     irq_restore(irq);
 }
 
 int net_init(void) {
     if (g_ready) return 0;
-    if (rtl8139_init() != 0) {
-        set_status(rtl8139_status());
-        return -1;
+    if (rtl8139_init() == 0) {
+        nifs[n_nifs].kind = NIC_RTL;
+        memcpy(nifs[n_nifs].mac, rtl8139_mac(), 6);
+        n_nifs++;
+    }
+    int nv = vnet_init();
+    for (int i = 0; i < nv && n_nifs < NIF_MAX; i++) {
+        nifs[n_nifs].kind = NIC_VIRTIO;
+        nifs[n_nifs].dev = i;
+        memcpy(nifs[n_nifs].mac, vnet_mac(i), 6);
+        n_nifs++;
+    }
+    if (!n_nifs) { set_status("net: no network card"); return -1; }
+    for (int i = 0; i < n_nifs; i++) {
+        nif_t* f = &nifs[i];
+        f->name[0] = 'e'; f->name[1] = 't'; f->name[2] = 'h'; f->name[3] = (char)('0' + i); f->name[4] = 0;
+        f->ip = IP4(10, 0, 2 + i, 15);
+        f->gw = IP4(10, 0, 2 + i, 2);
+        f->mask = 0xFFFFFF00u;
     }
     g_ready = true;
-    set_status("net: up (10.0.2.15/24 gw 10.0.2.2)");
+    set_status(n_nifs > 1 ? "net: up (eth0 10.0.2.15/24 + more, see ifconfig)" : "net: up (10.0.2.15/24 gw 10.0.2.2)");
 
-    /* warm ARP cache for gateway so first packet doesn't stall */
-    if (resolve_mac(g_gw, g_gw_mac, 1500)) g_gw_known = true;
+    /* warm ARP cache for gateways so first packet doesn't stall */
+    for (int i = 1; i < n_nifs; i++) resolve_mac(nifs[i].gw, g_gw_mac, 500);
+    if (resolve_mac(nifs[0].gw, g_gw_mac, 1500)) g_gw_known = true;
+    for (const char* m = g_gw_known ? "samara: gw arp ok\r\n" : "samara: gw arp FAIL\r\n"; *m; m++) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, *m); }
     uint8_t dns_mac[6];
     resolve_mac(IP4(NET_IP_A, NET_IP_B, NET_IP_C, 3), dns_mac, 500);
     return 0;

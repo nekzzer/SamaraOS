@@ -55,7 +55,10 @@ struct window {
     int  fs_x, fs_y, fs_w, fs_h;                             /* before fullscreen */
     void (*on_resize)(window_t*);                             /* client size changed; NULL ok */
     void (*on_scroll)(window_t*, int dz);                     /* mouse wheel, dz > 0 = down; NULL ok */
+    int  group;                      /* same non-zero group = one taskbar button */
 };
+
+#define WG_TERMINAL 1
 
 #define WM_EDGE_L 1
 #define WM_EDGE_R 2
@@ -88,6 +91,7 @@ window_t* wm_focused(void);
 /* Desktop wallpaper (/home/user, /mnt or / wallpaper.bmp) changed: reload
    it on the next frame (or at the next desktop start). */
 void      wm_invalidate_wallpaper(void);
+uint32_t* wm_background(int W, int H);     /* W*H pixels, NULL if no memory */
 /* Type + run a shell command line in the desktop terminal (opens it). */
 bool      wm_terminal_feed(const char* line);
 
@@ -97,5 +101,7 @@ void      wm_toggle_fullscreen(window_t* w);
 
 /* For app windows: get the client rectangle (inside title+border). */
 void      wm_client_rect(window_t* w, int* x, int* y, int* cw, int* ch);
+/* repaint just this part of the window (screen coords) */
+void      wm_damage(window_t* w, int x, int y, int cw, int ch);
 
 #endif

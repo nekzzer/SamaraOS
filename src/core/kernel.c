@@ -10,6 +10,7 @@
 #include "boot/pit.h"
 #include "drivers/keyboard.h"
 #include "drivers/mouse.h"
+#include "drivers/usb.h"
 #include "core/heap.h"
 #include "core/task.h"
 #include "fs/fs.h"
@@ -19,6 +20,7 @@
 #include "core/vmm.h"
 #include "gfx/font.h"
 #include "gui/desktop.h"
+#include "gui/login.h"
 #include "gfx/termfont.h"
 #include "drivers/ata.h"
 #include "drivers/ahci.h"
@@ -32,6 +34,7 @@
 #include "proc/userland.h"
 #include "net/sock.h"
 #include "fs/fatfs.h"
+#include "fs/ext2.h"
 #include "shell/commands.h"
 
 /* ---------- Multiboot 1 header ---------- */
@@ -330,6 +333,53 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
     if (ata_drive_present(DISK_AHCI_BASE) && fatfs_probe(DISK_AHCI_BASE)) {
         int r = fatfs_mount(DISK_AHCI_BASE, fs_resolve(fs_root(), "/mnt"));
         vga_printf("    /mnt: %s\n", r == 0 ? "sda mounted (vfat, persistent)" : "mount failed");
+    } else if (ata_drive_present(DISK_VIRTIO_BASE) && fatfs_probe(DISK_VIRTIO_BASE)) {
+        int r = fatfs_mount(DISK_VIRTIO_BASE, fs_resolve(fs_root(), "/mnt"));
+        vga_printf("    /mnt: %s\n", r == 0 ? "vda mounted (vfat, persistent)" : "mount failed");
+    } else {
+        /* installed system on a plain ide disk (see gui/install.c) */
+        for (int i = 0; i < ATA_DRIVES; i++) {
+            if (!ata_drive_present(i) || !fatfs_probe(i)) continue;
+            int r = fatfs_mount(i, fs_resolve(fs_root(), "/mnt"));
+            vga_printf("    /mnt: %s %s\n", ata_drive_name(i), r == 0 ? "mounted" : "mount failed");
+            break;
+        }
+    }
+    login_load_etc();
+
+    /* ext2 disks show up under /disk/<name> */
+    for (int i = 0; i < DISK_MAX; i++) {
+        if (!ext2_probe(i)) continue;
+        fs_node_t* d = fs_resolve(fs_root(), "/disk");
+        if (!d) d = fs_create(fs_root(), "/disk", FS_DIR);
+        char p[24] = "/disk/", lab[17];
+        strcat(p, ata_drive_name(i));
+        ext2_label(i, lab);
+        if (lab[0] == '/') {                   /* label "/usr/local": mount it there */
+            strcpy(p, lab);
+            for (char* s = p + 1; *s; s++) {
+                if (*s != '/') continue;
+                *s = 0;
+                if (!fs_resolve(fs_root(), p)) fs_create(fs_root(), p, FS_DIR);
+                *s = '/';
+            }
+        }
+        fs_node_t* at = fs_resolve(fs_root(), p);
+        if (!at) at = fs_create(fs_root(), p, FS_DIR);
+        int r = ext2_mount(i, at);
+        vga_printf("    %s: %s\n", p, r == 0 ? "ext2 mounted" : r == 1 ? "ext mounted read-only" : "ext2 mount failed");
+        /* /usr/local/bin/x -> /usr/bin/x too: ssh commands and the like use a short PATH */
+        if (r >= 0 && !strcmp(p, "/usr/local")) {
+            fs_node_t* lb = fs_resolve(fs_root(), "/usr/local/bin");
+            fs_node_t* ub = fs_resolve(fs_root(), "/usr/bin");
+            for (fs_node_t* c = lb ? lb->child : NULL; c && ub; c = c->next) {
+                if (fs_child(ub, c->name)) continue;
+                char tg[FS_NAME_MAX + 20] = "/usr/local/bin/";
+                strcat(tg, c->name);
+                fs_node_t* l = fs_symlink(ub, c->name, tg);
+                if (l) l->mount_id = 0;
+            }
+        }
     }
 
     /* Background services from /etc/rc: the dropbear ssh server and telnetd
@@ -356,6 +406,10 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
     boot_step("sb16");
     if (sb16_init()) vga_printf("ok (DSP %u.%u)\n", 0u, 0u); /* version not pretty-printed here */
     else             vga_printf("%s\n", sb16_status());
+
+    boot_step("usb");
+    usb_init();
+    boot_done("uhci (polled)");
 
     BOOT_OK("synth wavs", synth_install_demo_wavs());
     BOOT_OK("embed wavs", embed_install());
@@ -402,7 +456,12 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
     boot_autorun();
     /* The shell runs on the graphical console (true colour, the terminal
        font) unless "textmode" asks for plain VGA text. */
-    if (!strstr(boot_cmdline, "textmode")) console_gfx_start();
+    if (!strstr(boot_cmdline, "textmode") && console_gfx_start() && !strstr(boot_cmdline, "nologin")) {
+        /* booted from the ISO: offer to install first */
+        if (fs_resolve(fs_root(), "/boot/grub/core.img")) install_screen();
+        login_screen();
+        shell_run_line("desktop");
+    }
     shell_run();
 
     while (1) hlt();

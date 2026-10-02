@@ -17,15 +17,9 @@ struct file;
 
 typedef enum { P_FREE = 0, P_ALIVE, P_ZOMBIE } pstate_t;
 
-typedef struct proc {
-    pstate_t state;
-    int      pid, ppid, pgid, sid;
-    int      task;                 /* task slot running this process */
-    uint32_t pd;                   /* page directory (physical) */
-    uint32_t brk_start, brk;
-    uint32_t tls_base;
-    uint32_t clear_child_tid;
-    fs_node_t* cwd;
+/* What threads of one process share (CLONE_FILES|SIGHAND|FS|VM). The leader
+   owns it, threads just point at it. */
+typedef struct pshared {
     struct file* fds[MAX_FDS];
     uint8_t  cloexec[MAX_FDS];
     struct {
@@ -34,14 +28,32 @@ typedef struct proc {
         uint32_t restorer;         /* musl's __restore / __restore_rt */
         uint64_t mask;
     } sa[NSIG_MAX];
+    uint32_t brk_start, brk;
+    fs_node_t* cwd;
+    int      umask;
+} pshared_t;
+
+typedef struct proc {
+    pstate_t state;
+    int      pid, ppid, pgid, sid;
+    int      tgid;                 /* thread group = pid of the leader */
+    bool     is_thread;            /* made by clone(CLONE_THREAD), not waitable */
+    bool     zleader;              /* leader called exit() while threads still run */
+    bool     in_futex;
+    int      task;                 /* task slot running this process */
+    uint32_t pd;                   /* page directory (physical) */
+    uint32_t tls_base;
+    uint32_t clear_child_tid;
+    pshared_t* sh;
+    pshared_t  shd;                /* leader's own, threads use sh of the leader */
     uint64_t sig_mask;             /* Linux sigset: bit (sig-1) */
     uint64_t sig_pending;          /* caught signals waiting for delivery */
     uint64_t saved_mask;           /* sigsuspend: mask to restore after the handler */
     bool     in_sigsuspend;
+    uint32_t ss_sp, ss_size;       /* sigaltstack, size 0 = off. qemu coroutines need it */
     uint32_t alarm_at;             /* uptime ms of pending SIGALRM, 0 = none */
     uint32_t alarm_interval;       /* setitimer reload, ms */
     int      exit_status;          /* wait(2) encoding once zombie */
-    int      umask;
     bool     kernel_waited;        /* launched by the kernel shell, which reaps it */
     bool     tty_detached;         /* background job: console reads EOF, writes are dropped */
     int      ctty;                 /* controlling terminal: 0 console, -1 none, n>0 pty n-1 */
@@ -76,6 +88,7 @@ uint32_t proc_tls_base(proc_t* p);
 bool    proc_interrupted(void);       /* current process has a fatal signal pending */
 void    proc_signal_group(int pgid, int sig);
 int     proc_send_signal(proc_t* p, int sig);
+int     proc_send_signal_tid(proc_t* p, int sig);
 int     proc_count(void);
 proc_t* proc_at(int i);
 
@@ -85,6 +98,11 @@ void    proc_fault_kill(const char* what, int sig, uint32_t eip, uint32_t addr) 
 
 /* Syscall-level operations (syscall.c calls these). */
 int     proc_fork(regs_t* r);
+int     proc_clone(regs_t* r);     /* full clone(2): threads or fork */
+void    proc_thread_exit(int code) __attribute__((noreturn));
+int     futex_op(uint32_t uaddr, int op, uint32_t val, uint32_t timeout, uint32_t uaddr2, uint32_t val3);
+void    futex_forget(proc_t* p);
+void    futex_wake_addr(uint32_t pd, uint32_t addr, int n);
 int     proc_vfork(regs_t* r);     /* child shares memory, parent waits for exec/exit */
 int     proc_execve(regs_t* r, const char* path, char* const argv[], char* const envp[]);
 void    proc_exit(int status) __attribute__((noreturn));   /* status = wait encoding */
@@ -102,6 +120,7 @@ void    proc_deliver_signal(regs_t* r, int nr, int32_t ret);
 int     proc_sigreturn(regs_t* r, bool rt);
 int     proc_sigaction(int sig, const uint32_t* act, uint32_t* oact, bool old_abi);
 int     proc_sigsuspend(const uint64_t* mask);
+int     proc_sigaltstack(const uint32_t* ss, uint32_t* old, uint32_t esp);
 void    proc_check_alarm(proc_t* p, bool from_irq);   /* fire SIGALRM when due */
 void    proc_account_tick(proc_t* p, bool user);
 

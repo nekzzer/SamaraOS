@@ -23,7 +23,7 @@
    foreground job and wm_terminal_poll() does the same shuttling per frame. */
 
 static char *const user_env[] = {
-    "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/games:/opt/gcc/bin",
+    "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/games:/usr/local/bin:/opt/gcc/bin",
     "HOME=/home/user",
     "USER=root",
     "LOGNAME=root",
@@ -48,7 +48,7 @@ bool shell_find_program(const char *name, char *out, int cap) {
     out[cap - 1] = 0;
     return true;
   }
-  static const char *const path[] = {"/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/games/", "/opt/gcc/bin/"};
+  static const char *const path[] = {"/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/games/", "/usr/local/bin/", "/opt/gcc/bin/"};
   for (unsigned i = 0; i < sizeof(path) / sizeof(path[0]); i++) {
     char full[128];
     strncpy(full, path[i], sizeof(full) - 1);
@@ -290,8 +290,8 @@ void cmd_disks(int argc, char **argv) {
   for (int i = 0; i < DISK_MAX; i++) {
     if (!ata_drive_present(i))
       continue;
-    bool sata = i >= DISK_AHCI_BASE;
-    vga_printf("  %s   %s  %u       %s\n", ata_drive_name(i), sata ? "sata" : "ide ",
+    bool sata = i >= DISK_AHCI_BASE && i < DISK_VIRTIO_BASE;
+    vga_printf("  %s   %s  %u       %s\n", ata_drive_name(i), sata ? "sata" : i >= DISK_VIRTIO_BASE ? "virt" : "ide ",
                ata_drive_sectors(i) / 2048, sata ? ahci_model(i - DISK_AHCI_BASE) : "");
   }
   vga_printf("ahci: %s\n", ahci_status());
@@ -311,6 +311,12 @@ void cmd_gnu_nano(int argc, char **argv) {
 /* `python` / `python3` run MicroPython (/usr/bin/micropython). */
 void cmd_python(int argc, char **argv) {
   char path[128];
+  /* real CPython from the ports disk wins, micropython is the fallback */
+  if (shell_find_program("/usr/local/bin/python3", path, sizeof(path))) {
+    argv[0] = "python3";
+    shell_exec_program(path, argc, argv);
+    return;
+  }
   if (!shell_find_program("micropython", path, sizeof(path))) {
     vga_puts("python: MicroPython is not installed (userland/build-micropython.sh)\n");
     return;

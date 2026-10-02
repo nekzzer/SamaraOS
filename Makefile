@@ -21,12 +21,14 @@ QDISPLAY ?= -display gtk,zoom-to-fit=off
 # Wire the PC speaker (PIT channel 2) to a real audio backend. Without these
 # flags QEMU silently drops the speaker output even though the OS programs it.
 # pa = PulseAudio (Linux). Override with AUDIO= for another backend/host.
+# USB: UHCI controller with a mouse on it (drivers/usb.c). USB= to drop it.
+USB      ?= -usb -device usb-mouse
 AUDIO    ?= -audiodev pa,id=snd0 -machine pcspk-audiodev=snd0 -device sb16,audiodev=snd0
 
 KCFLAGS  := -m32 -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
             -nostdlib -mno-red-zone \
             -mgeneral-regs-only -mno-mmx -mno-sse -mno-sse2 \
-            -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable \
+            -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -MMD -MP \
             -std=gnu11 -Isrc
 
 # DOOM compile flags. Permissive so id Software's 1993 K&R C compiles.
@@ -87,12 +89,16 @@ KERN_SRC := \
     src/gui/desktop.c \
     src/gui/wm.c \
     src/gui/uwin.c \
+    src/gui/login.c \
+    src/gui/install.c \
     src/drivers/ata.c \
     src/drivers/ahci.c \
     src/apps/doom.c \
     src/apps/mediaplayer.c \
     src/apps/paint.c \
     src/apps/clock.c \
+    src/apps/pterm.c \
+    src/apps/imgdec.c \
     src/drivers/sb16.c \
     src/apps/wav.c \
     src/apps/synth.c \
@@ -101,6 +107,9 @@ KERN_SRC := \
     src/fs/fatfs.c \
     src/drivers/pci.c \
     src/drivers/rtl8139.c \
+    src/drivers/virtio.c \
+    src/fs/ext2.c \
+    src/drivers/usb.c \
     src/net/net.c \
     src/net/sock.c \
     src/apps/snake.c \
@@ -185,6 +194,7 @@ ALL_OBJ := $(KERN_OBJ) $(LIBC_OBJ) $(DGEN_LOC_OBJ) $(DGEN_OBJ) $(EMBED_OBJS) $(U
 
 KERNEL := build/samara.elf
 
+
 all: $(KERNEL)
 
 # Auto-generated list of EMBED(name, sym) pairs included from src/apps/embed.c
@@ -251,9 +261,9 @@ MUSIC_DIR ?= music
 MUSIC_DRIVE := -drive file=fat:$(MUSIC_DIR),format=raw,if=ide,index=2,snapshot=on
 
 # RTL8139 NIC on QEMU user-mode SLIRP. Guest gets 10.0.2.15, gw 10.0.2.2.
-# DNS at 10.0.2.3 is exposed but our stack doesn't use it (numeric IPs only).
+# Internet through SLIRP NAT by default (same as run-internet): DNS 10.0.2.3, host is 10.0.2.2.
 # Host loopback only: `ssh -p 2222 root@localhost`, `telnet localhost 2323`.
-NET_DRIVE := -netdev user,id=n0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:2323-:23 \
+NET_DRIVE := -netdev user,id=n0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:2323-:23,hostfwd=tcp:127.0.0.1:8080-:80 \
              -device rtl8139,netdev=n0
 
 # Persistent 64 MiB FAT32 disk on AHCI: SamaraOS mounts it at /mnt and
@@ -299,7 +309,7 @@ run: $(KERNEL) $(DISK_IMG) src-tar
 	@test -f $(GCC_TAR) || $(MAKE) --no-print-directory $(GCC_TAR) || echo "(no gcc module: toolchain/gcc-native missing)"
 	K=$$(python3 tools/pick-kernel.py $(DISK_IMG) $(KERNEL) $(SELF_KERNEL)) && \
 	$(QEMU) -kernel $$K $(ACCEL) -m $(GCC_MEM) $(RUN_MODULES) -append "video=$(VIDEO) $(APPEND)" \
-	    -vga std $(QDISPLAY) -serial stdio $(AUDIO) $(MUSIC_DRIVE) $(NET_DRIVE) $(DISK_DRIVE)
+	    -vga std $(QDISPLAY) -serial stdio $(AUDIO) $(USB) $(MUSIC_DRIVE) $(NET_DRIVE) $(DISK_DRIVE)
 
 run-gcc: run
 
@@ -312,6 +322,16 @@ INET_DRIVE := -netdev user,id=n0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,host
 
 run-internet: NET_DRIVE = $(INET_DRIVE)
 run-internet: run
+
+# More network cards: `make run NICS=3` adds virtio-net cards on their own
+# SLIRP nets (eth1 = 10.0.3.15, eth2 = 10.0.4.15, ...). By hand:
+#   -netdev user,id=n1,net=10.0.3.0/24 -device virtio-net-pci,netdev=n1
+# `make run VDISK=file.img` attaches a virtio-blk disk (/dev/vda).
+NICS ?= 1
+NET_DRIVE += $(foreach i,$(shell seq 2 $(NICS) 2>/dev/null),-netdev user,id=n$(i),net=10.0.$(shell echo $$(($(i)+1))).0/24 -device virtio-net-pci,netdev=n$(i))
+VDISK ?=
+comma := ,
+DISK_DRIVE += $(if $(VDISK),-drive file=$(VDISK)$(comma)format=raw$(comma)if=virtio)
 
 # Run with DOOM1.WAD attached as the primary disk so 'doom' command works.
 WAD ?= Doom1.WAD
@@ -328,9 +348,26 @@ run-debug: $(KERNEL)
 # Boots on any x86 PC/VM from CD/USB, not just via QEMU's -kernel shortcut.
 ISO := build/samara.iso
 
-$(ISO): $(KERNEL) iso/grub.cfg
+# install.tar rides along as a module: the kernel + GRUB's boot.img and a
+# core.img that boots /boot/samara.elf off a FAT32 disk. With it in /boot
+# the OS starts the installer (src/gui/install.c).
+GRUB_CORE := build/grub-core.img
+INSTALL_TAR := build/install.tar
+
+$(GRUB_CORE): iso/early.cfg | build
+	grub-mkimage -O i386-pc -o $@ -p /boot/grub -c iso/early.cfg biosdisk fat multiboot
+
+$(INSTALL_TAR): $(KERNEL) $(GRUB_CORE)
+	@mkdir -p build/instdir/boot/grub
+	cp $(KERNEL) build/instdir/boot/samara.elf
+	cp $(GRUB_CORE) build/instdir/boot/grub/core.img
+	cp /usr/lib/grub/i386-pc/boot.img build/instdir/boot/grub/boot.img
+	tar --format=ustar --owner=0 --group=0 -C build/instdir -cf $@ boot
+
+$(ISO): $(KERNEL) $(INSTALL_TAR) iso/grub.cfg
 	@mkdir -p build/isodir/boot/grub
 	cp $(KERNEL) build/isodir/boot/samara.elf
+	cp $(INSTALL_TAR) build/isodir/boot/install.tar
 	cp iso/grub.cfg build/isodir/boot/grub/grub.cfg
 	grub-mkrescue -o $(ISO) build/isodir
 
@@ -342,6 +379,21 @@ run-iso: $(ISO)
 	@mkdir -p $(MUSIC_DIR)
 	$(QEMU) -cdrom $(ISO) -boot d -m 256 -vga std -serial stdio $(AUDIO) \
 	    -drive file=fat:$(MUSIC_DIR),format=raw,if=ide,index=3,snapshot=on $(NET_DRIVE)
+
+# Installer test: ISO + an empty 512 MB ide disk (build/hd.img), then
+# `make run-hd` boots what got installed, no CD.
+HD_IMG := build/hd.img
+
+$(HD_IMG): | build
+	truncate -s 512M $@
+
+run-install: $(ISO) $(HD_IMG)
+	$(QEMU) $(ACCEL) -cdrom $(ISO) -boot order=c,once=d -m 512 -vga std -serial stdio $(AUDIO) \
+	    -drive file=$(HD_IMG),format=raw,if=ide,index=0 $(NET_DRIVE)
+
+run-hd: $(HD_IMG)
+	$(QEMU) $(ACCEL) -m 512 -vga std -serial stdio $(AUDIO) \
+	    -drive file=$(HD_IMG),format=raw,if=ide,index=0 $(NET_DRIVE)
 
 # Same as run-doom but the WAD sits on a SATA disk behind an AHCI controller
 # (exercises src/drivers/ahci.c; shows up as /dev/sda, disk index 4).
@@ -360,4 +412,7 @@ clean:
 	rm -rf build
 
 .PHONY: run-internet
-.PHONY: all run run-doom run-sata run-debug iso run-iso clean build compile_commands.json
+.PHONY: all run run-doom run-sata run-debug iso run-iso run-install run-hd clean build compile_commands.json
+
+# header dependencies (gcc -MMD): editing a .h rebuilds who includes it
+-include $(KERN_OBJ:.o=.d)

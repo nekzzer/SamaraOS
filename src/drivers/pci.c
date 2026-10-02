@@ -1,5 +1,6 @@
 #include "drivers/pci.h"
 #include "core/io.h"
+#include "core/task.h"
 
 #define CF8 0xCF8
 #define CFC 0xCFC
@@ -12,9 +13,15 @@ static uint32_t addr_of(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off) {
          | (off & 0xFC);
 }
 
+/* CF8/CFC is a pair: netd probes the NIC while kmain scans for usb/ahci,
+   and a task switch between the two writes read someone else's register.
+   That was the "network is dead on every other boot" bug. */
 uint32_t pci_cfg_read32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off) {
+    uint32_t f = irq_save();
     outl(CF8, addr_of(bus, dev, fn, off));
-    return inl(CFC);
+    uint32_t v = inl(CFC);
+    irq_restore(f);
+    return v;
 }
 
 uint16_t pci_cfg_read16(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off) {
@@ -28,8 +35,10 @@ uint8_t pci_cfg_read8(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off) {
 }
 
 void pci_cfg_write32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off, uint32_t v) {
+    uint32_t f = irq_save();
     outl(CF8, addr_of(bus, dev, fn, off));
     outl(CFC, v);
+    irq_restore(f);
 }
 
 void pci_cfg_write16(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off, uint16_t v) {

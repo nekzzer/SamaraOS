@@ -1,0 +1,16 @@
+<!DOCTYPE html><html><head><title>Images</title><style>
+body{font-family:sans-serif;margin:16px;background:#f4f1ea}
+.hero{height:120px;background:url(img.jpg) center/cover no-repeat;color:#fff;padding:12px;font-size:24px;font-weight:bold}
+.tile{height:60px;background:#fff url("tile.png");border:1px solid #999;margin:10px 0}
+.fl{float:right;margin:0 0 8px 12px;border:3px solid #333}
+.row{display:flex;gap:10px;align-items:center}
+img.round{border-radius:8px}
+.resp{max-width:100%}
+</style></head><body>
+<div class="hero">background-image cover</div>
+<p><img class="fl" src="img.png" width="150">Float right PNG with width 150 (height from the aspect ratio). Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.</p>
+<div class="row"><img src="img.jpg" alt="jpeg"><img src="alpha.png" alt="alpha png"><img src="img.gif" alt="gif"><span>inline images in a flex row</span></div>
+<div class="tile">tiled background</div>
+<p>Inline <img src="alpha.png" width="20" height="20"> icon inside text, and a broken one: <img src="nope.png" alt="[broken image alt]">.</p>
+<img class="resp" src="img.jpg" style="width:900px;display:block">
+</body></html>

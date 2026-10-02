@@ -79,7 +79,11 @@ void (*fs_dirty_hook)(int mount_id);
 
 void fs_touch(fs_node_t* n) {
     for (; n; n = n->parent)
-        if (n->mount_id) { if (fs_dirty_hook) fs_dirty_hook(n->mount_id); return; }
+        if (n->mount_id) {
+            if (n->mount_id >= 8) { extern void ext2_dirty(int); ext2_dirty(n->mount_id); }
+            else if (fs_dirty_hook) fs_dirty_hook(n->mount_id);
+            return;
+        }
 }
 
 static fs_node_t* find_child(fs_node_t* dir, const char* name) {
@@ -91,7 +95,9 @@ static fs_node_t* find_child(fs_node_t* dir, const char* name) {
     return NULL;
 }
 
-fs_node_t* fs_resolve(fs_node_t* cwd, const char* path) {
+/* walks path; a symlink in the middle (or at the end with follow) is
+   replaced by its target + the rest, 8 levels deep at most */
+static fs_node_t* resolve(fs_node_t* cwd, const char* path, bool follow, int depth) {
     if (!path || !*path) return cwd;
     fs_node_t* cur = (path[0] == '/') ? root_ : cwd;
     char part[FS_NAME_MAX];
@@ -100,9 +106,24 @@ fs_node_t* fs_resolve(fs_node_t* cwd, const char* path) {
         if (*p == '/' || *p == 0) {
             if (pi > 0) {
                 part[pi] = 0;
+                fs_node_t* dir = cur;
                 cur = find_child(cur, part);
                 if (!cur) return NULL;
                 pi = 0;
+                const char* rest = p;
+                while (*rest == '/') rest++;
+                if (cur->type == FS_LINK && (*rest || follow)) {
+                    if (depth > 8 || !cur->data) return NULL;
+                    static char buf[1024];                       /* target + "/" + rest */
+                    char tmp[1024];
+                    int k = 0;
+                    for (size_t i = 0; i < cur->size && k < 1000; i++) tmp[k++] = cur->data[i];
+                    if (*rest && k < 1000) tmp[k++] = '/';
+                    for (; *rest && k < 1022; rest++) tmp[k++] = *rest;
+                    tmp[k] = 0;
+                    memcpy(buf, tmp, (size_t)k + 1);
+                    return resolve(dir, tmp, follow, depth + 1);
+                }
             }
             if (*p == 0) break;
         } else if (pi < FS_NAME_MAX - 1) {
@@ -110,6 +131,25 @@ fs_node_t* fs_resolve(fs_node_t* cwd, const char* path) {
         }
     }
     return cur;
+}
+
+fs_node_t* fs_resolve(fs_node_t* cwd, const char* path)    { return resolve(cwd, path, true, 0); }
+fs_node_t* fs_resolve_nf(fs_node_t* cwd, const char* path) { return resolve(cwd, path, false, 0); }
+
+fs_node_t* fs_symlink(fs_node_t* dir, const char* name, const char* target) {
+    if (!dir || dir->type != FS_DIR || find_child(dir, name)) return NULL;
+    fs_node_t* n = node_new(name, FS_LINK, dir);
+    if (!n) return NULL;
+    size_t len = strlen(target);
+    n->data = (char*)kmalloc((uint32_t)len + 1);
+    if (!n->data) { kfree(n); return NULL; }
+    memcpy(n->data, target, len + 1);
+    n->size = len;
+    n->cap = len + 1;
+    n->mode = 0777;
+    link_child(dir, n);
+    fs_touch(dir);
+    return n;
 }
 
 static void split_dir_base(const char* path, char* dir, char* base) {
@@ -136,7 +176,7 @@ fs_node_t* fs_create(fs_node_t* cwd, const char* path, fs_type_t type) {
 }
 
 int fs_unlink(fs_node_t* cwd, const char* path) {
-    fs_node_t* n = fs_resolve(cwd, path);
+    fs_node_t* n = fs_resolve_nf(cwd, path);
     if (!n || n == root_) return -1;
     if (n->type == FS_DIR && n->child) return -1;
     fs_detach(n);

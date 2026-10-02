@@ -1,0 +1,37 @@
+<!DOCTYPE html><html><head><title>Box model</title><style>
+body{font-family:sans-serif;margin:0;padding:16px;background:#eef}
+.b{background:#fff;border:1px solid #99a;margin:10px 0;padding:8px}
+.w{width:300px;margin:10px auto;background:#ffe;border:3px solid #cc0;text-align:center}
+.bb{box-sizing:border-box;width:50%;padding:20px;border:10px solid #9cf;background:#def}
+.r{border-radius:10px;background:#2c3e50;color:#fff;padding:12px;border:2px solid #e67e22}
+.sides{border-top:4px solid red;border-right:4px dashed green;border-bottom:4px dotted blue;border-left:8px solid orange;padding:10px;background:#fff}
+.mw{max-width:400px;background:#fcf;padding:6px}
+.minw{min-width:500px;width:100px;background:#cff}
+.ovf{height:40px;overflow:hidden;background:#fdd;border:1px solid red}
+.rel{position:relative;background:#dfd;height:80px;border:1px solid green}
+.abs{position:absolute;right:10px;top:10px;background:#393;color:#fff;padding:4px}
+.relm{position:relative;left:40px;top:4px;color:#a00}
+.op{opacity:.4;background:#000;color:#fff;padding:6px}
+.rgba{background:rgba(255,0,0,.25);padding:6px}
+.fl{float:left;width:100px;height:60px;background:#fc9;margin-right:10px}
+.fr{float:right;width:100px;background:#9cf;margin-left:10px}
+.cl{clear:both;background:#ddd}
+.cf::after{content:"";display:table;clear:both}
+.pad{padding:1em 2em;margin:1em 3em;background:#fff}
+</style></head><body>
+<div class="b">plain block with border and padding</div>
+<div class="w">width:300px, margin:auto (centered)</div>
+<div class="bb">box-sizing:border-box width 50%</div>
+<div class="r">border-radius with coloured border</div>
+<div class="b sides">different border sides and styles</div>
+<div class="mw">max-width 400px - this box should stop growing at 400 pixels wide even on a wide window</div>
+<div class="minw">min-width 500px beats width 100px</div>
+<div class="ovf">overflow hidden, height 40px: line one<br>line two<br>line three should be cut<br>line four</div>
+<div class="rel">position:relative box<div class="abs">absolute top right</div></div>
+<p>Text with <span class="relm">relative shifted span</span> inside.</p>
+<div class="op">opacity .4</div>
+<div class="rgba">rgba background</div>
+<div class="cf b"><div class="fl">float left</div><div class="fr">float right</div>Text flows between the floats. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</div>
+<div class="cl">clear:both</div>
+<div class="pad">padding 1em 2em, margin 1em 3em</div>
+</body></html>

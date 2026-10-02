@@ -1,4 +1,5 @@
 #include "proc/pty.h"
+#include "core/io.h"
 #include "proc/proc.h"
 #include "proc/tty.h"
 #include "core/string.h"
@@ -215,7 +216,7 @@ int pty_slave_open(int i, int flags) {
     p->slave_seen = true;
     /* A session leader without a terminal gets this one (unless O_NOCTTY). */
     proc_t* me = proc_current();
-    if (me && me->pid == me->sid && me->ctty < 0 && !(flags & 0x100) && !p->sid) {
+    if (me && me->tgid == me->sid && me->ctty < 0 && !(flags & 0x100) && !p->sid) {
         me->ctty = i + 1;
         p->sid = me->sid;
         p->pgrp = me->pgid;
@@ -274,7 +275,7 @@ int pty_read(int i, bool master, char* buf, int n, bool nonblock) {
             if (p->slave_seen && p->srefs <= 0) return -EIO;   /* shell gone */
             if (nonblock) return -EAGAIN;
             if (proc_interrupted()) return -EINTR;
-            task_yield();
+            task_sleep_ms(2);
         }
     }
     /* slave */
@@ -301,7 +302,7 @@ int pty_read(int i, bool master, char* buf, int n, bool nonblock) {
             if (pit_uptime_ms() - start >= tmo) return 0;
         }
         if (proc_interrupted()) return -EINTR;
-        task_yield();
+        task_sleep_ms(2);                                 /* idle shells used to spin here */
     }
 }
 
@@ -314,7 +315,8 @@ int pty_write(int i, bool master, const char* buf, int n, bool nonblock) {
         if (master) {
             if (p->slave_seen && p->srefs <= 0) { irq_restore(f); return done ? done : -EIO; }
             /* each input byte may echo up to 3 and queue 1 */
-            while (done < n && ring_space(&p->in) > 2 && ring_space(&p->out) > 8)
+            /* echo gets dropped if the reader is behind; ^C must still get through */
+            while (done < n && ring_space(&p->in) > 2)
                 input_char(p, buf[done++]);
         } else {
             if (p->mrefs <= 0) { irq_restore(f); return done ? done : -EIO; }
@@ -330,6 +332,15 @@ int pty_write(int i, bool master, const char* buf, int n, bool nonblock) {
 }
 
 fs_node_t* pty_node(int i) { pty_t* p = get(i); return p ? p->node : NULL; }
+
+/* kernel-side masters (the desktop's extra terminals) */
+void pty_unlock(int i) { pty_t* p = get(i); if (p) p->locked = false; }
+void pty_set_size(int i, int rows, int cols) {
+    pty_t* p = get(i);
+    if (!p || (p->rows == rows && p->cols == cols)) return;
+    p->rows = (uint16_t)rows; p->cols = (uint16_t)cols;
+    signal_fg(p, 28);                                    /* SIGWINCH */
+}
 
 /* ---------------- ioctl ---------------- */
 
@@ -411,4 +422,21 @@ int pty_ioctl(int i, bool master, uint32_t req, uint32_t arg) {
             return 0;
     }
     return -EINVAL;
+}
+
+void kdbg(const char* s, int a, int b, int c) {
+    char buf[80];
+    int k = 0;
+    while (*s) buf[k++] = *s++;
+    int v[3] = { a, b, c };
+    for (int j = 0; j < 3; j++) {
+        buf[k++] = ' ';
+        int x = v[j];
+        if (x < 0) { buf[k++] = '-'; x = -x; }
+        char d[12]; int n = 0;
+        do { d[n++] = (char)('0' + x % 10); x /= 10; } while (x);
+        while (n) buf[k++] = d[--n];
+    }
+    buf[k++] = '\r'; buf[k++] = '\n';
+    for (int j = 0; j < k; j++) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, buf[j]); }
 }

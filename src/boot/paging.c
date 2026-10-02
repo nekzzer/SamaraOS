@@ -110,6 +110,10 @@ static void pf_isr(struct interrupt_frame* f, uint32_t err) {
     /* Lazily grown user stack (also hit by the kernel copying into it). */
     if (proc_handle_fault(cr2, err)) return;
     if ((f->cs & 3) == 3) proc_fault_kill("Segmentation fault", 11, f->eip, cr2);
+    /* kernel tripped over a bad pointer from a syscall: kill the process,
+       not the whole box. TODO proper copy_from_user + EFAULT */
+    if (cr2 >= USER_BASE && cr2 < USER_TOP && proc_current())
+        proc_fault_kill("bad user ptr", 11, f->eip, cr2);
     dump("PF", err, f->eip, f->cs, cr2);
     __asm__ volatile ("cli");
     for (;;) __asm__ volatile ("hlt");

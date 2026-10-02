@@ -122,25 +122,34 @@ static void fill_pid_dir(fs_node_t* d, proc_t* p, char* mem, uint32_t cap) {
     static const char* const long_state[] = { "R (running)", "S (sleeping)", "Z (zombie)" };
     b = (sb_t){ mem, 0, cap };
     sb_puts(&b, "Name:\t"); sb_puts(&b, p->name);
-    sb_puts(&b, "\nUmask:\t0"); { char t[8]; utoa((uint32_t)p->umask, t, 8); sb_puts(&b, t); }
+    sb_puts(&b, "\nUmask:\t0"); { char t[8]; utoa((uint32_t)p->sh->umask, t, 8); sb_puts(&b, t); }
     sb_puts(&b, "\nState:\t"); sb_puts(&b, long_state[s == 'R' ? 0 : s == 'S' ? 1 : 2]);
-    sb_puts(&b, "\nTgid:\t"); sb_int(&b, p->pid);
+    sb_puts(&b, "\nTgid:\t"); sb_int(&b, p->tgid);
     sb_puts(&b, "\nPid:\t"); sb_int(&b, p->pid);
     sb_puts(&b, "\nPPid:\t"); sb_int(&b, p->ppid);
     sb_puts(&b, "\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\n");
     int nfd = 0;
-    for (int i = 0; i < MAX_FDS; i++) if (p->fds[i]) nfd++;
+    for (int i = 0; i < MAX_FDS; i++) if (p->sh->fds[i]) nfd++;
     sb_puts(&b, "VmSize:\t"); sb_pad(&b, vsz_kb, 8); sb_puts(&b, " kB\n");
     sb_puts(&b, "VmRSS:\t"); sb_pad(&b, vsz_kb, 8); sb_puts(&b, " kB\n");
-    sb_puts(&b, "VmData:\t"); sb_pad(&b, (p->brk - p->brk_start) / 1024, 8); sb_puts(&b, " kB\n");
+    sb_puts(&b, "VmData:\t"); sb_pad(&b, (p->sh->brk - p->sh->brk_start) / 1024, 8); sb_puts(&b, " kB\n");
     sb_puts(&b, "Threads:\t1\nOpenFDs:\t"); sb_int(&b, nfd); sb_putc(&b, '\n');
     put(d, "status", &b);
 
     b = (sb_t){ mem, 0, cap };
     char path[256];
-    fs_path(p->cwd, path, sizeof(path));
+    fs_path(p->sh->cwd, path, sizeof(path));
     sb_puts(&b, path); sb_putc(&b, '\n');
     put(d, "cwd", &b);
+
+    /* task/<pid>/: htop reads the main thread from there. one thread per proc for now */
+    if (strcmp(d->parent->name, "task")) {
+        char name[12];
+        itoa(p->pid, name, 10);
+        fs_node_t* t = ensure(d, "task", FS_DIR, 0555);
+        fs_node_t* td = t ? ensure(t, name, FS_DIR, 0555) : NULL;
+        if (td) fill_pid_dir(td, p, mem, cap);
+    }
 }
 
 /* ---------------- global files ---------------- */

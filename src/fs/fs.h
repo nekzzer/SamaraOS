@@ -2,9 +2,9 @@
 #define SAMARA_FS_H
 #include "core/types.h"
 
-#define FS_NAME_MAX 32
+#define FS_NAME_MAX 128
 
-typedef enum { FS_FILE = 1, FS_DIR = 2 } fs_type_t;
+typedef enum { FS_FILE = 1, FS_DIR = 2, FS_LINK = 3 } fs_type_t;   /* LINK: data = target */
 
 typedef struct fs_node {
     char name[FS_NAME_MAX];
@@ -35,7 +35,9 @@ void        fs_add_disk_nodes(void);      /* after disks are probed */
 
 void        fs_init(void);
 fs_node_t*  fs_root(void);
-fs_node_t*  fs_resolve(fs_node_t* cwd, const char* path);   /* NULL if missing */
+fs_node_t*  fs_resolve(fs_node_t* cwd, const char* path);   /* NULL if missing; follows symlinks */
+fs_node_t*  fs_resolve_nf(fs_node_t* cwd, const char* path);  /* the last one is not followed */
+fs_node_t*  fs_symlink(fs_node_t* dir, const char* name, const char* target);
 fs_node_t*  fs_create(fs_node_t* cwd, const char* path, fs_type_t type);
 int         fs_unlink(fs_node_t* cwd, const char* path);
 int         fs_write(fs_node_t* file, const char* data, size_t len);  /* replaces */

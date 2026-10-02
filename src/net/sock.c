@@ -1,5 +1,6 @@
 #include "net/sock.h"
 #include "net/net.h"
+#include "core/io.h"
 #include "core/heap.h"
 #include "core/string.h"
 #include "core/task.h"
@@ -463,8 +464,11 @@ static void pump(void) {
     irq_restore(f);
 }
 
+static void ser(const char* m) { while (*m) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, *m++); } }
+
 static void netd(void) {
     net_init();                                        /* NIC may be absent: loopback still works */
+    ser("samara: "); ser(net_status()); ser("\r\n");
     for (;;) {
         pump();
         task_sleep_ms(2);

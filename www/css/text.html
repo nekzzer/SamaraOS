@@ -1,0 +1,59 @@
+<!DOCTYPE html><html><head><title>Text and colours</title><style>
+:root{--main:#1a5276;--gap:8px;--big:calc(var(--gap) * 3)}
+body{font-family:Georgia,serif;margin:16px;line-height:1.5}
+.s10{font-size:10px}.s13{font-size:13px}.s16{font-size:16px}.s20{font-size:20px}.s24{font-size:24px}.s32{font-size:32px}.s48{font-size:48px}
+.em{font-size:1.5em}.rem{font-size:1.25rem}.pt{font-size:18pt}.pc{font-size:120%}
+.b{font-weight:700}.i{font-style:italic}.bi{font:italic bold 18px/1.2 sans-serif}
+.m{font-family:"Courier New",monospace}
+.up{text-transform:uppercase}.lo{text-transform:lowercase}.cap{text-transform:capitalize}
+.ls{letter-spacing:4px}.ws{word-spacing:12px}
+.u{text-decoration:underline}.lt{text-decoration:line-through}.ov{text-decoration:overline}
+.ind{text-indent:40px}.c{text-align:center}.r{text-align:right}
+.lh{line-height:32px;background:#eef}
+.nw{white-space:nowrap;overflow:hidden;background:#fee}
+.pre{white-space:pre;font-family:monospace;background:#eee}
+.pl{white-space:pre-line;background:#efe}
+.vis{visibility:hidden}
+.sw{display:inline-block;width:70px;height:22px;margin:2px;font:11px sans-serif;color:#fff;text-align:center;line-height:22px}
+.var{color:var(--main);padding:var(--gap);border:2px solid var(--main);margin-bottom:var(--big)}
+.fb{color:var(--nope,#c0392b)}
+.calc{width:calc(100% - 80px);background:#ddf;margin-left:40px}
+.vw{width:50vw;background:#fdf}
+.ch{width:20ch;background:#dff}
+@media (min-width:300px){.mq1{background:#cfc}}
+@media (max-width:200px){.mq2{background:#fcc}}
+@media screen and (prefers-color-scheme:light){.mq3{background:#cfc}}
+@media print{.mq4{display:none}}
+@supports (display:grid){.sup{background:#cfc}}
+</style></head><body>
+<p><span class="s10">10px</span> <span class="s13">13px</span> <span class="s16">16px</span> <span class="s20">20px</span> <span class="s24">24px</span> <span class="s32">32px</span> <span class="s48">48px</span></p>
+<p><span class="em">1.5em</span> <span class="rem">1.25rem</span> <span class="pt">18pt</span> <span class="pc">120%</span></p>
+<p><span class="b">bold</span> <span class="i">italic text here</span> <span class="bi">font shorthand</span> <span class="m">monospace</span></p>
+<p><span class="up">uppercase</span> <span class="lo">LOWERCASE</span> <span class="cap">capitalize every word</span></p>
+<p><span class="ls">letter spacing</span> | <span class="ws">word spacing is wide</span></p>
+<p><span class="u">underline</span> <span class="lt">line-through</span> <span class="ov">overline</span></p>
+<p class="ind">text-indent 40px: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.</p>
+<p class="c">centered</p><p class="r">right aligned</p>
+<p class="lh">line-height 32px. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim.</p>
+<p class="nw">white-space nowrap: this long line does not wrap at all even though it is much much longer than the window is wide, so it gets cut</p>
+<div class="pre">pre:   keeps    spaces
+    and newlines</div>
+<div class="pl">pre-line collapses    spaces
+but keeps newlines</div>
+<p>before <span class="vis">INVISIBLE</span> after (gap)</p>
+<div>
+<span class="sw" style="background:#c0392b">#c0392b</span><span class="sw" style="background:#0a0">#0a0</span><span class="sw" style="background:#00f8">#00f8</span>
+<span class="sw" style="background:rgb(255 128 0)">rgb</span><span class="sw" style="background:rgba(0,0,0,.5)">rgba .5</span>
+<span class="sw" style="background:hsl(270,60%,50%)">hsl</span><span class="sw" style="background:hsla(120,100%,25%,.7)">hsla</span>
+<span class="sw" style="background:rebeccapurple">named</span><span class="sw" style="background:darkslategray">named</span>
+<span class="sw" style="background:linear-gradient(to right,red,blue)">gradient</span><span class="sw" style="background:tomato;color:currentColor">current</span>
+</div>
+<div class="var">var(--main) colour, border and padding from custom properties</div>
+<p class="fb">var() fallback red</p>
+<div class="calc">calc(100% - 80px), margin-left 40px</div>
+<div class="vw">50vw</div><div class="ch">20ch wide</div>
+<p class="mq1">@media min-width green</p><p class="mq2">@media max-width 200: not red</p>
+<p class="mq3">prefers-color-scheme light green</p><p class="mq4">@media print does not hide this</p>
+<p class="sup">@supports green</p>
+<p>Русский текст: съешь же ещё этих мягких французских булок.</p>
+</body></html>

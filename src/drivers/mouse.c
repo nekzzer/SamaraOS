@@ -119,6 +119,35 @@ void mouse_draw_cursor(void) {
     cursor_visible = true;
 }
 
+/* dy: up is positive (ps/2 way). dz: > 0 = wheel towards the user. Called from
+   the irq12 handler and from the usb poll task. */
+void mouse_feed(int dx, int dy, int dz, uint8_t newbtn) {
+    uint32_t fl;
+    __asm__ volatile ("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+    if (input_grabbed()) {
+        if (dx) input_push(IEV_REL, IEV_REL_X, dx);
+        if (dy) input_push(IEV_REL, IEV_REL_Y, -dy);
+        if (dz) input_push(IEV_REL, IEV_REL_WHEEL, -dz);   /* evdev: + = up */
+        for (int i = 0; i < 3; i++)
+            if ((newbtn ^ btn) & (1 << i))
+                input_push(IEV_KEY, (uint16_t)(0x110 + i), (newbtn >> i) & 1);
+        btn = newbtn;
+    } else {
+        btn = newbtn;
+        wheel_acc += dz;
+        mx += dx;
+        my -= dy;          /* invert Y to screen coords */
+
+        if (mx < 0) mx = 0;
+        if (mx > mxmax) mx = mxmax;
+        if (my < 0) my = 0;
+        if (my > mymax) my = mymax;
+
+        mouse_draw_cursor();
+    }
+    if (fl & 0x200) __asm__ volatile ("sti" ::: "memory");
+}
+
 __attribute__((interrupt))
 static void mouse_isr(struct interrupt_frame* f) {
     (void)f;
@@ -144,29 +173,7 @@ static void mouse_isr(struct interrupt_frame* f) {
     if (flags & 0x20) dy |= 0xFFFFFF00;
     if (flags & 0x40 || flags & 0x80) { pic_send_eoi(12); return; } /* overflow */
 
-    uint8_t newbtn = flags & 0x07;
-    if (input_grabbed()) {
-        if (dx) input_push(IEV_REL, IEV_REL_X, dx);
-        if (dy) input_push(IEV_REL, IEV_REL_Y, -dy);
-        if (dz) input_push(IEV_REL, IEV_REL_WHEEL, -dz);   /* evdev: + = up */
-        for (int i = 0; i < 3; i++)
-            if ((newbtn ^ btn) & (1 << i))
-                input_push(IEV_KEY, (uint16_t)(0x110 + i), (newbtn >> i) & 1);
-        btn = newbtn;
-        pic_send_eoi(12);
-        return;
-    }
-    btn = newbtn;
-    wheel_acc += dz;
-    mx += dx;
-    my -= dy;          /* invert Y to screen coords */
-
-    if (mx < 0) mx = 0;
-    if (mx > mxmax) mx = mxmax;
-    if (my < 0) my = 0;
-    if (my > mymax) my = mymax;
-
-    mouse_draw_cursor();
+    mouse_feed(dx, dy, dz, flags & 0x07);
     pic_send_eoi(12);
 }
 

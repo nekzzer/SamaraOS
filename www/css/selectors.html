@@ -1,0 +1,59 @@
+<!DOCTYPE html><html><head><title>Selectors</title><style>
+body{font-family:sans-serif;margin:16px}
+.t{padding:2px 6px;margin:2px 0;background:#fdd}
+/* every line should turn green */
+.a > .t{background:#cfc}
+.b .t{background:#cfc}
+.c + .t{background:#cfc}
+.d ~ .t{background:#cfc}
+[data-x]{background:#cfc}
+[data-y="yes"]{background:#cfc}
+[href^="http"]{background:#cfc}
+[href$=".pdf"]{background:#cfc}
+[title*="mid"]{background:#cfc}
+[class~="word"]{background:#cfc}
+ol li:first-child{background:#cfc}
+ol li:last-child{background:#cfc}
+ol li:nth-child(2){background:#cfc}
+.odd p:nth-child(odd){background:#cfc}
+.odd p:nth-child(even){background:#ccf}
+.not p:not(.skip){background:#cfc}
+:root .root{background:#cfc}
+.is :is(h3,h4){background:#cfc}
+#id.cls{background:#cfc}
+.spec{background:#cfc}
+div.spec{background:#fdd}
+#spec2{background:#cfc}
+.spec2{background:#fdd !important}
+.spec3{background:#cfc !important}
+#spec3{background:#fdd}
+.hov:hover{background:#fdd}
+.hov{background:#cfc}
+.ps::before{content:"\2192  before ";color:#070}
+.ps::after{content:" after";color:#070}
+.hidden{display:none}
+</style></head><body>
+<h2>All should be green</h2>
+<div class="a"><div class="t">child combinator &gt;</div></div>
+<div class="b"><span><div class="t">descendant combinator</div></span></div>
+<div class="c">(c)</div><div class="t">adjacent sibling +</div>
+<div class="d">(d)</div><p>x</p><div class="t">general sibling ~</div>
+<div class="t" data-x>[data-x]</div>
+<div class="t" data-y="yes">[data-y="yes"]</div>
+<a class="t" href="https://example.com/" style="display:block">[href^=http]</a>
+<a class="t" href="/doc.pdf" style="display:block">[href$=.pdf]</a>
+<div class="t" title="a mid b">[title*=mid]</div>
+<div class="t other word">[class~=word]</div>
+<ol><li class="t">first-child</li><li class="t">nth-child(2)</li><li class="t">last-child</li></ol>
+<div class="odd"><p class="t">odd (green)</p><p class="t">even (blue)</p><p class="t">odd (green)</p></div>
+<div class="not"><p class="t">:not(.skip) green</p><p class="t skip">.skip stays red (correct)</p></div>
+<div class="t root">:root ancestor</div>
+<div class="is"><h3 class="t">:is(h3,h4)</h3></div>
+<div class="t cls" id="id">#id.cls</div>
+<div class="t spec">.spec (div.spec is later but... wait, div.spec wins: red is correct)</div>
+<div class="t spec2" id="spec2">!important beats id: red is correct</div>
+<div class="t spec3" id="spec3">!important class beats id</div>
+<div class="t hov">:hover ignored</div>
+<div class="t ps">pseudo</div>
+<div class="t hidden">YOU SHOULD NOT SEE THIS</div>
+</body></html>

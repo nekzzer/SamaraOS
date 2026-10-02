@@ -226,6 +226,18 @@ set constantshow
 RC
 fi
 
+# GNU bash 5.2 (static, userland/build-bash.sh). busybox ash stays the default sh.
+BASH=$ROOT/toolchain/bash-5.2.21/bash
+[ -x "$BASH" ] && cp "$BASH" "$OUT/usr/bin/bash"
+
+# QuickJS: qjs, node (quickjs + node api layer) and domjs (runs page scripts
+# for the browser). Built by userland/build-quickjs.sh into build/js/.
+JSB=$ROOT/build/js
+if [ -x "$JSB/node" ]; then
+    cp "$JSB/qjs" "$JSB/node" "$JSB/domjs" "$OUT/usr/bin/"
+    ln -f "$OUT/usr/bin/node" "$OUT/usr/bin/nodejs"
+fi
+
 # MicroPython (static, built by userland/build-micropython.sh) + demos.
 MPY=$ROOT/toolchain/micropython/ports/unix/build-standard/micropython
 if [ -x "$MPY" ]; then
@@ -306,6 +318,32 @@ if [ -x "$TLS/curl" ]; then
     ln -f "$OUT/etc/ssl/certs/ca-certificates.crt" "$OUT/etc/ssl/cert.pem"
 fi
 
+# dynamic linking: musl's libc.so is the loader too. the kernel reads
+# PT_INTERP (/lib/ld-musl-i386.so.1) and starts there, ld.so does the rest
+mkdir -p "$OUT/lib"
+cp "$MUSL/lib/libc.so" "$OUT/lib/libc.so"
+cp "$MUSL/lib/libgcc_s.so.1" "$OUT/lib/"
+"$XBIN/i686-linux-musl-strip" "$OUT/lib/libc.so" "$OUT/lib/libgcc_s.so.1"
+ln -f "$OUT/lib/libc.so" "$OUT/lib/ld-musl-i386.so.1"
+mkdir -p "$OUT/etc"
+printf '/lib\n/usr/local/lib\n/usr/lib\n' > "$OUT/etc/ld-musl-i386.path"
+# tiny test: dyn.so + a program linked against it
+cat > "$OUT/usr/src/dyn.c" <<'C'
+#include <stdio.h>
+#include <dlfcn.h>
+int dyn_add(int a, int b);
+int main(void) {
+    printf("dynamic hello, 2+3=%d\n", dyn_add(2, 3));
+    void *h = dlopen("libdyn.so", RTLD_NOW);
+    int (*f)(int, int) = h ? (int (*)(int, int))dlsym(h, "dyn_add") : 0;
+    printf("dlopen: %s, f(40,2)=%d\n", h ? "ok" : dlerror(), f ? f(40, 2) : -1);
+    return 0;
+}
+C
+echo 'int dyn_add(int a, int b) { return a + b; }' > "$OUT/usr/src/libdyn.c"
+"$XBIN/i686-linux-musl-gcc" -O2 -s -shared -fPIC "$OUT/usr/src/libdyn.c" -o "$OUT/lib/libdyn.so"
+"$XBIN/i686-linux-musl-gcc" -O2 -s "$OUT/usr/src/dyn.c" -L"$OUT/lib" -ldyn -o "$OUT/usr/bin/dyntest"
+
 cd "$OUT"
-tar --format=ustar --owner=0 --group=0 -cf "$ROOT/userland/sysroot.tar" usr $( [ -d etc ] && echo etc )
+tar --format=ustar --owner=0 --group=0 -cf "$ROOT/userland/sysroot.tar" usr lib $( [ -d etc ] && echo etc )
 ls -la "$ROOT/userland/sysroot.tar"

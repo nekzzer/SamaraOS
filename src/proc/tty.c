@@ -107,7 +107,7 @@ int tty_read(char* buf, int n, bool nonblock) {
     if (n <= 0) return 0;
     proc_t* me = proc_current();
     if (me && me->tty_detached) return 0;          /* background job: EOF */
-    if (me) reader_pid = me->pid;
+    if (me) reader_pid = me->tgid;
     uint32_t deadline = 0;
     for (;;) {
         uint32_t f = irq_save();
@@ -134,7 +134,7 @@ int tty_read(char* buf, int n, bool nonblock) {
             else if ((int32_t)(pit_uptime_ms() - deadline) >= 0) return 0;
         }
         if (proc_interrupted()) return -4;               /* EINTR */
-        task_yield();
+        task_sleep_ms(2);
     }
 }
 

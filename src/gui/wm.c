@@ -1,6 +1,7 @@
 #include "gui/wm.h"
 #include "drivers/fbdev.h"
 #include "apps/browser.h"
+#include "apps/pterm.h"
 #include "apps/clock.h"
 #include "apps/mediaplayer.h"
 #include "apps/paint.h"
@@ -272,7 +273,20 @@ window_t* wm_open_info(int x, int y, int w, int h, const char* title, const char
     return win;
 }
 
+static window_t* main_terminal(int x, int y);
+
+/* The first Terminal is the kernel shell; asking again opens another one
+   (sh on a pty, apps/pterm.c), a bit lower and to the right. */
 window_t* wm_open_terminal(int x, int y) {
+    if (terminal_idx < 0 || !windows[terminal_idx].open) return main_terminal(x, y);
+    int k = 0;
+    for (int i = 0; i < WM_MAX_WINDOWS; i++) if (windows[i].open && windows[i].group == WG_TERMINAL) k++;
+    window_t* w = pterm_open(x + 28 * k, y + 28 * k);
+    if (!w) { restore(terminal_idx); return &windows[terminal_idx]; }
+    return w;
+}
+
+static window_t* main_terminal(int x, int y) {
     if (terminal_idx >= 0 && windows[terminal_idx].open) {
         restore(terminal_idx);
         return &windows[terminal_idx];
@@ -286,9 +300,20 @@ window_t* wm_open_terminal(int x, int y) {
     win->min_h = 5 * gfx_term_cell_h() + WM_TITLE_H + 6;
     win->term_x = x + 4;
     win->term_y = y + WM_TITLE_H + 2;
+    win->group = WG_TERMINAL;
     terminal_idx = (int)(win - windows);
     wm_terminal_init(win);
     return win;
+}
+
+void wm_damage(window_t* w, int x, int y, int cw, int ch) {
+    if (!w || !w->open || w->minimized) return;
+    rect_t c = client_of(w), r = R(x, y, cw, ch);
+    if (r.x0 < c.x0) r.x0 = c.x0;
+    if (r.y0 < c.y0) r.y0 = c.y0;
+    if (r.x1 > c.x1) r.x1 = c.x1;
+    if (r.y1 > c.y1) r.y1 = c.y1;
+    if (r.x1 > r.x0 && r.y1 > r.y0) damage_rect(r);
 }
 
 window_t* wm_open_app(int x, int y, int w, int h, const char* title,
@@ -540,6 +565,12 @@ static void build_background(int W, int H, bool force) {
     }
 }
 
+/* login screen wants the same wallpaper */
+uint32_t* wm_background(int W, int H) {
+    build_background(W, H, false);
+    return bg_cache;
+}
+
 /* ========================================================================
    Clock (CMOS RTC, polled once a second)
    ======================================================================== */
@@ -604,6 +635,13 @@ static rect_t tb_btn[WM_MAX_WINDOWS];
 static int    tb_btn_win[WM_MAX_WINDOWS];
 static int    n_tb;
 
+static int group_count(int g) {
+    if (!g) return 1;
+    int k = 0;
+    for (int i = 0; i < WM_MAX_WINDOWS; i++) if (windows[i].open && windows[i].group == g) k++;
+    return k;
+}
+
 static void layout_taskbar(void) {
     int W = gfx_w(), top = gfx_h() - TASKBAR_H;
     tb_start = R(8, top + 6, 32 + text_w(UIF_BIG, "samara") + 14, 28);
@@ -618,6 +656,15 @@ static void layout_taskbar(void) {
         while (j >= 0 && open_seq[order[j]] > open_seq[v]) { order[j + 1] = order[j]; j--; }
         order[j + 1] = v;
     }
+
+    /* windows of one group share a button: keep the first of each */
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        int g = windows[order[i]].group, dup = 0;
+        for (int j = 0; j < m && g; j++) if (windows[order[j]].group == g) dup = 1;
+        if (!dup) order[m++] = order[i];
+    }
+    n = m;
 
     int x = tb_start.x1 + 17, right = tb_net.x0 - 12;
     int bw = 188;
@@ -859,7 +906,7 @@ static void scan_icons(void) {
 /* Types a command line into the desktop terminal (opening it if needed)
    and runs it. Refuses while a program already owns the terminal. */
 bool wm_terminal_feed(const char* line) {
-    window_t* t = wm_open_terminal(120, 64);
+    window_t* t = main_terminal(120, 64);
     if (!t) return false;
     if (wm_terminal_busy()) return false;
     return wm_terminal_submit(t, line);
@@ -1164,13 +1211,24 @@ static void draw_taskbar(void) {
         int idx = tb_btn_win[i];
         window_t* w = &windows[idx];
         rect_t b = tb_btn[i];
-        bool foc = (idx == focused_idx && !w->minimized);
+        int cnt = group_count(w->group);
+        bool foc = (idx == focused_idx && !w->minimized) ||
+                   (cnt > 1 && focused_idx >= 0 && windows[focused_idx].group == w->group && !windows[focused_idx].minimized);
         bool hv = hovered(HOV_TASK, idx);
         if (foc || hv)
             gfx_rrect_fill(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0, 4, GFX_CORNERS_ALL,
                            foc ? C_BAR_ACTIVE : C_BAR_HOVER);
         uint32_t tc = foc || hv ? C_BAR_TEXT : w->minimized ? C_BAR_FAINT : C_BAR_DIM;
-        text_fit(b.x0 + 12, b.y0 + 14, UIF_REG, w->title, b.x1 - b.x0 - 24, tc);
+        int tw = b.x1 - b.x0 - 24;
+        if (cnt > 1) {                                   /* stacked: a count pill on the right */
+            char num[8];
+            itoa(cnt, num, 10);
+            int pw = text_w(UIF_SMALL, num) + 12;
+            gfx_rrect_fill(b.x1 - 10 - pw, b.y0 + 6, pw, 16, 8, GFX_CORNERS_ALL, foc ? C_ACCENT : C_BAR_PILL_HV);
+            uif_draw_center(b.x1 - 10 - pw, b.y0 + 6, pw, 16, UIF_SMALL, num, foc ? C_BAR : C_BAR_TEXT);
+            tw -= pw + 6;
+        }
+        text_fit(b.x0 + 12, b.y0 + 14, UIF_REG, cnt > 1 && w->group == WG_TERMINAL ? "Terminal" : w->title, tw, tc);
         if (foc) gfx_rect_fill(b.x0 + 10, b.y1 - 2, b.x1 - b.x0 - 20, 2, C_ACCENT);
     }
 
@@ -1579,6 +1637,29 @@ static void on_press(int mx, int my) {
         for (int i = 0; i < n_tb; i++) {
             if (!r_hit(tb_btn[i], mx, my)) continue;
             int idx = tb_btn_win[i];
+            int g = windows[idx].group;
+            if (group_count(g) > 1) {
+                /* stacked button: bring the group up, clicking again walks through it */
+                int cur = focused_idx >= 0 && windows[focused_idx].group == g && !windows[focused_idx].minimized ? focused_idx : -1;
+                int pick = -1;
+                if (cur >= 0) {
+                    uint32_t best = 0xFFFFFFFFu, low = 0xFFFFFFFFu;
+                    int first = -1;
+                    for (int k = 0; k < WM_MAX_WINDOWS; k++) {
+                        if (!windows[k].open || windows[k].group != g) continue;
+                        if (open_seq[k] > open_seq[cur] && open_seq[k] < best) { best = open_seq[k]; pick = k; }
+                        if (open_seq[k] < low) { low = open_seq[k]; first = k; }
+                    }
+                    if (pick < 0) pick = first;
+                } else {
+                    int bz = -1;
+                    for (int k = 0; k < WM_MAX_WINDOWS; k++)
+                        if (windows[k].open && windows[k].group == g && windows[k].z > bz) { bz = windows[k].z; pick = k; }
+                }
+                if (pick >= 0) { if (windows[pick].minimized) restore(pick); else set_focus(pick); }
+                damage_taskbar();
+                return;
+            }
             if (windows[idx].minimized)  restore(idx);
             else if (idx == focused_idx) minimize(idx);
             else                         set_focus(idx);

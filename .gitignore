@@ -45,3 +45,6 @@ quakegeneric-master/
 # clangd index / generated compile db
 .cache/
 compile_commands.json
+
+# claude code instructions (local only)
+CLAUDE.md

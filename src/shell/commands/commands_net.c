@@ -71,17 +71,22 @@ void cmd_ifconfig(int argc, char **argv) {
   (void)argv;
   if (ensure_net("ifconfig") != 0)
     return;
-  vga_puts("eth0  HWaddr ");
-  print_mac(net_mac());
-  vga_putc('\n');
-  vga_puts("      inet ");
-  print_ip(net_ip());
-  vga_puts("  mask 255.255.255.0  gw ");
-  print_ip(net_gw());
-  vga_putc('\n');
-  vga_puts("      status: ");
-  vga_puts(net_status());
-  vga_putc('\n');
+  for (int i = 0; i < net_ifcount(); i++) {
+    const char *name;
+    const uint8_t *mac;
+    uint32_t ip, mask, gw, rx, tx;
+    net_ifinfo(i, &name, &mac, &ip, &mask, &gw, &rx, &tx);
+    vga_printf("%s  HWaddr ", name);
+    print_mac(mac);
+    vga_puts("\n      inet ");
+    print_ip(ip);
+    vga_puts("  mask ");
+    print_ip(mask);
+    vga_puts("  gw ");
+    print_ip(gw);
+    vga_printf("\n      RX packets %u  TX packets %u\n", rx, tx);
+  }
+  vga_puts("lo    inet 127.0.0.1  mask 255.0.0.0\n");
 }
 
 void cmd_ping(int argc, char **argv) {

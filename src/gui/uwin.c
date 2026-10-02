@@ -106,7 +106,7 @@ static uwin_t* by_handle(uint32_t h) {
     proc_t* p = proc_current();
     if (h >= UWIN_MAX || !p) return NULL;
     uwin_t* u = &U[h];
-    if (u->state == U_FREE || u->pid != p->pid) return NULL;
+    if (u->state == U_FREE || u->pid != p->tgid) return NULL;
     return u;
 }
 
@@ -196,7 +196,7 @@ static uwin_t* text_target(uint32_t buf, int bw, int bh) {
     if (!p || !buf) return NULL;
     for (int i = 0; i < UWIN_MAX; i++) {
         uwin_t* u = &U[i];
-        if (u->state == U_OPEN && u->pid == p->pid && u->buf == buf && u->w == bw && u->h == bh)
+        if (u->state == U_OPEN && u->pid == p->tgid && u->buf == buf && u->w == bw && u->h == bh)
             return u;
     }
     return NULL;
@@ -340,7 +340,7 @@ static int32_t op_open(uint32_t a) {
     if (slot < 0) return -ENOMEM;
     uwin_t* u = &U[slot];
     memset(u, 0, sizeof(*u));
-    u->pid = p->pid;
+    u->pid = p->tgid;
     u->w = o.w; u->h = o.h; u->scale = o.scale;
     u->hover_x = u->hover_y = -1;
     if (!o.title || !ustr(o.title, u->title, sizeof(u->title))) strcpy(u->title, p->name);

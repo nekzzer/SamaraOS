@@ -1,0 +1,43 @@
+<!DOCTYPE html><html><head><title>CSS test</title><style>
+:root{--acc:#c0392b;--pad:12px}
+body{font-family:sans-serif;margin:0;background:#fafafa;color:#222}
+header{background:linear-gradient(90deg,#2c3e50,#4ca1af);color:white;padding:var(--pad) 20px}
+header h1{margin:0;font-size:32px}
+nav{display:flex;gap:10px;justify-content:center;background:#eee;padding:6px}
+nav a{padding:4px 10px;background:var(--acc);color:#fff;border-radius:6px;text-decoration:none}
+.wrap{max-width:700px;margin:20px auto;padding:0 10px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.card{border:1px solid #ccc;padding:8px;background:white}
+.card:nth-child(2){border-color:red}
+p + p{text-indent:2em}
+li:last-child{color:green}
+.x::before{content:"[B] ";color:blue}
+.x::after{content:" [A]";color:purple}
+.up{text-transform:uppercase;letter-spacing:2px}
+.strike{text-decoration:line-through}
+em{color:hsl(200,80%,40%)}
+.fl{float:right;width:120px;background:#ffd;border:2px dashed #aa0;padding:4px}
+.rel{position:relative;left:30px;color:rgba(0,0,0,.5)}
+table{border-collapse:collapse;width:100%}td,th{border:1px solid #888;padding:4px}
+tr:nth-child(odd) td{background:#eef}
+.hide{display:none}
+.big{font-size:calc(1rem + 10px)}
+.mono{font-family:monospace;background:#222;color:#0f0;padding:6px}
+@media (max-width:500px){body{background:red}}
+@media (prefers-color-scheme:dark){body{background:black}}
+</style></head><body>
+<header><h1>Hello CSS</h1><small>subtitle here</small></header>
+<nav><a href="#">One</a><a href="#">Two</a><a href="#">Three</a></nav>
+<div class="wrap">
+<div class="fl">Floating box on the right with some text</div>
+<p>First paragraph with <em>emphasis</em>, <b>bold</b> and <a href="/">a link</a>. Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor.</p>
+<p>Second paragraph should be indented. <span class="strike">struck</span> <span class="up">upper case</span> <span class="rel">relative</span></p>
+<p class="x">pseudo</p><p class="hide">HIDDEN TEXT</p><p class="big">Big text calc</p>
+<ol><li>one</li><li>two</li><li>three green</li></ol>
+<ul><li>disc<ul><li>circle</li></ul></li></ul>
+<div class="grid"><div class="card">Card 1</div><div class="card">Card 2 red</div><div class="card">Card 3</div><div class="card">Card 4</div></div>
+<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr><tr><td>3 longer cell</td><td>4</td></tr></table>
+<pre class="mono">mono  pre
+  text</pre>
+<div style="display:flex;justify-content:space-between;border-top:3px solid var(--acc);margin-top:10px"><span>left</span><span>right</span></div>
+</div></body></html>

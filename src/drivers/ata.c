@@ -1,4 +1,5 @@
 #include "drivers/ata.h"
+#include "drivers/virtio.h"
 #include "core/io.h"
 #include "core/string.h"
 #include "drivers/ahci.h"
@@ -88,6 +89,7 @@ static bool probe_drive(ata_t* d) {
 int ata_primary(void) {
     for (int i = 0; i < ATA_DRIVES; i++) if (drives[i].present) return i;
     for (int i = 0; i < AHCI_MAX_DISKS; i++) if (ahci_present(i)) return DISK_AHCI_BASE + i;
+    for (int i = 0; i < VBLK_MAX; i++) if (vblk_present(i)) return DISK_VIRTIO_BASE + i;
     return -1;
 }
 
@@ -107,27 +109,32 @@ bool ata_init_all(void) {
         if (probe_drive(&drives[i])) any = true;
     }
     if (ahci_init() > 0) any = true;
+    if (vblk_init() > 0) any = true;
     return any;
 }
 
 bool ata_drive_present(int idx) {
+    if (idx >= DISK_VIRTIO_BASE && idx < DISK_MAX) return vblk_present(idx - DISK_VIRTIO_BASE);
     if (idx >= DISK_AHCI_BASE && idx < DISK_MAX) return ahci_present(idx - DISK_AHCI_BASE);
     if (idx < 0 || idx >= ATA_DRIVES) return false;
     return drives[idx].present;
 }
 
 uint32_t ata_drive_sectors(int idx) {
+    if (idx >= DISK_VIRTIO_BASE && idx < DISK_MAX) return vblk_sectors(idx - DISK_VIRTIO_BASE);
     if (idx >= DISK_AHCI_BASE && idx < DISK_MAX) return ahci_sectors(idx - DISK_AHCI_BASE);
     if (idx < 0 || idx >= ATA_DRIVES) return 0;
     return drives[idx].sectors;
 }
 
 const char* ata_drive_name(int idx) {
-    static const char* const names[DISK_MAX] = { "hda", "hdb", "hdc", "hdd", "sda", "sdb", "sdc", "sdd" };
+    static const char* const names[DISK_MAX] = { "hda", "hdb", "hdc", "hdd", "sda", "sdb", "sdc", "sdd",
+                                                 "vda", "vdb", "vdc", "vdd" };
     return (idx >= 0 && idx < DISK_MAX) ? names[idx] : "?";
 }
 
 int ata_read(int idx, uint32_t lba, int count, void* buf) {
+    if (idx >= DISK_VIRTIO_BASE && idx < DISK_MAX) return vblk_read(idx - DISK_VIRTIO_BASE, lba, count, buf);
     if (idx >= DISK_AHCI_BASE && idx < DISK_MAX) return ahci_read(idx - DISK_AHCI_BASE, lba, count, buf);
     if (idx < 0 || idx >= ATA_DRIVES) return -1;
     ata_t* d = &drives[idx];
@@ -149,7 +156,9 @@ int ata_read(int idx, uint32_t lba, int count, void* buf) {
 
         for (int sector = 0; sector < chunk; sector++) {
             if (wait_drq(d) < 0) return -1;
-            for (int w = 0; w < 256; w++) *p++ = inw(d->io + 0);
+            /* rep insw: way less vm exits on kvm than 256 inw's */
+            int n = 256;
+            __asm__ volatile ("rep insw" : "+D"(p), "+c"(n) : "d"(d->io) : "memory");
             delay_400ns(d);
         }
 
@@ -160,6 +169,7 @@ int ata_read(int idx, uint32_t lba, int count, void* buf) {
 }
 
 int ata_write(int idx, uint32_t lba, int count, const void* buf) {
+    if (idx >= DISK_VIRTIO_BASE && idx < DISK_MAX) return vblk_write(idx - DISK_VIRTIO_BASE, lba, count, buf);
     if (idx >= DISK_AHCI_BASE && idx < DISK_MAX) return ahci_write(idx - DISK_AHCI_BASE, lba, count, buf);
     if (idx < 0 || idx >= ATA_DRIVES) return -1;
     ata_t* d = &drives[idx];

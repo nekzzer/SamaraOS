@@ -1,3 +1,5 @@
+#include "apps/pterm.h"
+#include "gui/wm.h"
 #include "../shell_priv.h"
 #include "apps/browser.h"
 #include "apps/clock.h"
@@ -104,6 +106,20 @@ void cmd_clock(int argc, char **argv) {
   }
   if (clock_open() != 0)
     vga_puts("clock: failed to open\n");
+}
+
+/* More Terminal windows (sh on a pty): term [count] */
+void cmd_term(int argc, char **argv) {
+  if (!uwin_wm_running()) {
+    vga_puts("term: enter 'desktop' first\n");
+    return;
+  }
+  int n = argc > 1 ? atoi(argv[1]) : 1;
+  for (int i = 0; i < n && i < 8; i++)
+    if (!pterm_open(160 + 28 * i, 90 + 28 * i)) {
+      vga_puts("term: failed\n");
+      return;
+    }
 }
 
 /* Launches the desktop (if not already) and opens the browser there. */

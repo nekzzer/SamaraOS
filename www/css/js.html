@@ -1,0 +1,28 @@
+<!DOCTYPE html><html><head><title>Live JS</title><style>
+body{font-family:sans-serif;margin:16px}
+button{padding:4px 10px}
+.box{border:1px solid #999;padding:8px;margin:8px 0;background:#fff}
+.on{background:#cfc}
+#tick{font-family:monospace;color:#060}
+</style></head><body>
+<h2>Live JavaScript</h2>
+<div class="box">Counter: <b id="n">0</b> <button id="inc">+1</button> <button onclick="document.getElementById('n').textContent='0'">reset</button></div>
+<div class="box">Timer: <span id="tick">...</span></div>
+<div class="box">Name: <input id="name" value=""> <button id="hi">Say hi</button> <div id="out"></div></div>
+<div class="box" id="tog">Click the link: <a href="#" id="toggle">toggle green</a></div>
+<div class="box">fetch(): <span id="f">waiting</span></div>
+<ul id="list"></ul>
+<div class="box"><a href="#" onclick="location.href='index.html';return false">location.href to index</a></div>
+<script>
+let n = 0;
+document.getElementById('inc').addEventListener('click', () => { n++; document.getElementById('n').textContent = n; });
+let s = 0;
+setInterval(() => { s++; document.getElementById('tick').textContent = s + ' s since load'; }, 1000);
+document.getElementById('hi').onclick = () => {
+  const v = document.getElementById('name').value;
+  document.getElementById('out').innerHTML = '<p>Hi, <b>' + (v || 'nobody') + '</b>!</p>';
+  const li = document.createElement('li'); li.textContent = 'said hi to ' + (v || 'nobody'); document.getElementById('list').appendChild(li);
+};
+document.getElementById('toggle').addEventListener('click', (e) => { e.preventDefault(); document.getElementById('tog').classList.toggle('on'); });
+fetch('index.html').then(r => r.text()).then(t => { document.getElementById('f').textContent = 'got ' + t.length + ' bytes'; });
+</script></body></html>

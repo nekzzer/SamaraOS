@@ -18,6 +18,9 @@ const char* net_status(void);
 const uint8_t* net_mac(void);
 uint32_t       net_ip(void);
 uint32_t       net_gw(void);
+/* all the cards: eth0, eth1, ... */
+int  net_ifcount(void);
+bool net_ifinfo(int i, const char** name, const uint8_t** mac, uint32_t* ip, uint32_t* mask, uint32_t* gw, uint32_t* rx, uint32_t* tx);
 
 /* Pump RX: dispatch ARP, ICMP, TCP. Call this in any loop that waits. */
 void net_poll(void);

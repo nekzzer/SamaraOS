@@ -62,6 +62,7 @@ void cmd_snake(int argc, char **argv);
 void cmd_player(int argc, char **argv);
 void cmd_paint(int argc, char **argv);
 void cmd_clock(int argc, char **argv);
+void cmd_term(int argc, char **argv);
 void cmd_browser(int argc, char **argv);
 void cmd_klayout(int argc, char **argv);
 

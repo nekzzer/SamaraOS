@@ -30,6 +30,7 @@
 
 #define SA_SIGINFO   0x00000004u
 #define SA_RESTORER  0x04000000u
+#define SA_ONSTACK   0x08000000u
 #define SA_RESTART   0x10000000u
 #define SA_NODEFER   0x40000000u
 #define SA_RESETHAND 0x80000000u
@@ -81,7 +82,7 @@ void proc_deliver_signal(regs_t* r, int nr, int32_t ret) {
     while (!(ready & SIGBIT(sig))) sig++;
     p->sig_pending &= ~SIGBIT(sig);
 
-    uint32_t handler = p->sa[sig].handler, flags = p->sa[sig].flags;
+    uint32_t handler = p->sh->sa[sig].handler, flags = p->sh->sa[sig].flags;
     if (handler <= 1) return;                        /* reset to DFL/IGN meanwhile */
 
     /* Interrupted syscall: restart it transparently, or report EINTR. */
@@ -93,9 +94,11 @@ void proc_deliver_signal(regs_t* r, int nr, int32_t ret) {
     uint64_t oldmask = p->in_sigsuspend ? p->saved_mask : p->sig_mask;
     p->in_sigsuspend = false;
     bool rt = (flags & SA_SIGINFO) != 0;
-    uint32_t restorer = (flags & SA_RESTORER) ? p->sa[sig].restorer : 0;
+    uint32_t restorer = (flags & SA_RESTORER) ? p->sh->sa[sig].restorer : 0;
 
     uint32_t sp = r->useresp;
+    bool on_alt = p->ss_size && sp - p->ss_sp <= p->ss_size;
+    if ((flags & SA_ONSTACK) && p->ss_size && !on_alt) sp = p->ss_sp + p->ss_size;
     uint32_t fx = (sp - 512) & ~15u;                 /* FPU state on top */
     uint32_t base;
     if (rt) base = (fx - (16 + 128 + 128)) & ~15u;
@@ -114,6 +117,7 @@ void proc_deliver_signal(regs_t* r, int nr, int32_t ret) {
         memset((void*)info, 0, 128 + 128);
         ((uint32_t*)info)[0] = (uint32_t)sig;        /* si_signo */
         uint32_t* u = (uint32_t*)uc;                 /* flags, link, stack[3] */
+        u[2] = p->ss_sp; u[3] = p->ss_size ? (on_alt ? 1 : 0) : 2; u[4] = p->ss_size;
         save_context((sigcontext_t*)(u + 5), r, fx, oldmask);
         memcpy(u + 5 + 22, &oldmask, 8);             /* uc_sigmask */
     } else {
@@ -123,8 +127,8 @@ void proc_deliver_signal(regs_t* r, int nr, int32_t ret) {
     }
 
     if (!(flags & SA_NODEFER)) p->sig_mask |= SIGBIT(sig);
-    p->sig_mask |= p->sa[sig].mask;
-    if (flags & SA_RESETHAND) { p->sa[sig].handler = 0; p->sa[sig].flags = 0; }
+    p->sig_mask |= p->sh->sa[sig].mask;
+    if (flags & SA_RESETHAND) { p->sh->sa[sig].handler = 0; p->sh->sa[sig].flags = 0; }
 
     r->useresp = base;
     r->eip = handler;
@@ -176,26 +180,41 @@ int proc_sigaction(int sig, const uint32_t* act, uint32_t* oact, bool old_abi) {
     /* rt layout: handler, flags, restorer, mask[2]; old: handler, mask, flags, restorer */
     if (oact) {
         if (old_abi) {
-            oact[0] = p->sa[sig].handler; oact[1] = (uint32_t)p->sa[sig].mask;
-            oact[2] = p->sa[sig].flags;   oact[3] = p->sa[sig].restorer;
+            oact[0] = p->sh->sa[sig].handler; oact[1] = (uint32_t)p->sh->sa[sig].mask;
+            oact[2] = p->sh->sa[sig].flags;   oact[3] = p->sh->sa[sig].restorer;
         } else {
-            oact[0] = p->sa[sig].handler; oact[1] = p->sa[sig].flags;
-            oact[2] = p->sa[sig].restorer;
-            memcpy(&oact[3], &p->sa[sig].mask, 8);
+            oact[0] = p->sh->sa[sig].handler; oact[1] = p->sh->sa[sig].flags;
+            oact[2] = p->sh->sa[sig].restorer;
+            memcpy(&oact[3], &p->sh->sa[sig].mask, 8);
         }
     }
     if (act) {
         if (sig == 9 || sig == 19) return -EINVAL;
-        p->sa[sig].handler = act[0];
+        p->sh->sa[sig].handler = act[0];
         if (old_abi) {
-            p->sa[sig].mask = act[1]; p->sa[sig].flags = act[2]; p->sa[sig].restorer = act[3];
+            p->sh->sa[sig].mask = act[1]; p->sh->sa[sig].flags = act[2]; p->sh->sa[sig].restorer = act[3];
         } else {
-            p->sa[sig].flags = act[1]; p->sa[sig].restorer = act[2];
-            memcpy(&p->sa[sig].mask, &act[3], 8);
+            p->sh->sa[sig].flags = act[1]; p->sh->sa[sig].restorer = act[2];
+            memcpy(&p->sh->sa[sig].mask, &act[3], 8);
         }
-        p->sa[sig].mask &= ~UNBLOCKABLE;
+        p->sh->sa[sig].mask &= ~UNBLOCKABLE;
         if (act[0] <= 1) p->sig_pending &= ~SIGBIT(sig);   /* now DFL/IGN: drop */
     }
+    return 0;
+}
+
+/* stack_t: sp, flags, size. SS_ONSTACK 1, SS_DISABLE 2 */
+int proc_sigaltstack(const uint32_t* ss, uint32_t* old, uint32_t esp) {
+    proc_t* p = proc_current();
+    bool on = p->ss_size && esp - p->ss_sp <= p->ss_size;
+    if (old) { old[0] = p->ss_sp; old[1] = p->ss_size ? (on ? 1 : 0) : 2; old[2] = p->ss_size; }
+    if (!ss) return 0;
+    if (on) return -1;                               /* EPERM */
+    if (ss[1] & 2) { p->ss_sp = p->ss_size = 0; return 0; }
+    if (ss[1] & ~2u) return -EINVAL;
+    if (ss[2] < 2048) return -12;                    /* ENOMEM, MINSIGSTKSZ */
+    p->ss_sp = ss[0];
+    p->ss_size = ss[2];
     return 0;
 }
 
@@ -212,7 +231,7 @@ int proc_sigsuspend(const uint64_t* mask) {
    must wait for the process's next syscall instead of tearing it down. */
 void proc_check_alarm(proc_t* p, bool from_irq) {
     if (!p || !p->alarm_at || (int32_t)(pit_uptime_ms() - p->alarm_at) < 0) return;
-    if (from_irq && p->sa[14].handler <= 1) return;
+    if (from_irq && p->sh->sa[14].handler <= 1) return;
     p->alarm_at = p->alarm_interval ? pit_uptime_ms() + p->alarm_interval : 0;
     proc_send_signal(p, 14);                         /* SIGALRM */
 }

@@ -20,6 +20,8 @@ bool pty_readable(int i, bool master);
 bool pty_writable(int i, bool master);
 int  pty_ioctl(int i, bool master, uint32_t req, uint32_t arg);
 int  pty_pending(int i, bool master);          /* FIONREAD */
+void pty_unlock(int i);
+void pty_set_size(int i, int rows, int cols);
 struct fs_node;
 struct fs_node* pty_node(int i);               /* /dev/pts/i */
 

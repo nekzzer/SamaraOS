@@ -10,7 +10,8 @@
 
 #define ATA_DRIVES 4                 /* legacy IDE channels */
 #define DISK_AHCI_BASE 4             /* indices 4..7: SATA disks behind AHCI */
-#define DISK_MAX 8
+#define DISK_VIRTIO_BASE 8           /* 8..11: virtio-blk, /dev/vda.. */
+#define DISK_MAX 12
 #define ATA_DRIVE_PRIMARY_MASTER     0
 #define ATA_DRIVE_PRIMARY_SLAVE      1
 #define ATA_DRIVE_SECONDARY_MASTER   2

@@ -233,7 +233,7 @@ int userland_install(void) {
     put_text("/etc/hosts", "127.0.0.1\tlocalhost\n10.0.2.15\tsamara\n10.0.2.2\thost gateway\n");
     put_text("/etc/resolv.conf", "nameserver 10.0.2.3\nnameserver 1.1.1.1\n");
     put_text("/etc/services", "http\t80/tcp\nhttps\t443/tcp\ndomain\t53/udp\n");
-    put_text("/etc/shells", "/bin/sh\n/bin/ash\n");
+    put_text("/etc/shells", "/bin/sh\n/bin/ash\n/usr/bin/bash\n");
     put_text("/etc/motd", "");                    /* login shells show samarafetch instead */
     /* every interactive sh ($ENV): gradient prompt, colours */
     put_text("/etc/shrc",
@@ -242,10 +242,10 @@ int userland_install(void) {
              "PS1=\"$(samarafetch --ps1 2>/dev/null || echo '\\u@\\h:\\w\\$ ')\"\n"
              "alias ls='ls --color=auto' ll='ls -l --color=auto' la='ls -la --color=auto'\n"
              "alias grep='grep --color=auto'\n"
-             "alias python=micropython python3=micropython\n");
+             "if [ -x /usr/local/bin/python3 ]; then alias python=python3; else alias python=micropython python3=micropython; fi\n");
     /* login shells (ssh, telnet): the logo + system info, then the above */
     put_text("/etc/profile",
-             "export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/games:/opt/gcc/bin\n"
+             "export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/games:/usr/local/bin:/opt/gcc/bin\n"
              "export ENV=/etc/shrc\n"
              "case $- in *i*) samarafetch 2>/dev/null ;; esac\n"
              ". /etc/shrc\n");
