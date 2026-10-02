@@ -82,6 +82,15 @@ static char state_of(proc_t* p) {
     return p == proc_current() ? 'R' : 'S';
 }
 
+static int nthreads(proc_t* p) {
+    int n = 0;
+    for (int i = 0; i < proc_count(); i++) {
+        proc_t* q = proc_at(i);
+        if (q && q->state == P_ALIVE && q->tgid == p->tgid) n++;
+    }
+    return n ? n : 1;
+}
+
 static void fill_pid_dir(fs_node_t* d, proc_t* p, char* mem, uint32_t cap) {
     sb_t b;
     uint32_t pages = p->pd ? vmm_count_pages(p->pd) : 0;
@@ -99,7 +108,7 @@ static void fill_pid_dir(fs_node_t* d, proc_t* p, char* mem, uint32_t cap) {
     sb_int(&b, p->sid); sb_puts(&b, " 1025 ");                 /* tty_nr: tty1 */
     sb_int(&b, p->pgid); sb_puts(&b, " 4194560 0 0 0 0 ");     /* tpgid flags minflt.. */
     sb_num(&b, ut); sb_putc(&b, ' '); sb_num(&b, st);
-    sb_puts(&b, " 0 0 20 0 1 0 ");                             /* cutime cstime prio nice threads itreal */
+    sb_puts(&b, " 0 0 20 0 "); sb_int(&b, nthreads(p)); sb_puts(&b, " 0 ");   /* cutime cstime prio nice threads itreal */
     sb_num(&b, start); sb_putc(&b, ' ');
     sb_num(&b, vsz_kb * 1024); sb_putc(&b, ' ');
     sb_num(&b, pages);
@@ -133,7 +142,7 @@ static void fill_pid_dir(fs_node_t* d, proc_t* p, char* mem, uint32_t cap) {
     sb_puts(&b, "VmSize:\t"); sb_pad(&b, vsz_kb, 8); sb_puts(&b, " kB\n");
     sb_puts(&b, "VmRSS:\t"); sb_pad(&b, vsz_kb, 8); sb_puts(&b, " kB\n");
     sb_puts(&b, "VmData:\t"); sb_pad(&b, (p->sh->brk - p->sh->brk_start) / 1024, 8); sb_puts(&b, " kB\n");
-    sb_puts(&b, "Threads:\t1\nOpenFDs:\t"); sb_int(&b, nfd); sb_putc(&b, '\n');
+    sb_puts(&b, "Threads:\t"); sb_int(&b, nthreads(p)); sb_puts(&b, "\nOpenFDs:\t"); sb_int(&b, nfd); sb_putc(&b, '\n');
     put(d, "status", &b);
 
     b = (sb_t){ mem, 0, cap };
@@ -142,13 +151,48 @@ static void fill_pid_dir(fs_node_t* d, proc_t* p, char* mem, uint32_t cap) {
     sb_puts(&b, path); sb_putc(&b, '\n');
     put(d, "cwd", &b);
 
-    /* task/<pid>/: htop reads the main thread from there. one thread per proc for now */
+    // no io accounting, htop just wants the file
+    b = (sb_t){ mem, 0, cap };
+    sb_puts(&b, "rchar: 0\nwchar: 0\nsyscr: 0\nsyscw: 0\nread_bytes: 0\nwrite_bytes: 0\ncancelled_write_bytes: 0\n");
+    put(d, "io", &b);
+
+    /* maps: rough, from what we know without walking page tables (too slow,
+       this runs on every /proc lookup). mmap area is one blob */
+    b = (sb_t){ mem, 0, cap };
+    char hx[12];
+#define HX(v) do { utoa((v), hx, 16); for (int _i = (int)strlen(hx); _i < 8; _i++) sb_putc(&b, '0'); sb_puts(&b, hx); } while (0)
+    if (p->sh->brk_start > 0x08048000u) {
+        HX(0x08048000u); sb_putc(&b, '-'); HX(p->sh->brk_start);
+        sb_puts(&b, " r-xp 00000000 00:00 0          "); sb_puts(&b, p->name); sb_putc(&b, '\n');
+    }
+    if (p->sh->brk > p->sh->brk_start) {
+        HX(p->sh->brk_start); sb_putc(&b, '-'); HX((p->sh->brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
+        sb_puts(&b, " rw-p 00000000 00:00 0          [heap]\n");
+    }
+    HX(USER_STACK_TOP - USER_STACK_MAX); sb_putc(&b, '-'); HX(USER_STACK_TOP);
+    sb_puts(&b, " rw-p 00000000 00:00 0          [stack]\n");
+#undef HX
+    put(d, "maps", &b);
+
+    /* task/<tid>/ for every thread of the group, htop reads the main one from there */
     if (strcmp(d->parent->name, "task")) {
-        char name[12];
-        itoa(p->pid, name, 10);
         fs_node_t* t = ensure(d, "task", FS_DIR, 0555);
-        fs_node_t* td = t ? ensure(t, name, FS_DIR, 0555) : NULL;
-        if (td) fill_pid_dir(td, p, mem, cap);
+        if (!t) return;
+        fs_node_t* c = t->child;
+        while (c) {
+            fs_node_t* next = c->next;
+            proc_t* q = proc_by_pid(atoi(c->name));
+            if (!q || q->tgid != p->tgid) remove_tree(c);
+            c = next;
+        }
+        for (int i = 0; i < proc_count(); i++) {
+            proc_t* q = proc_at(i);
+            if (!q || q->tgid != p->tgid) continue;
+            char name[12];
+            itoa(q->pid, name, 10);
+            fs_node_t* td = ensure(t, name, FS_DIR, 0555);
+            if (td) fill_pid_dir(td, q, mem, cap);
+        }
     }
 }
 
@@ -241,14 +285,14 @@ void procfs_refresh(void) {
         fs_node_t* next = c->next;
         if (c->type == FS_DIR && is_pid_name(c->name)) {
             proc_t* p = proc_by_pid(atoi(c->name));
-            if (!p) remove_tree(c);
+            if (!p || p->is_thread) remove_tree(c);     // threads live in task/ only
         }
         c = next;
     }
 
     for (int i = 0; i < proc_count(); i++) {
         proc_t* p = proc_at(i);
-        if (!p) continue;
+        if (!p || p->is_thread) continue;
         char name[12];
         itoa(p->pid, name, 10);
         fs_node_t* d = ensure(proc_root, name, FS_DIR, 0555);
