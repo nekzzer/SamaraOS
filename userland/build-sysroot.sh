@@ -327,6 +327,14 @@ cp "$MUSL/lib/libgcc_s.so.1" "$OUT/lib/"
 ln -f "$OUT/lib/libc.so" "$OUT/lib/ld-musl-i386.so.1"
 mkdir -p "$OUT/etc"
 printf '/lib\n/usr/local/lib\n/usr/lib\n' > "$OUT/etc/ld-musl-i386.path"
+# fastfetch, neofetch and co read this for the OS line
+cat > "$OUT/etc/os-release" <<'OS'
+NAME="SamaraOS"
+PRETTY_NAME="SamaraOS 0.5"
+ID=samara
+VERSION_ID=0.5
+HOME_URL="https://github.com/nekzzer/SamaraOS"
+OS
 # tiny test: dyn.so + a program linked against it
 cat > "$OUT/usr/src/dyn.c" <<'C'
 #include <stdio.h>
@@ -343,6 +351,13 @@ C
 echo 'int dyn_add(int a, int b) { return a + b; }' > "$OUT/usr/src/libdyn.c"
 "$XBIN/i686-linux-musl-gcc" -O2 -s -shared -fPIC "$OUT/usr/src/libdyn.c" -o "$OUT/lib/libdyn.so"
 "$XBIN/i686-linux-musl-gcc" -O2 -s "$OUT/usr/src/dyn.c" -L"$OUT/lib" -ldyn -o "$OUT/usr/bin/dyntest"
+
+# htop + fastfetch out of the box (dynamic, need the /lib stuff above).
+# built by build-ports.sh htop fastfetch
+P=$ROOT/toolchain/ports
+[ -x "$P/htop-3.3.0/htop" ] && cp "$P/htop-3.3.0/htop" "$OUT/usr/bin/"
+[ -x "$P/fastfetch-2.21.3/build-i686/fastfetch" ] && cp "$P/fastfetch-2.21.3/build-i686/fastfetch" "$OUT/usr/bin/"
+"$XBIN/i686-linux-musl-strip" "$OUT/usr/bin/htop" "$OUT/usr/bin/fastfetch" 2>/dev/null || true
 
 cd "$OUT"
 tar --format=ustar --owner=0 --group=0 -cf "$ROOT/userland/sysroot.tar" usr lib $( [ -d etc ] && echo etc )
