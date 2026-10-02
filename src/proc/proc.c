@@ -136,6 +136,7 @@ typedef struct {
 
 #define PT_LOAD 1
 #define PT_INTERP 3
+#define PT_DYNAMIC 2
 #define PT_PHDR 6
 #define PF_W    2
 
@@ -191,7 +192,16 @@ static int load_elf(uint32_t pd, const fs_node_t* n, image_t* img, uint32_t bias
     /* Text read-only (so fork can share it), then re-open writable segments
        in case one shares a page with text. A static-pie writes its own
        relocations into RELRO data, which lives in a writable segment. */
-    for (int i = 0; i < h->phnum; i++)
+    // DT_TEXTREL (22) or DF_TEXTREL in DT_FLAGS: ld.so patches the text, leave it rw.
+    // non-PIC .a in a pie does that (htop + ncurses crashed on it)
+    bool textrel = false;
+    for (int i = 0; i < h->phnum; i++) {
+        if (ph[i].type != PT_DYNAMIC || ph[i].offset + ph[i].filesz > n->size) continue;
+        const uint32_t* d = (const uint32_t*)(n->data + ph[i].offset);
+        for (uint32_t k = 0; k + 1 < ph[i].filesz / 4 && d[k]; k += 2)
+            if (d[k] == 22 || (d[k] == 30 && (d[k + 1] & 4))) textrel = true;
+    }
+    for (int i = 0; i < h->phnum && !textrel; i++)
         if (ph[i].type == PT_LOAD && !(ph[i].flags & PF_W))
             vmm_set_writable(pd, ph[i].vaddr + bias, ph[i].memsz, false);
     for (int i = 0; i < h->phnum; i++)
