@@ -1508,6 +1508,11 @@ static int32_t dispatch(regs_t* r) {
         case 240: return do_futex(a, b, c, d, e, f6, false);
         case 422: return do_futex(a, b, c, d, e, f6, true);       /* futex_time64 */
         case 219: return 0;                                          /* madvise: advisory */
+        // eventfd(2), timerfd, signalfd(4), epoll*, memfd: not here yet. glib/qemu fall back
+        // to pipes and poll on ENOSYS, so just say no without spamming the log
+        case 323: case 328: case 322: case 325: case 326: case 321: case 327:
+        case 254: case 329: case 255: case 256: case 319: case 356:
+            return -ENOSYS;
         case 242:                                                    /* sched_getaffinity: one cpu, no smp yet */
             if (c < 4) return -EINVAL;
             UCHK((void*)d, c);
