@@ -23,7 +23,7 @@ xsamara        # X11 + Mesa, once the X packages are in (see "X11")
 * X.Org 21 on the framebuffer with keyboard and mouse, Mesa llvmpipe
   (OpenGL 4.5), glxgears at ~47 FPS in QEMU
 * graphical desktop with a compositing window manager at 60 FPS
-* ~230 Linux system calls: `fork`, `execve`, `clone` threads, `futex`,
+* ~210 Linux system calls: `fork`, `execve`, `clone` threads, `futex`,
   signals, pipes, unix and inet sockets (with fd passing), ptys, netlink,
   `epoll`, SysV shm
 * dynamic linking (`ld-musl`), PIE and static PIE binaries
