@@ -11,16 +11,21 @@ packages straight from the Alpine Linux repositories through `apk`.
 
 ```
 apk update
-apk add python3 git vim btop zsh openssh
+apk add python3 git vim btop zsh openssh openjdk8-jre-base
 curl -Lso- bench.sh | bash
+xsamara        # X11 + Mesa, once the X packages are in (see "X11")
 ```
 
 ## Highlights
 
-* `apk` from Alpine Linux (x86) out of the box: thousands of ready packages
+* `apk` from Alpine Linux (x86) out of the box: thousands of ready packages,
+  kept across reboots on an ext2 root disk
+* X.Org 21 on the framebuffer with keyboard and mouse, Mesa llvmpipe
+  (OpenGL 4.5), glxgears at ~47 FPS in QEMU
 * graphical desktop with a compositing window manager at 60 FPS
-* ~210 Linux system calls: `fork`, `execve`, `clone` threads, `futex`,
-  signals, pipes, unix and inet sockets, ptys, netlink
+* ~230 Linux system calls: `fork`, `execve`, `clone` threads, `futex`,
+  signals, pipes, unix and inet sockets (with fd passing), ptys, netlink,
+  `epoll`, SysV shm
 * dynamic linking (`ld-musl`), PIE and static PIE binaries
 * own TCP/IP stack with DHCP, several network cards (RTL8139, Intel e1000,
   virtio-net), SSH and telnet servers
@@ -62,6 +67,7 @@ Userland (optional, the repo ships `userland/sysroot.tar`):
 | `make run NIC=e1000` | network card: `rtl8139` (default), `e1000`, `virtio-net-pci` |
 | `make run NICS=3` | extra virtio-net cards, each on its own NAT (eth1, eth2) |
 | `make run VDISK=build/ports.img` | attach an ext2 disk as virtio-blk (`/dev/vda`) |
+| `make run ROOTDISK=` | without the persistent root disk (`build/root.img`) |
 | `make run VIDEO=1920x1080` | screen size (default 1600x900) |
 | `make run APPEND="..."` | extra kernel options |
 | `make run QDISPLAY="-display none"` | headless |
@@ -105,9 +111,30 @@ figlet. What it took on the kernel side:
 * `AF_NETLINK` route dumps for `getifaddrs()` (btop)
 * `LANG=C.UTF-8`, `/etc/fstab`, `/etc/mtab`
 
-The root file system is in RAM, so packages are gone after a reboot (see
-Limits). When a program hits a missing syscall the kernel prints
+`make run` attaches `build/root.img` (2 GB ext2 labelled `/`, created on the
+first run). It is merged into the root at boot, so installed packages and
+changes in `/usr`, `/lib`, `/etc`, `/root` survive a reboot. Files are read
+from it on first use, not at mount, and clean ones are dropped again when
+memory runs low. When a program hits a missing syscall the kernel prints
 `[sys] pid N (prog) unimplemented syscall NNN` on the console.
+
+## X11
+
+```
+apk add xorg-server xf86-video-fbdev xf86-input-evdev xterm twm font-misc-misc \
+        mesa-dri-gallium llvm17-libs mesa-demos
+xsamara
+```
+
+`xsamara` starts Xorg on `/dev/fb0` with `/etc/X11/xorg.conf` (both ship
+with the OS), runs `~/.xinitrc` or twm + xterm, and stops X when that
+ends. Input comes from `/dev/input-kbd` and `/dev/input-mouse`, evdev style
+devices for the Xorg evdev driver. Ctrl+Alt+Q takes the keyboard back if
+something hangs.
+
+What X needed from the kernel: named AF_UNIX sockets with `SCM_RIGHTS`,
+`epoll`, `mmap` of the framebuffer, `FBIOPUT_VSCREENINFO`,
+`/sys/class/graphics/fb0`, SysV shm for MIT-SHM, evdev ioctls.
 
 ## Kernel
 
@@ -152,7 +179,7 @@ Limits). When a program hits a missing syscall the kernel prints
 
 | Path | What it is |
 |---|---|
-| `/` | ramfs in memory, cleared on reboot, symlinks, names up to 127 chars |
+| `/` | ramfs in memory with symlinks, names up to 127 chars; the ext2 root disk is merged into it |
 | `/mnt` | FAT32 on `disk.img`, read and write, long names, persistent |
 | `/usr/local` | ext2 disk labelled `/usr/local` (`VDISK=build/ports.img`), read and write |
 | `/proc` | `meminfo`, `cpuinfo`, `uptime`, `mounts`, `/proc/<pid>/` with `maps`, `io`, `task/` |
@@ -160,7 +187,10 @@ Limits). When a program hits a missing syscall the kernel prints
 | `/opt/gcc` | gcc 11, binutils, make |
 | `/usr/src/samaraos` | kernel sources |
 
-ext2 disks are mounted by their label; ext3 and ext4 mount read only.
+ext2 disks are mounted by their label (`/` merges into the root,
+`/usr/local` goes there); ext3 and ext4 mount read only. Writes are
+incremental: a file keeps its inode and blocks, only changed blocks go to
+the disk.
 
 ## Drivers
 
@@ -404,16 +434,28 @@ Pass them with `make run APPEND="..."`.
 
 * one CPU core
 * IPv4 only
-* `/` is in RAM: `apk add` is gone after a reboot, only `/mnt` and ext2
-  disks survive
-* no `epoll`, `eventfd`, `timerfd`, `memfd` yet (programs that need them,
-  like nodejs, fail)
-* no X server yet, so no graphical Alpine packages
+* no `eventfd`, `timerfd`, `memfd` yet (nodejs and friends fail)
+* X has no hardware acceleration (llvmpipe on one core) and no mode
+  switching: it runs in the boot resolution
+* the file cache is ~340 MB of a 1 GB guest; a single file bigger than
+  that can't be opened
 * wide characters (CJK, emoji) are not drawn
 * browser: no progressive JPEG and no SVG, no `z-index`, `transform`,
   `box-shadow`, `:hover`; big pages (over 400 KB) get CSS but no scripts
 
 ## Recent work
+
+**X11 and Mesa.** See "X11". glxgears went from 1.9 to 47 FPS once SysV
+shm was there (MIT-SHM instead of every frame through the socket) and pipes
+got 64 KB buffers with `memcpy`.
+
+**Java.** openjdk8 (the only one Alpine has for x86) runs: `/proc/self/exe`
+for `$ORIGIN` in RPATH, and the stack start in `/proc/self/stat` pointed
+one byte past the stack.
+
+**ext2 root disk.** Incremental write back, lazy file reads, eviction of
+clean files when the file arena is full, in place growth of file buffers
+(libLLVM is 161 MB).
 
 **apk and Alpine packages.** See "Packages". The biggest one was DNS:
 `recvmsg` passed a kernel stack pointer to the user pointer check when it
@@ -448,5 +490,5 @@ dynamic linking with `.so` files, htop and fastfetch, procfs threads and
 maps, yutani, a CSS engine for the browser, many terminals, threads,
 bash 5.2, USB mouse, QuickJS with `node` and `domjs`.
 
-**Next:** packages that survive a reboot (ext2 root for `/usr`, `/lib`,
-`/etc/apk`), `epoll` and friends, SMP, an X server.
+**Next:** SMP, `eventfd`/`timerfd`/`memfd`, interrupts off for too long
+at boot (KVM then replays timer ticks, see the KVM note).
