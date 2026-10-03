@@ -3,25 +3,33 @@
 A hobby operating system for 32-bit x86 (i686), written in C.
 It boots via Multiboot and runs in QEMU.
 
-The kernel is about 30k lines of own code (38k with userland, tools and
-build scripts, not counting DOOM and generated font tables). User programs
-are ordinary static Linux binaries (musl): the kernel runs them through a
-Linux i386 compatible system call interface. So busybox, bash, nano, gcc,
-curl, QuickJS, MicroPython and dropbear SSH work inside SamaraOS without
-changes.
+About 32k lines of own kernel code (43k with userland, tools and build
+scripts, not counting DOOM and generated font tables). The kernel speaks
+the Linux i386 system call ABI, so ordinary Linux programs built against
+musl run as they are: static ones, dynamic ones with `.so` libraries, and
+packages straight from the Alpine Linux repositories through `apk`.
+
+```
+apk update
+apk add python3 git vim btop zsh openssh
+curl -Lso- bench.sh | bash
+```
 
 ## Highlights
 
+* `apk` from Alpine Linux (x86) out of the box: thousands of ready packages
 * graphical desktop with a compositing window manager at 60 FPS
-* ~190 Linux system calls: `fork`, `execve`, `clone` threads, `futex`,
-  signals, pipes, sockets, ptys
-* own TCP/IP stack, internet through QEMU NAT, SSH and telnet servers
+* ~210 Linux system calls: `fork`, `execve`, `clone` threads, `futex`,
+  signals, pipes, unix and inet sockets, ptys, netlink
+* dynamic linking (`ld-musl`), PIE and static PIE binaries
+* own TCP/IP stack with DHCP, several network cards (RTL8139, Intel e1000,
+  virtio-net), SSH and telnet servers
 * HTTPS (curl + mbedTLS) and a web browser with its own CSS engine and
   JavaScript (QuickJS + a small DOM)
-* bash 5.2, busybox, nano, gcc 11 inside the OS, and the OS can rebuild
-  its own kernel
+* bash 5.2, zsh, busybox, nano, gcc 11 inside the OS, and the OS can
+  rebuild its own kernel
+* FAT32 and ext2 with write support, ext3/ext4 read only, virtio-blk disks
 * any number of terminal windows, stacked into one taskbar button
-* FAT32 disk with read and write support
 * USB mouse (UHCI), SoundBlaster 16
 * DOOM, Tetris, Snake, Breakout, Paint, a music player
 
@@ -51,6 +59,9 @@ Userland (optional, the repo ships `userland/sysroot.tar`):
 |---|---|
 | `make run` | runs the newest kernel (host build or the one the OS built itself) |
 | `make run SELF=0` | always the host built kernel (use this while developing) |
+| `make run NIC=e1000` | network card: `rtl8139` (default), `e1000`, `virtio-net-pci` |
+| `make run NICS=3` | extra virtio-net cards, each on its own NAT (eth1, eth2) |
+| `make run VDISK=build/ports.img` | attach an ext2 disk as virtio-blk (`/dev/vda`) |
 | `make run VIDEO=1920x1080` | screen size (default 1600x900) |
 | `make run APPEND="..."` | extra kernel options |
 | `make run QDISPLAY="-display none"` | headless |
@@ -58,8 +69,8 @@ Userland (optional, the repo ships `userland/sysroot.tar`):
 | `make run-debug` | no KVM, logs interrupts |
 | `make iso`, `make run-iso` | bootable GRUB ISO |
 
-`make run` has internet through QEMU user mode NAT (SLIRP). The host is
-`10.0.2.2`, DNS `10.0.2.3`, the guest is `10.0.2.15`. Connect from the
+`make run` has internet through QEMU user mode NAT (SLIRP). The OS gets
+its address by DHCP (`10.0.2.15`, gateway `10.0.2.2`). Connect from the
 host while the OS is running:
 
 ```
@@ -70,6 +81,33 @@ curl http://localhost:8080/        # guest port 80
 ```
 
 There is no root password. Ports are open only on the host loopback.
+
+KVM note: the Makefile passes `-global kvm-pit.lost_tick_policy=discard`.
+Without it KVM replays the timer ticks lost while the kernel boots with
+interrupts off, the uptime jumps seconds ahead and short timeouts (DHCP on
+e1000) fire at once.
+
+## Packages (apk)
+
+`apk` is the static `apk-tools` from Alpine 3.20 x86, with the Alpine keys,
+the `main` and `community` repositories and an empty package database, so
+`apk add` works right after boot. Alpine packages are i386 musl binaries,
+the same ABI the kernel runs.
+
+Tested: python3, git, vim, lua, jq, tree, neofetch, btop, zsh, openssh,
+figlet. What it took on the kernel side:
+
+* `recvmsg` now fills `msg_name`: musl 1.2.5 drops DNS answers without a
+  source address, every lookup timed out
+* `flock`, `fallocate`, `setfsuid32`/`setfsgid32`
+* `link`/`linkat` (the file system has no hard links, so it copies the file)
+* `rename` over an existing file used the cwd instead of the directory fd
+* `AF_NETLINK` route dumps for `getifaddrs()` (btop)
+* `LANG=C.UTF-8`, `/etc/fstab`, `/etc/mtab`
+
+The root file system is in RAM, so packages are gone after a reboot (see
+Limits). When a program hits a missing syscall the kernel prints
+`[sys] pid N (prog) unimplemented syscall NNN` on the console.
 
 ## Kernel
 
@@ -85,20 +123,21 @@ There is no root password. Ports are open only on the host loopback.
 
 * kernel heap plus a large arena for file data
 * up to 1 GB of physical memory mapped directly, programs can use all RAM
-* copy on fork, stack that grows on demand, `mmap`, `munmap`, `brk`
+* copy on fork, stack that grows on demand, `mmap` (with real `PROT_NONE`),
+  `mprotect`, `munmap`, `brk`
 
 **Processes and threads**
 
 * preemptive multitasking, kernel tasks and ring 3 processes
-* ~190 Linux i386 syscalls via `int 0x80`
+* ~210 Linux i386 syscalls via `int 0x80`
 * real threads: `clone` with shared memory, `futex`, `set_thread_area` (TLS),
   so musl `pthread` programs work
+* ELF loader for `ET_EXEC`, PIE and static PIE; `PT_INTERP` loads
+  `ld-musl-i386.so.1`, which maps the `.so` files itself
 * `prlimit64`, `getrlimit`, `sched_*`, `clock_gettime`, `poll`, `select`, ...
-* ELF loader for `ET_EXEC` and static PIE binaries
-* up to 48 processes and 1024 file descriptors per process
 * sessions, process groups, controlling terminal, job control
 * background jobs with `cmd &`
-* `strace=PID` kernel option logs syscalls to COM1
+* `strace` / `strace=PID` kernel option logs syscalls to COM1
 
 **Terminals**
 
@@ -113,12 +152,15 @@ There is no root password. Ports are open only on the host loopback.
 
 | Path | What it is |
 |---|---|
-| `/` | ramfs in memory, cleared on reboot |
+| `/` | ramfs in memory, cleared on reboot, symlinks, names up to 127 chars |
 | `/mnt` | FAT32 on `disk.img`, read and write, long names, persistent |
-| `/proc` | `meminfo`, `cpuinfo`, `uptime`, `mounts`, `/proc/<pid>/...` |
-| `/dev` | `null zero random tty fb0 input ptmx pts/N hda sda ...` |
+| `/usr/local` | ext2 disk labelled `/usr/local` (`VDISK=build/ports.img`), read and write |
+| `/proc` | `meminfo`, `cpuinfo`, `uptime`, `mounts`, `/proc/<pid>/` with `maps`, `io`, `task/` |
+| `/dev` | `null zero random tty fb0 input ptmx pts/N hda sda vda ...` |
 | `/opt/gcc` | gcc 11, binutils, make |
 | `/usr/src/samaraos` | kernel sources |
+
+ext2 disks are mounted by their label; ext3 and ext4 mount read only.
 
 ## Drivers
 
@@ -126,16 +168,18 @@ There is no root password. Ports are open only on the host loopback.
 * PS/2 mouse with scroll wheel
 * USB: UHCI host controller (polled) with a USB HID mouse
 * VGA text mode, VBE framebuffer up to 1920x1080x32, `/dev/fb0`
-* ATA PIO and AHCI (SATA with DMA)
+* ATA PIO, AHCI (SATA with DMA), virtio-blk
+* network: RTL8139, Intel e1000 (82540EM, 82545EM, 82574L), virtio-net
 * SoundBlaster 16 and PC speaker
-* RTL8139 network card
-* PCI config space access is atomic (see "Recent work")
+* PCI: one bus walk at boot, cached; config space access is atomic
 
 ## Network
 
 * own stack: Ethernet, ARP, IPv4, ICMP, TCP, UDP, loopback
-* static address `10.0.2.15`, gateway `10.0.2.2`, DNS `10.0.2.3`
-* BSD sockets for programs
+* DHCP client on every card, falls back to `10.0.2.15` if nobody answers;
+  the DNS server from the lease goes to `/etc/resolv.conf`
+* several cards at once, routing by subnet, `ifconfig` per card
+* BSD sockets for programs, `AF_UNIX`, `AF_NETLINK` (route dumps)
 * SSH server and client (dropbear), telnet, `nc`, `wget`, `curl`
 * HTTPS: `curl` and an `openssl s_client` stand-in (used by busybox `wget`)
   on mbedTLS, CA roots in `/etc/ssl/certs` (`userland/build-curl.sh`)
@@ -146,7 +190,9 @@ There is no root password. Ports are open only on the host loopback.
 
 The built in shell has Tab completion, history and background jobs.
 There are about 80 built in commands, everything else is searched in `PATH`.
-`bash` (5.2) and busybox `sh` are there too.
+Lines with pipes, redirects, quotes, `;`, `$` or `&&` are handed to
+`/bin/sh -c`. `bash` (5.2) and busybox `sh` are there too, `zsh` and others
+come from `apk`.
 
 | Group | Commands |
 |---|---|
@@ -164,12 +210,16 @@ the font size, the mouse wheel scrolls history.
 
 ## Programs
 
+Built in (from `userland/sysroot.tar` and the busybox in the kernel):
+
 | Program | What it is |
 |---|---|
+| apk | Alpine package manager (apk-tools 2.14, static) |
 | busybox | 402 applets: `sh`, `vi`, `less`, `top`, `awk`, `sed`, `tar`, ... |
 | bash 5.2 | `userland/build-bash.sh` |
 | nano 7.2 | text editor |
 | curl 8.15 | HTTP and HTTPS (mbedTLS 3.6) |
+| htop, fastfetch | dynamic binaries, use `/lib/ld-musl-i386.so.1` |
 | qjs | QuickJS JavaScript engine |
 | node | QuickJS with a Node.js style API layer (`userland/js/node/*.js`): `fs`, `path`, `process`, `child_process`, `http`, ... |
 | domjs | QuickJS + a small DOM, runs page scripts for the browser |
@@ -179,6 +229,10 @@ the font size, the mouse wheel scrolls history.
 | dropbear | `ssh`, `scp`, `dropbear` |
 | samarafetch | system info with a gradient logo |
 | tetris, breakout | games in `/usr/games` |
+
+On the ports disk (`./userland/build-ports.sh`, `VDISK=build/ports.img`):
+CPython 3.12, git 2.46, vim 9.1, Lua 5.4, and yutani, the toaruos
+compositor, with some of its demos (`userland/build-toaru.sh`).
 
 Write your own window programs with `/usr/include/samara.h`
 (`sm_open`, `sm_rect`, `sm_text`, `sm_event`, `sm_present`).
@@ -313,7 +367,7 @@ Pass them with `make run APPEND="..."`.
 | `autosh=<script>` | run a script, print to COM1, power off (headless tests) |
 | `browser=<url>` | open the browser with this page when the desktop starts |
 | `wmstats` | desktop FPS to COM1 |
-| `strace=PID` | trace syscalls |
+| `strace`, `strace=PID` | trace all syscalls or one process |
 | `kbd_ignore=35,2b` | ignore broken keys |
 
 ## Hotkeys
@@ -334,94 +388,65 @@ Pass them with `make run APPEND="..."`.
 |---|---|
 | `src/boot` | GDT, IDT, paging, FPU and SSE, PIC, PIT |
 | `src/core` | `kmain`, heap, tasks, vmm, strings |
-| `src/drivers` | keyboard, mouse, USB (UHCI), VGA, ATA, AHCI, PCI, RTL8139, SB16, fbdev, input |
-| `src/fs` | ramfs, FAT12/16, FAT32 |
+| `src/drivers` | keyboard, mouse, USB (UHCI), VGA, ATA, AHCI, PCI, RTL8139, e1000, virtio, SB16, fbdev, input |
+| `src/fs` | ramfs, FAT12/16, FAT32, ext2 |
 | `src/proc` | processes, threads, syscalls, signals, tty, pty, procfs, ELF loader |
-| `src/net` | TCP/IP stack, sockets |
+| `src/net` | TCP/IP stack, DHCP, sockets |
 | `src/gfx` | graphics, fonts, terminal |
 | `src/gui` | desktop, window manager, program windows |
 | `src/shell` | shell, commands, Tab completion |
 | `src/apps` | browser, image decoders, extra terminals, player, Paint, clock, snake, DOOM |
-| `userland` | sysroot, build scripts (bash, curl, dropbear, nano, QuickJS, MicroPython), `samara.h`, `js/` (node layer, `dom.js`), games |
+| `userland` | sysroot, build scripts (bash, curl, dropbear, nano, QuickJS, MicroPython, ports, toaru), `samara.h`, `js/` (node layer, `dom.js`), games |
 | `tools` | font generators, module builders, `browser-test/` |
 | `www` | test pages (`www/css/`) and web demos |
 
 ## Limits
 
 * one CPU core
-* no DHCP, one network card, IPv4 only
-* only `/mnt` survives a reboot
+* IPv4 only
+* `/` is in RAM: `apk add` is gone after a reboot, only `/mnt` and ext2
+  disks survive
+* no `epoll`, `eventfd`, `timerfd`, `memfd` yet (programs that need them,
+  like nodejs, fail)
+* no X server yet, so no graphical Alpine packages
 * wide characters (CJK, emoji) are not drawn
 * browser: no progressive JPEG and no SVG, no `z-index`, `transform`,
   `box-shadow`, `:hover`; big pages (over 400 KB) get CSS but no scripts
 
 ## Recent work
 
-**Browser: a real CSS engine.** The old code handled a small subset
-(colours, backgrounds, `display: none`, bold, three font sizes, alignment,
-some margins) while streaming the HTML. It is replaced by:
+**apk and Alpine packages.** See "Packages". The biggest one was DNS:
+`recvmsg` passed a kernel stack pointer to the user pointer check when it
+wrote the sender address, the check said no and nothing was written. musl
+1.2.5 (the one in Alpine) throws away DNS answers that don't come from the
+nameserver, so every lookup timed out. The musl.cc toolchain (1.2.4 era)
+didn't care, that's why curl worked all along.
 
-* an HTML parser that builds a DOM (implied end tags for `p`, `li`, `dt`,
-  `dd`, `tr`, `td`, `th`, `tbody`, `option`; raw text elements)
-* a CSS parser (comments, strings, nesting skipped, `@media`, `@supports`,
-  `@layer`) into rules with compound selectors, attribute conditions and
-  specificity, bucketed for fast matching
-* a computed style per element with inheritance, custom properties on a
-  stack, `calc()`, two passes (font size and colour first, so `em` and
-  `currentColor` are right)
-* a layout engine: block flow with collapsing bottom margins, line boxes
-  with baseline alignment and `vertical-align`, inline boxes with
-  backgrounds and borders split per line, atomic inline-blocks, floats
-  with line shortening and `clear`, absolute and relative positioning,
-  flex, grid, tables with content-based column widths, list markers,
-  `::before` / `::after`, intrinsic sizes with a per-node cache
-* drawing: boxes (backgrounds, per-side borders, dashed and dotted, rounded
-  corners, alpha) interleaved with text in document order, clip rectangles
-  for `overflow: hidden`, scaled fonts, fake italic, letter spacing,
-  underline / strike / overline
+**`curl -Lso- bench.sh | bash` printed the script.** The kernel shell split
+lines on spaces only, so curl got `|` and `bash` as two more URLs. Lines
+with shell syntax now go to `/bin/sh -c`.
 
-Hacker News, Wikipedia, CNN Lite, example.com and the pages in `www/css/`
-were used for testing.
+**Intel e1000 and DHCP.** New polled e1000 driver, a DHCP client on every
+card. Getting DHCP to work on e1000 under QEMU+KVM took a while: QEMU's
+e1000 holds received frames for one second after RX is enabled, and our
+uptime ran far ahead of real time right after boot (KVM replays the PIT
+ticks lost while interrupts were off), so all retries were done in a few
+milliseconds. Fixed with `kvm-pit.lost_tick_policy=discard`.
 
-**Network was dead on 2 boots out of 3.** `netd` probes the RTL8139 while
-`kmain` scans PCI for USB and AHCI. The PCI config space is a pair of
-ports (address to `0xCF8`, data from `0xCFC`); a task switch between the
-two made one side read the other's register, and the NIC came up with a
-broken setup (no ARP answers, no ssh, "offline" in the taskbar). PCI
-config reads and writes are now atomic. After the fix: 6 of 6 boots with
-working network.
+**PCI bus walk.** `pci_find` walked all 256 buses on every call, a few
+seconds when the device isn't there. Now the bus is walked once and
+cached; the network comes up right after boot instead of ~6 s later.
 
-**Many terminals.** The desktop can open any number of terminals; the
-extra ones are `/bin/sh` on a pty with their own VT100 screen. Windows of
-one group share a taskbar button with a counter. New shell command `term`.
+**btop and zsh.** btop crashed when `getifaddrs()` failed (musl does it
+with netlink) and refused to start without a UTF-8 locale. zsh printed
+the bash style `PS1` from the environment as is, now it gets its own
+`~/.zshrc`.
 
-**Also:** threads (`clone`, `futex`, TLS), bash 5.2, USB UHCI mouse,
-QuickJS with `node` and `domjs`, `prlimit64` fix (it returned garbage
-because of the user pointer check on a kernel pointer), the network status
-on COM1, the `tools/browser-test` host harness, CSS test pages.
+**Before that:** virtio-blk and virtio-net, ext2 read and write, several
+network cards, symlinks, a ports disk with CPython, git, vim and Lua,
+dynamic linking with `.so` files, htop and fastfetch, procfs threads and
+maps, yutani, a CSS engine for the browser, many terminals, threads,
+bash 5.2, USB mouse, QuickJS with `node` and `domjs`.
 
-**Images in the browser:** `src/apps/imgdec.c` (inflate + PNG filters and
-palettes, baseline JPEG with integer IDCT, GIF LZW), fetched in the
-background, scaled with a small box filter, alpha over the background.
-
-**Live JavaScript:** `domjs` stays alive after the first render; see the
-browser section. Promise jobs now run after every script, timer and event
-(before, `fetch().then()` results never showed up).
-
-**Wikipedia with styles:** big pages go through a light `domjs` mode that
-only inlines stylesheets, the document may be up to 1400 px wide (so
-desktop `@media` layouts apply), `grid-template-areas`, compounds with up to
-6 classes, `mask-image` icons are not painted as squares. Wikipedia
-articles render with the Vector 2022 layout: sidebar, header, infobox.
-
-**Terminals are cheap now:** blocking reads on ptys and the console,
-`poll` and `select` sleep instead of spinning on `task_yield` (5 idle
-shells used to eat the CPU), a terminal repaints only the rows that
-changed and only the cells under the clip, and ^C gets through even when
-the output ring is full. `term N` opens N terminals at once.
-
-**Build:** header dependencies (`-MMD`), so editing a `.h` rebuilds the
-files that include it.
-
-**Next:** virtio (block, net, gpu), ext2, bigger ports (Lua, CPython, git,
-vim), SMP.
+**Next:** packages that survive a reboot (ext2 root for `/usr`, `/lib`,
+`/etc/apk`), `epoll` and friends, SMP, an X server.
