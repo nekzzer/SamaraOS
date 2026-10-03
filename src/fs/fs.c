@@ -39,6 +39,7 @@ void fs_init(void) {
         { "null", FS_DEV_NULL }, { "zero", FS_DEV_ZERO }, { "tty", FS_DEV_TTY },
         { "console", FS_DEV_TTY }, { "random", FS_DEV_RANDOM }, { "urandom", FS_DEV_RANDOM },
         { "fb0", FS_DEV_FB }, { "input", FS_DEV_INPUT }, { "ptmx", FS_DEV_PTMX },
+        { "input-kbd", FS_DEV_EVKBD }, { "input-mouse", FS_DEV_EVMOUSE },
     };
     for (unsigned i = 0; i < sizeof(devs) / sizeof(devs[0]); i++) {
         fs_node_t* d = node_new(devs[i].name, FS_FILE, dev);

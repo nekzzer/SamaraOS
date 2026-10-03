@@ -131,6 +131,7 @@ void mouse_feed(int dx, int dy, int dz, uint8_t newbtn) {
         for (int i = 0; i < 3; i++)
             if ((newbtn ^ btn) & (1 << i))
                 input_push(IEV_KEY, (uint16_t)(0x110 + i), (newbtn >> i) & 1);
+        input_sync(INPUT_MOUSE);
         btn = newbtn;
     } else {
         btn = newbtn;

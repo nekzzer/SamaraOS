@@ -128,7 +128,7 @@ static void kbd_isr(struct interrupt_frame* f) {
         }
         uint16_t code = input_linux_key(sc, ext);
         ext = false;
-        if (code) input_push(IEV_KEY, code, released ? 0 : 1);
+        if (code) { input_push(IEV_KEY, code, released ? 0 : 1); input_sync(INPUT_KBD); }
         pic_send_eoi(1);
         return;
     }

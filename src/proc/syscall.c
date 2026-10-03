@@ -8,6 +8,7 @@
 #include "proc/pty.h"
 #include "proc/file.h"
 #include "drivers/fbdev.h"
+#include "drivers/input.h"
 #include "gfx/gfx.h"
 #include "proc/tty.h"
 #include "core/heap.h"
@@ -268,7 +269,13 @@ static void fill_stat_file(kstat64_t* st, file_t* f) {
     st->st_blksize = 4096;
     if (f->type == F_PIPE_R || f->type == F_PIPE_W) st->st_mode = S_IFIFO | 0600;
     else if (f->type == F_SOCKET || f->type == F_SPAIR || f->type == F_NETLINK || f->type == F_USOCK || f->type == F_ULISTEN) st->st_mode = 0140000 | 0777;          /* S_IFSOCK */
-    else { st->st_mode = S_IFCHR | 0666; st->st_rdev = f->type == F_TTY ? (5u << 8) : (1u << 8) | 3; }
+    else {
+        st->st_mode = S_IFCHR | 0666;
+        /* input: major 13, minor 64+n like /dev/input/eventN. evdev compares
+           st_rdev and threw the mouse out as a duplicate of the keyboard */
+        st->st_rdev = f->type == F_TTY ? (5u << 8) : f->type == F_INPUT ? (13u << 8) | (64u + (uint32_t)f->disk)
+                                                                       : (1u << 8) | 3;
+    }
     st->st_atime = st->st_mtime = st->st_ctime = clock_epoch();
 }
 
@@ -617,6 +624,11 @@ static int do_ioctl(int fd, uint32_t req, uint32_t arg) {
         else if (f->type == F_PTM || f->type == F_PTS) n = pty_pending(f->pty, f->type == F_PTM);
         *(int*)arg = n;
         return 0;
+    }
+    if (f->type == F_INPUT) {
+        uint32_t len = (req >> 16) & 0x3FFF;
+        if (len) UCHK((void*)arg, len);
+        return input_ioctl(f->disk, req, (uint8_t*)arg);
     }
     if (f->type == F_FB) {
         if (req == FBIOGET_VSCREENINFO) { UCHK((void*)arg, 160); fbdev_vscreeninfo((uint32_t*)arg); return 0; }

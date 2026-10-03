@@ -45,6 +45,13 @@ static file_t* open_pty_slave(int i, int flags) {
 file_t* file_open_node(fs_node_t* n, int flags) {
     static const ftype_t dev_type[] = { 0, F_NULL, F_ZERO, F_TTY, F_RANDOM, F_FB, F_INPUT };
     if (n->dev == FS_DEV_SOCK) return NULL;                   /* sockets get connect(), not open() */
+    if (n->dev == FS_DEV_EVKBD || n->dev == FS_DEV_EVMOUSE) {
+        file_t* f = file_new(F_INPUT, flags);
+        if (!f) return NULL;
+        f->disk = n->dev == FS_DEV_EVKBD ? INPUT_KBD : INPUT_MOUSE;   /* which ring */
+        input_open(f->disk);
+        return f;
+    }
     if (n->dev == FS_DEV_PTMX) {                               /* new pty pair */
         int i = pty_alloc();
         if (i < 0) return NULL;
@@ -68,7 +75,7 @@ file_t* file_open_node(fs_node_t* n, int flags) {
         ftype_t t = dev_type[n->dev];
         if (t == F_FB && !fbdev_open()) return NULL;
         file_t* f = file_new(t, flags);
-        if (t == F_INPUT) input_open();
+        if (t == F_INPUT && f) { f->disk = INPUT_ALL; input_open(INPUT_ALL); }
         else if (t == F_FB && !f) fbdev_close();
         return f;
     }
@@ -86,7 +93,7 @@ void file_close(file_t* f) {
     if (f->type == F_NODE && f->node) fs_release(f->node);
     if (f->type == F_SOCKET && f->sock) sock_close(f->sock);
     if (f->type == F_FB) fbdev_close();
-    if (f->type == F_INPUT) input_close();
+    if (f->type == F_INPUT) input_close(f->disk);
     if (f->type == F_PTM) pty_master_close(f->pty);
     if (f->type == F_PTS) pty_slave_close(f->pty);
     if (f->type == F_USOCK || f->type == F_ULISTEN) ux_release(f);
@@ -244,7 +251,7 @@ bool file_readable(file_t* f) {
         case F_SOCKET: return sock_readable(f->sock);
         case F_ULISTEN: return ux_pending(f);
         case F_USOCK:  return false;
-        case F_INPUT:  return input_pending();
+        case F_INPUT:  return input_pending(f->disk);
         case F_PTM:    return pty_readable(f->pty, true);
         case F_PTS:    return pty_readable(f->pty, false);
         default:       return true;
@@ -315,7 +322,7 @@ int file_read(file_t* f, char* buf, uint32_t n) {
             return pty_read(f->pty, f->type == F_PTM, buf, (int)n, (f->flags & O_NONBLOCK) != 0);
         case F_DISK: return disk_rw(f, buf, n, false);
         case F_FB:   return -EBADF;
-        case F_INPUT: return input_read(buf, n, (f->flags & O_NONBLOCK) != 0);
+        case F_INPUT: return input_read(f->disk, buf, n, (f->flags & O_NONBLOCK) != 0);
         case F_SOCKET: return sock_recv(f->sock, (uint8_t*)buf, n, (f->flags & O_NONBLOCK) != 0, false, 0, 0);
         case F_PIPE_W: return -EBADF;
         case F_SPAIR:
@@ -345,7 +352,7 @@ int file_write(file_t* f, const char* buf, uint32_t n) {
         case F_PTM: case F_PTS:
             return pty_write(f->pty, f->type == F_PTM, buf, (int)n, (f->flags & O_NONBLOCK) != 0);
         case F_DISK: return disk_rw(f, (char*)buf, n, true);
-        case F_INPUT: return -EBADF;
+        case F_INPUT: return (int)n;                  /* LED events from xorg: nothing to light */
         case F_FB: {
             int r = fbdev_write(f->off, buf, n);
             if (r > 0) f->off += (uint32_t)r;
