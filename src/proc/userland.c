@@ -232,6 +232,37 @@ int userland_install(void) {
     put_text("/etc/group", "root:x:0:\n");
     put_text("/etc/fstab", "none / ramfs rw 0 0\n");   /* btop stats it */
     if (!fs_resolve_nf(fs_root(), "/etc/mtab")) fs_symlink(fs_resolve(fs_root(), "/etc"), "mtab", "/proc/mounts");
+    /* X11 on the framebuffer, once you apk add xorg-server & co. evdev on our
+       two input devices, no udev, no vt switching */
+    mkdir_p("/etc/X11");
+    put_text("/etc/X11/xorg.conf",
+             "Section \"ServerFlags\"\n    Option \"AutoAddDevices\" \"false\"\n"
+             "    Option \"AutoEnableDevices\" \"false\"\n    Option \"DontVTSwitch\" \"true\"\nEndSection\n"
+             "Section \"Device\"\n    Identifier \"fb\"\n    Driver \"fbdev\"\n    Option \"fbdev\" \"/dev/fb0\"\nEndSection\n"
+             "Section \"Screen\"\n    Identifier \"s\"\n    Device \"fb\"\nEndSection\n"
+             "Section \"InputDevice\"\n    Identifier \"kbd\"\n    Driver \"evdev\"\n    Option \"Device\" \"/dev/input-kbd\"\nEndSection\n"
+             "Section \"InputDevice\"\n    Identifier \"mouse\"\n    Driver \"evdev\"\n    Option \"Device\" \"/dev/input-mouse\"\nEndSection\n"
+             "Section \"ServerLayout\"\n    Identifier \"l\"\n    Screen \"s\"\n"
+             "    InputDevice \"kbd\" \"CoreKeyboard\"\n    InputDevice \"mouse\" \"CorePointer\"\nEndSection\n");
+    {
+        const char* xs =
+            "#!/bin/sh\n"
+            "# X on the framebuffer. Ctrl+Alt+Q gets the keyboard back if it hangs\n"
+            "if ! command -v Xorg >/dev/null; then\n"
+            "    echo 'no Xorg here. apk add xorg-server xf86-video-fbdev xf86-input-evdev xterm twm font-misc-misc mesa-dri-gallium llvm17-libs mesa-demos'\n"
+            "    exit 1\n"
+            "fi\n"
+            "D=${XDISPLAY:-0}\n"
+            "Xorg :$D -nolisten tcp -keeptty -novtswitch vt1 -logfile /tmp/Xorg.$D.log >/dev/null 2>&1 &\n"
+            "X=$!\n"
+            "i=0\n"
+            "while [ ! -S /tmp/.X11-unix/X$D ] && [ $i -lt 150 ]; do sleep 0.1; i=$((i+1)); done\n"
+            "export DISPLAY=:$D\n"
+            "if [ -x \"$HOME/.xinitrc\" ]; then \"$HOME/.xinitrc\"\n"
+            "else twm & xterm -geometry 80x24+20+20; fi\n"
+            "kill $X 2>/dev/null; wait $X 2>/dev/null\n";
+        put_file("/usr/bin/xsamara", xs, strlen(xs), 0755);
+    }
     /* a bit of /sys: xorg's fbdevhw readlinks /sys/class/graphics/fb0 and
        refuses anything that isn't there or sits on pci */
     mkdir_p("/sys/class/graphics");
