@@ -253,7 +253,8 @@ int userland_install(void) {
              "    Option \"AutoEnableDevices\" \"false\"\n    Option \"DontVTSwitch\" \"true\"\nEndSection\n"
              "Section \"Device\"\n    Identifier \"fb\"\n    Driver \"fbdev\"\n    Option \"fbdev\" \"/dev/fb0\"\nEndSection\n"
              "Section \"Screen\"\n    Identifier \"s\"\n    Device \"fb\"\nEndSection\n"
-             "Section \"InputDevice\"\n    Identifier \"kbd\"\n    Driver \"evdev\"\n    Option \"Device\" \"/dev/input-kbd\"\nEndSection\n"
+             "Section \"InputDevice\"\n    Identifier \"kbd\"\n    Driver \"evdev\"\n    Option \"Device\" \"/dev/input-kbd\"\n"
+             "    Option \"XkbLayout\" \"us,ru\"\n    Option \"XkbOptions\" \"grp:alt_shift_toggle\"\nEndSection\n"   /* alt+shift like the rest of the os */
              "Section \"InputDevice\"\n    Identifier \"mouse\"\n    Driver \"evdev\"\n    Option \"Device\" \"/dev/input-mouse\"\nEndSection\n"
              "Section \"ServerLayout\"\n    Identifier \"l\"\n    Screen \"s\"\n"
              "    InputDevice \"kbd\" \"CoreKeyboard\"\n    InputDevice \"mouse\" \"CorePointer\"\nEndSection\n");
