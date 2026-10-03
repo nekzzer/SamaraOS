@@ -722,6 +722,17 @@ const char *shell_builtin_name(int i) {
 
 static void execute(char *line) {
   char *argv[16];
+  /* pipes, redirects, quotes etc: we can't do that, let busybox sh deal.
+     was printing bench.sh instead of running it lol */
+  bool meta = strstr(line, "&&") != NULL;
+  for (char *p = line; *p && !meta; p++)
+    if (strchr("|<>;$`'\"*", *p))
+      meta = true;
+  if (meta) {
+    char *a[] = {"sh", "-c", line, NULL};
+    shell_exec_program("/bin/sh", 3, a);
+    return;
+  }
   int argc = split(line, argv, 16);
   if (!argc)
     return;

@@ -292,7 +292,7 @@ static int pipe_write(file_t* f, pipe_t* p, const char* buf, uint32_t n) {
 
 int file_read(file_t* f, char* buf, uint32_t n) {
     switch (f->type) {
-        case F_NULL: return 0;
+        case F_NULL: case F_NETLINK: return 0;   // netlink goes through recv
         case F_ZERO: memset(buf, 0, n); return (int)n;
         case F_RANDOM: for (uint32_t i = 0; i < n; i++) buf[i] = (char)rnd8(); return (int)n;
         case F_TTY:  return tty_read(buf, (int)n, (f->flags & O_NONBLOCK) != 0);
@@ -323,7 +323,7 @@ int file_read(file_t* f, char* buf, uint32_t n) {
 
 int file_write(file_t* f, const char* buf, uint32_t n) {
     switch (f->type) {
-        case F_NULL: case F_ZERO: case F_RANDOM: return (int)n;
+        case F_NULL: case F_ZERO: case F_RANDOM: case F_NETLINK: return (int)n;
         case F_TTY:  return tty_write(buf, (int)n);
         case F_PTM: case F_PTS:
             return pty_write(f->pty, f->type == F_PTM, buf, (int)n, (f->flags & O_NONBLOCK) != 0);

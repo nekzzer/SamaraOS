@@ -64,43 +64,41 @@ static void fill_dev(pci_dev_t* d, uint8_t bus, uint8_t dev, uint8_t fn) {
     d->irq = pci_cfg_read8(bus, dev, fn, 0x3C);
 }
 
-int pci_scan(pci_dev_t* out, int max) {
+/* walking all 256 buses takes seconds (tcg especially) and every driver
+   wanted its own walk at boot. do it once, nobody hotplugs here */
+static pci_dev_t cache[64];
+static int ncache = -1;
+
+static void walk(void) {
     int n = 0;
-    for (int bus = 0; bus < 256 && n < max; bus++) {
-        for (int dev = 0; dev < 32 && n < max; dev++) {
+    for (int bus = 0; bus < 256 && n < 64; bus++) {
+        for (int dev = 0; dev < 32 && n < 64; dev++) {
             uint16_t vid = pci_cfg_read16((uint8_t)bus, (uint8_t)dev, 0, 0);
             if (vid == 0xFFFF) continue;
             int max_fn = 1;
             uint8_t hdr = pci_cfg_read8((uint8_t)bus, (uint8_t)dev, 0, 0x0E);
             if (hdr & 0x80) max_fn = 8;
-            for (int fn = 0; fn < max_fn && n < max; fn++) {
+            for (int fn = 0; fn < max_fn && n < 64; fn++) {
                 uint16_t fv = pci_cfg_read16((uint8_t)bus, (uint8_t)dev, (uint8_t)fn, 0);
                 if (fv == 0xFFFF) continue;
-                fill_dev(&out[n++], (uint8_t)bus, (uint8_t)dev, (uint8_t)fn);
+                fill_dev(&cache[n++], (uint8_t)bus, (uint8_t)dev, (uint8_t)fn);
             }
         }
     }
+    ncache = n;
+}
+
+int pci_scan(pci_dev_t* out, int max) {
+    if (ncache < 0) walk();
+    int n = ncache < max ? ncache : max;
+    for (int i = 0; i < n; i++) out[i] = cache[i];
     return n;
 }
 
 int pci_find(uint16_t vendor, uint16_t device, pci_dev_t* out) {
-    for (int bus = 0; bus < 256; bus++) {
-        for (int dev = 0; dev < 32; dev++) {
-            uint16_t vid = pci_cfg_read16((uint8_t)bus, (uint8_t)dev, 0, 0);
-            if (vid == 0xFFFF) continue;
-            int max_fn = 1;
-            uint8_t hdr = pci_cfg_read8((uint8_t)bus, (uint8_t)dev, 0, 0x0E);
-            if (hdr & 0x80) max_fn = 8;
-            for (int fn = 0; fn < max_fn; fn++) {
-                uint16_t fv = pci_cfg_read16((uint8_t)bus, (uint8_t)dev, (uint8_t)fn, 0);
-                if (fv != vendor) continue;
-                uint16_t did = pci_cfg_read16((uint8_t)bus, (uint8_t)dev, (uint8_t)fn, 2);
-                if (did != device) continue;
-                fill_dev(out, (uint8_t)bus, (uint8_t)dev, (uint8_t)fn);
-                return 1;
-            }
-        }
-    }
+    if (ncache < 0) walk();
+    for (int i = 0; i < ncache; i++)
+        if (cache[i].vendor == vendor && cache[i].device == device) { *out = cache[i]; return 1; }
     return 0;
 }
 

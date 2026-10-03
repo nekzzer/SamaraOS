@@ -12,7 +12,9 @@ OBJCOPY  := $(CROSS)objcopy
 QEMU     ?= qemu-system-i386
 # Hardware virtualization when the host has it (/dev/kvm), else QEMU falls
 # back to TCG emulation - ~10-20x slower for drawing and compiling.
-ACCEL    ?= -accel kvm -accel tcg -cpu max
+# lost_tick_policy=discard: kvm replays pit ticks lost while we boot with irqs
+# off, uptime flies ahead and every short timeout (dhcp!) fires instantly
+ACCEL    ?= -accel kvm -accel tcg -cpu max -global kvm-pit.lost_tick_policy=discard
 # Guest resolution, shown 1:1 (no blurry scaling): pick one that fits your
 # screen with the window frame. `make run VIDEO=1920x1080` for fullscreen.
 VIDEO    ?= 1600x900
@@ -107,6 +109,7 @@ KERN_SRC := \
     src/fs/fatfs.c \
     src/drivers/pci.c \
     src/drivers/rtl8139.c \
+    src/drivers/e1000.c \
     src/drivers/virtio.c \
     src/fs/ext2.c \
     src/drivers/usb.c \
@@ -263,8 +266,10 @@ MUSIC_DRIVE := -drive file=fat:$(MUSIC_DIR),format=raw,if=ide,index=2,snapshot=o
 # RTL8139 NIC on QEMU user-mode SLIRP. Guest gets 10.0.2.15, gw 10.0.2.2.
 # Internet through SLIRP NAT by default (same as run-internet): DNS 10.0.2.3, host is 10.0.2.2.
 # Host loopback only: `ssh -p 2222 root@localhost`, `telnet localhost 2323`.
+# `make run NIC=e1000` (or virtio-net-pci)
+NIC ?= rtl8139
 NET_DRIVE := -netdev user,id=n0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:2323-:23,hostfwd=tcp:127.0.0.1:8080-:80 \
-             -device rtl8139,netdev=n0
+             -device $(NIC),netdev=n0
 
 # Persistent 64 MiB FAT32 disk on AHCI: SamaraOS mounts it at /mnt and
 # writes changes back, so files there survive reboots. Created on first run;

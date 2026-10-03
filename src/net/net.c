@@ -1,6 +1,8 @@
 #include "net/net.h"
 #include "drivers/rtl8139.h"
 #include "drivers/virtio.h"
+#include "drivers/e1000.h"
+#include "fs/fs.h"
 #include "core/string.h"
 #include "core/heap.h"
 #include "core/io.h"
@@ -45,17 +47,18 @@ static bool      g_gw_known = false;
    "-netdev user,net=10.0.(2+N).0/24" hands out. Packets leave through
    the card whose subnet has the address, else through eth0. */
 #define NIF_MAX 6
-enum { NIC_RTL, NIC_VIRTIO };
+enum { NIC_RTL, NIC_VIRTIO, NIC_E1000 };
 typedef struct { int kind, dev; uint8_t mac[6]; uint32_t ip, mask, gw, rx, tx; char name[8]; } nif_t;
 static nif_t nifs[NIF_MAX];
 static int   n_nifs;
 
 static int nic_send(nif_t* f, const void* d, int n) {
     f->tx++;
+    if (f->kind == NIC_E1000) return e1000_send(d, n);
     return f->kind == NIC_RTL ? rtl8139_send(d, n) : vnet_send(f->dev, d, n);
 }
 static int nic_recv(nif_t* f, void* d, int max) {
-    int n = f->kind == NIC_RTL ? rtl8139_recv(d, max) : vnet_recv(f->dev, d, max);
+    int n = f->kind == NIC_E1000 ? e1000_recv(d, max) : f->kind == NIC_RTL ? rtl8139_recv(d, max) : vnet_recv(f->dev, d, max);
     if (n > 0) f->rx++;
     return n;
 }
@@ -456,11 +459,44 @@ static void on_tcp(const ip4_hdr_t* ih, const uint8_t* pkt, int len) {
     }
 }
 
+/* dhcp client state, only alive while net_init asks */
+static struct { nif_t* f; uint32_t xid, ip, mask, gw, dns, srv; int state; } dh;
+
+static void dhcp_input(const uint8_t* u, int len) {
+    const uint8_t* b = u + 8;
+    if (len < 8 + 240 || b[0] != 2 || *(uint32_t*)(b + 4) != dh.xid) return;
+    int type = 0;
+    uint32_t mask = 0, gw = 0, dns = 0, srv = 0;
+    const uint8_t* o = b + 240;
+    const uint8_t* end = u + len;
+    while (o + 2 <= end && *o != 255) {
+        if (*o == 0) { o++; continue; }
+        if (o + 2 + o[1] > end) break;
+        uint32_t v = o[1] >= 4 ? ntohl(*(uint32_t*)(o + 2)) : 0;
+        if (o[0] == 53) type = o[2];
+        else if (o[0] == 1) mask = v;
+        else if (o[0] == 3) gw = v;
+        else if (o[0] == 6) dns = v;
+        else if (o[0] == 54) srv = v;
+        o += 2 + o[1];
+    }
+    uint32_t yi = ntohl(*(uint32_t*)(b + 16));
+    if (type == 2 && dh.state == 1) { dh.ip = yi; dh.srv = srv; dh.state = 2; }
+    else if (type == 5 && dh.state == 3) { dh.ip = yi; dh.mask = mask; dh.gw = gw; dh.dns = dns; dh.state = 4; }
+    else if (type == 6) dh.state = -1;     /* NAK */
+}
+
 static void on_ipv4(const uint8_t* pkt, int len) {
     if (len < (int)sizeof(ip4_hdr_t)) return;
     const ip4_hdr_t* ih = (const ip4_hdr_t*)pkt;
     int ihl = (ih->vihl & 0x0F) * 4;
     if (ihl < 20 || ihl > len) return;
+    /* udp to :68 while asking, before the dst check: we have no ip yet */
+    if (dh.f && ih->proto == IP_PROTO_UDP && len >= ihl + 8 && pkt[ihl + 2] == 0 && pkt[ihl + 3] == 68) {
+        int t = ntohs(ih->total);
+        dhcp_input(pkt + ihl, (t > len ? len : t) - ihl);
+        return;
+    }
     uint32_t dst = ntohl(ih->dst);
     if (!nif_by_ip(dst) && dst != 0xFFFFFFFFu && (dst >> 24) != 127) return;
     int total = ntohs(ih->total);
@@ -497,11 +533,87 @@ void net_poll(void) {
     irq_restore(irq);
 }
 
+static void dhcp_send(nif_t* f, int type) {
+    uint8_t pkt[20 + 8 + 300];
+    memset(pkt, 0, sizeof(pkt));
+    uint8_t* u = pkt + 20;
+    uint8_t* b = u + 8;
+    b[0] = 1; b[1] = 1; b[2] = 6;
+    *(uint32_t*)(b + 4) = dh.xid;
+    b[10] = 0x80;                          /* broadcast reply pls, we have no ip */
+    memcpy(b + 28, f->mac, 6);
+    uint8_t* o = b + 236;
+    *o++ = 99; *o++ = 130; *o++ = 83; *o++ = 99;
+    *o++ = 53; *o++ = 1; *o++ = (uint8_t)type;
+    if (type == 3) {
+        *o++ = 50; *o++ = 4; *(uint32_t*)o = htonl(dh.ip); o += 4;
+        *o++ = 54; *o++ = 4; *(uint32_t*)o = htonl(dh.srv); o += 4;
+    }
+    *o++ = 55; *o++ = 3; *o++ = 1; *o++ = 3; *o++ = 6;
+    *o++ = 12; *o++ = 6; memcpy(o, "samara", 6); o += 6;
+    *o = 255;
+    *(uint16_t*)u = htons(68);
+    *(uint16_t*)(u + 2) = htons(67);
+    *(uint16_t*)(u + 4) = htons(8 + 300);  /* udp csum 0 = none, fine for v4 */
+    ip4_hdr_t* ih = (ip4_hdr_t*)pkt;
+    ih->vihl = 0x45;
+    ih->total = htons(sizeof(pkt));
+    ih->ttl = 64;
+    ih->proto = IP_PROTO_UDP;
+    ih->dst = 0xFFFFFFFFu;
+    ih->check = htons(cksum(ih, 20));
+    static const uint8_t bcast[6] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };
+    send_eth(f, ET_IPV4, bcast, pkt, sizeof(pkt));
+}
+
+static bool dhcp_wait(int st, uint32_t ms) {
+    uint32_t t0 = pit_uptime_ms();
+    while (pit_uptime_ms() - t0 < ms) {
+        net_poll();
+        if (dh.state == st || dh.state < 0) break;
+        task_yield();
+    }
+    return dh.state == st;
+}
+
+static bool dhcp(nif_t* f) {
+    dh.f = f;
+    dh.xid = (pit_uptime_ms() * 2654435761u) ^ f->mac[5] ^ (f->mac[4] << 8);
+    // e1000 on qemu+kvm missed every try here: kvm replays lost pit ticks after
+    // boot and our 1s turned into 3ms, while qemu's e1000 eats rx for a real 1s
+    // after RCTL. Makefile has lost_tick_policy=discard now, extra tries anyway
+    for (int i = 0; i < 4; i++) {
+        dh.state = 1;
+        dhcp_send(f, 1);
+        if (!dhcp_wait(2, 1000)) continue;
+        dh.state = 3;
+        dhcp_send(f, 3);
+        if (dhcp_wait(4, 1000)) break;
+    }
+    dh.f = NULL;
+    return dh.state == 4;
+}
+
+static char* ipstr(char* p, uint32_t ip) {
+    for (int i = 3; i >= 0; i--) {
+        utoa((ip >> (i * 8)) & 0xFF, p, 10);
+        while (*p) p++;
+        if (i) *p++ = '.';
+    }
+    *p = 0;
+    return p;
+}
+
 int net_init(void) {
     if (g_ready) return 0;
     if (rtl8139_init() == 0) {
         nifs[n_nifs].kind = NIC_RTL;
         memcpy(nifs[n_nifs].mac, rtl8139_mac(), 6);
+        n_nifs++;
+    }
+    if (e1000_init() == 0) {
+        nifs[n_nifs].kind = NIC_E1000;
+        memcpy(nifs[n_nifs].mac, e1000_mac(), 6);
         n_nifs++;
     }
     int nv = vnet_init();
@@ -520,14 +632,41 @@ int net_init(void) {
         f->mask = 0xFFFFFF00u;
     }
     g_ready = true;
-    set_status(n_nifs > 1 ? "net: up (eth0 10.0.2.15/24 + more, see ifconfig)" : "net: up (10.0.2.15/24 gw 10.0.2.2)");
+
+    /* dhcp on every card, keep the slirp guess if nobody answers */
+    uint32_t dns = 0;
+    bool got = false;
+    for (int i = 0; i < n_nifs; i++) {
+        nif_t* f = &nifs[i];
+        if (!dhcp(f)) continue;
+        f->ip = dh.ip;
+        f->mask = dh.mask ? dh.mask : 0xFFFFFF00u;
+        f->gw = dh.gw;
+        if (!i) got = true;
+        if (!dns) dns = dh.dns;
+    }
+    char s[64] = "net: up (", *p = s + 9;
+    p = ipstr(p, nifs[0].ip);
+    memcpy(p, " gw ", 4); p += 4;
+    p = ipstr(p, nifs[0].gw);
+    memcpy(p, got ? " dhcp)" : " static)", got ? 7 : 9);
+    set_status(s);
+    if (dns) {
+        char rc[64] = "nameserver ";
+        p = ipstr(rc + 11, dns);
+        memcpy(p, "\nnameserver 1.1.1.1\n", 21);
+        /* netd can beat userland_install, which writes the default one. wait for it */
+        fs_node_t* n = NULL;
+        for (int i = 0; i < 300 && !(n = fs_resolve(fs_root(), "/etc/resolv.conf")); i++) task_sleep_ms(10);
+        if (n) fs_write(n, rc, strlen(rc));
+    }
 
     /* warm ARP cache for gateways so first packet doesn't stall */
     for (int i = 1; i < n_nifs; i++) resolve_mac(nifs[i].gw, g_gw_mac, 500);
     if (resolve_mac(nifs[0].gw, g_gw_mac, 1500)) g_gw_known = true;
     for (const char* m = g_gw_known ? "samara: gw arp ok\r\n" : "samara: gw arp FAIL\r\n"; *m; m++) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, *m); }
     uint8_t dns_mac[6];
-    resolve_mac(IP4(NET_IP_A, NET_IP_B, NET_IP_C, 3), dns_mac, 500);
+    resolve_mac(dns ? dns : IP4(NET_IP_A, NET_IP_B, NET_IP_C, 3), dns_mac, 500);
     return 0;
 }
 

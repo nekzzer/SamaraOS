@@ -252,7 +252,7 @@ static void fill_stat_file(kstat64_t* st, file_t* f) {
     st->st_nlink = 1;
     st->st_blksize = 4096;
     if (f->type == F_PIPE_R || f->type == F_PIPE_W) st->st_mode = S_IFIFO | 0600;
-    else if (f->type == F_SOCKET || f->type == F_SPAIR) st->st_mode = 0140000 | 0777;          /* S_IFSOCK */
+    else if (f->type == F_SOCKET || f->type == F_SPAIR || f->type == F_NETLINK) st->st_mode = 0140000 | 0777;          /* S_IFSOCK */
     else { st->st_mode = S_IFCHR | 0666; st->st_rdev = f->type == F_TTY ? (5u << 8) : (1u << 8) | 3; }
     st->st_atime = st->st_mtime = st->st_ctime = clock_epoch();
 }
@@ -301,7 +301,7 @@ static int do_readlink(const char* path, char* buf, uint32_t n) {
         case F_NULL: strcpy(out, "/dev/null"); break;
         case F_ZERO: strcpy(out, "/dev/zero"); break;
         case F_RANDOM: strcpy(out, "/dev/urandom"); break;
-        case F_SOCKET: case F_SPAIR: strcpy(out, "socket:[1]"); break;
+        case F_SOCKET: case F_SPAIR: case F_NETLINK: strcpy(out, "socket:[1]"); break;
         default:     strcpy(out, "pipe:[1]"); break;
     }
     uint32_t l = strlen(out);
@@ -485,13 +485,35 @@ static int do_rename(int ofd, const char* from, int nfd, const char* to) {
         if (dst->type == FS_DIR && src->type != FS_DIR) return -EISDIR;
         if (dst->type != FS_DIR && src->type == FS_DIR) return -ENOTDIR;
         if (dst->type == FS_DIR && dst->child) return -ENOTEMPTY;
-        int r = do_unlink(AT_FDCWD, to, dst->type == FS_DIR ? AT_REMOVEDIR : 0);
+        // was AT_FDCWD: apk renames relative to a dirfd of /, from /root that missed
+        int r = do_unlink(nfd, to, dst->type == FS_DIR ? AT_REMOVEDIR : 0);
         if (r < 0) return r;
     }
     fs_detach(src);
     strncpy(src->name, name, FS_NAME_MAX - 1);
     src->name[FS_NAME_MAX - 1] = 0;
     fs_attach(parent, src);
+    return 0;
+}
+
+/* no real hard links, a node has one parent. so link = copy. apk wants it for
+   terminfo (vt220 -> vt220-am and co), nobody here cares the inode differs */
+static int do_link(int ofd, const char* from, int nfd, const char* to, int flags) {
+    UCHK(from, 1); UCHK(to, 1);
+    int err;
+    fs_node_t* src = lookup_ex(ofd, from, &err, (flags & 0x400) != 0);   /* AT_SYMLINK_FOLLOW */
+    if (!src) return err;
+    if (src->type == FS_DIR) return -EPERM;
+    char name[FS_NAME_MAX];
+    fs_node_t* par = lookup_parent(nfd, to, name, &err);
+    if (!par) return err;
+    if (fs_child(par, name)) return -EEXIST;
+    if (src->type == FS_LINK) return fs_symlink(par, name, src->data) ? 0 : -ENOMEM;
+    fs_node_t* n = fs_create(par, name, FS_FILE);
+    if (!n) return -ENOMEM;
+    if (src->size && fs_write(n, src->data, src->size) < 0) return -ENOMEM;
+    n->mode = src->mode;
+    n->dev = src->dev;
     return 0;
 }
 
@@ -1087,6 +1109,131 @@ static int spair_call(int call, file_t* f, uint32_t b, uint32_t c, uint32_t d) {
     return -95;
 }
 
+/* netlink, just enough NETLINK_ROUTE for musl getifaddrs() (btop died on it).
+   musl sends RTM_GETLINK / RTM_GETADDR and reads with MSG_DONTWAIT, so the
+   whole dump is built right away in send and sits in f->pipe */
+static uint8_t* nl_msg(pipe_t* q, uint16_t type, uint32_t seq, int body) {
+    int len = 16 + body;
+    if (q->count + len > PIPE_SZ) return NULL;
+    uint8_t* m = (uint8_t*)q->buf + q->count;
+    memset(m, 0, len);
+    *(uint32_t*)m = len;
+    *(uint16_t*)(m + 4) = type;
+    *(uint16_t*)(m + 6) = 2;                   /* NLM_F_MULTI */
+    *(uint32_t*)(m + 8) = seq;
+    q->count += len;
+    return m;
+}
+
+static void nl_attr(pipe_t* q, uint8_t* m, uint16_t type, const void* d, int n) {
+    int al = (4 + n + 3) & ~3;
+    if (!m || q->count + al > PIPE_SZ) return;
+    uint8_t* a = (uint8_t*)q->buf + q->count;
+    memset(a, 0, al);
+    *(uint16_t*)a = 4 + n;
+    *(uint16_t*)(a + 2) = type;
+    memcpy(a + 4, d, n);
+    q->count += al;
+    *(uint32_t*)m += al;
+}
+
+static void nl_dump(pipe_t* q, int type, uint32_t seq, int af) {
+    static const uint8_t zero[6], ff[6] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };
+    int n = af == 10 ? -1 : net_ifcount();            /* no ipv6 here */
+    for (int i = -1; i < n; i++) {                    /* -1 = lo */
+        const char* name = "lo";
+        const uint8_t* mac = zero;
+        uint32_t ip = 0x7F000001, mask = 0xFF000000, gw, rx = 0, tx = 0;
+        if (i >= 0) net_ifinfo(i, &name, &mac, &ip, &mask, &gw, &rx, &tx);
+        if (type == 18) {                             /* RTM_GETLINK -> NEWLINK */
+            uint8_t* m = nl_msg(q, 16, seq, 16);
+            if (!m) break;
+            *(uint16_t*)(m + 18) = i < 0 ? 772 : 1;   /* ARPHRD_LOOPBACK / ETHER */
+            *(int32_t*)(m + 20) = i + 2;
+            *(uint32_t*)(m + 24) = i < 0 ? 0x49 : 0x1043;
+            nl_attr(q, m, 3, name, strlen(name) + 1);
+            nl_attr(q, m, 1, mac, 6);
+            nl_attr(q, m, 2, i < 0 ? zero : ff, 6);
+            uint32_t mtu = i < 0 ? 65536 : 1500;
+            nl_attr(q, m, 4, &mtu, 4);
+            uint32_t st[23] = { rx, tx };            /* rtnl_link_stats, packets only */
+            nl_attr(q, m, 7, st, sizeof(st));
+        } else if (type == 22) {                      /* RTM_GETADDR -> NEWADDR */
+            uint8_t* m = nl_msg(q, 20, seq, 8);
+            if (!m) break;
+            int pl = 0;
+            for (uint32_t k = mask; k; k <<= 1) pl++;
+            m[16] = 2;
+            m[17] = (uint8_t)pl;
+            m[19] = i < 0 ? 254 : 0;                  /* scope host / universe */
+            *(uint32_t*)(m + 20) = i + 2;
+            uint32_t be = nbo32(ip), bc = nbo32(ip | ~mask);
+            nl_attr(q, m, 1, &be, 4);
+            nl_attr(q, m, 2, &be, 4);
+            if (i >= 0) nl_attr(q, m, 4, &bc, 4);
+            nl_attr(q, m, 3, name, strlen(name) + 1);
+        }
+    }
+    uint8_t* d = nl_msg(q, 3, seq, 4);               /* NLMSG_DONE */
+    if (d) *(uint16_t*)(d + 6) = 0;
+}
+
+static int32_t nl_call(int call, file_t* f, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32_t f6) {
+    pipe_t* q = f->pipe;
+    switch (call) {
+        case 2: case 14: return 0;                    /* bind, setsockopt */
+        case 6: case 7: {                             /* getsockname: sockaddr_nl, pid 0 */
+            if (!b || !c) return 0;
+            UCHK((void*)c, 4);
+            UCHK((void*)b, 12);
+            memset((void*)b, 0, 12);
+            *(uint16_t*)b = 16;
+            *(uint32_t*)c = 12;
+            return 0;
+        }
+        case 9: case 11: {                            /* send(to) */
+            UCHK((void*)b, c);
+            if (c < 17) return -EINVAL;
+            const uint8_t* h = (const uint8_t*)b;
+            int type = *(const uint16_t*)(h + 4);
+            if (type == 18 || type == 22) nl_dump(q, type, *(const uint32_t*)(h + 8), h[16]);
+            else {                                    /* anything else: error 0 = ack, good enough */
+                uint8_t* m = nl_msg(q, 2, *(const uint32_t*)(h + 8), 4);
+                if (m) *(uint16_t*)(m + 6) = 0;
+            }
+            return (int32_t)c;
+        }
+        case 10: case 12: case 17: {                  /* recv(from/msg) */
+            uint8_t* buf; uint32_t cap;
+            if (call == 17) {
+                UCHK((void*)b, 28);
+                uint32_t* mh = (uint32_t*)b;
+                if (!mh[3]) return 0;
+                iovec_t* iov = (iovec_t*)mh[2];
+                UCHK(iov, sizeof(iovec_t));
+                buf = (uint8_t*)iov[0].base; cap = iov[0].len;
+                mh[1] = 0; mh[5] = 0; mh[6] = 0;
+            } else { buf = (uint8_t*)b; cap = c; }
+            if (!q->count) return -EAGAIN;
+            UCHK(buf, cap);
+            // whole messages only, never split one
+            uint32_t n = 0;
+            while (n < (uint32_t)q->count) {
+                uint32_t l = (*(uint32_t*)(q->buf + n) + 3) & ~3u;
+                if (n + l > cap) break;
+                n += l;
+            }
+            if (!n) return -EINVAL;
+            memcpy(buf, q->buf, n);
+            memmove(q->buf, q->buf + n, q->count - n);
+            q->count -= n;
+            if (call == 12 && e && f6) { UCHK((void*)f6, 4); *(uint32_t*)f6 = 0; }
+            return (int32_t)n;
+        }
+    }
+    return 0;
+}
+
 static int32_t sys_socket_call(int call, uint32_t a, uint32_t b, uint32_t c,
                                uint32_t d, uint32_t e, uint32_t f6) {
     int err = 0;
@@ -1096,9 +1243,17 @@ static int32_t sys_socket_call(int call, uint32_t a, uint32_t b, uint32_t c,
     if (call != 1 && call != 8) {
         file_t* pf = getf((int)a);
         if (pf && pf->type == F_SPAIR) return spair_call(call, pf, b, c, d);
+        if (pf && pf->type == F_NETLINK) return nl_call(call, pf, b, c, d, e, f6);
     }
     switch (call) {
         case 1: {                                                     /* socket */
+            if (a == 16) {                                            /* AF_NETLINK */
+                fl = file_new(F_NETLINK, 2 | ((b & 04000) ? O_NONBLOCK : 0));
+                if (!fl) return -ENOMEM;
+                fl->pipe = (pipe_t*)kmalloc(sizeof(pipe_t));
+                memset(fl->pipe, 0, sizeof(pipe_t));
+                return install_fd(fl, 0, (b & 02000000) != 0);
+            }
             if (a != AF_INET) return -97;
             int type = (int)(b & 0xF);
             if (c && !((type == 1 && c == 6) || (type == 2 && c == 17))) return -93;  /* EPROTONOSUPPORT */
@@ -1191,7 +1346,9 @@ static int32_t sys_socket_call(int call, uint32_t a, uint32_t b, uint32_t c,
                 if ((uint32_t)r < iov[i].len || sock_type(s) == 2) break;
             }
             if (call == 17) {
-                if (m[0]) { uint32_t len = m[1]; write_addr(m[0], (uint32_t)&len, ip, port); m[1] = len; }
+                /* was &len on the kernel stack, UCHK said no and the name never got written.
+                   musl 1.2.5 dns drops replies without it (apk) */
+                if (m[0]) write_addr(m[0], (uint32_t)&m[1], ip, port);
                 m[5] = 0; m[6] = 0;
             }
             return total;
@@ -1269,7 +1426,9 @@ static int32_t dispatch(regs_t* r) {
             if (fs_child(par, name)) return -EEXIST;
             return fs_symlink(par, name, tg) ? 0 : -ENOMEM;
         }
-        case 9: case 14: case 297: return -EPERM;                     /* link/mknod */
+        case 9:   return do_link(AT_FDCWD, (const char*)a, AT_FDCWD, (const char*)b, 0);
+        case 303: return do_link((int)a, (const char*)b, (int)c, (const char*)d, (int)e);
+        case 14: case 297: return -EPERM;                             /* mknod */
         case 10:  return do_unlink(AT_FDCWD, (const char*)a, 0);
         case 301: return do_unlink((int)a, (const char*)b, (int)c);
         case 40:  return do_unlink(AT_FDCWD, (const char*)a, AT_REMOVEDIR);
@@ -1310,6 +1469,8 @@ static int32_t dispatch(regs_t* r) {
             if (a) UCHK((void*)a, 12);
             if (b) UCHK((void*)b, 12);
             return proc_sigaltstack((const uint32_t*)a, (uint32_t*)b, r->useresp);
+        case 215: case 216: return 0;                                /* setfsuid32/gid32: zsh. we're root anyway */
+        case 143: return 0;                                          /* flock, apk wants it. nobody fights for locks here */
         case 36: case 118: case 148: case 344:                       /* sync, fsync, fdatasync, syncfs */
             ext2_sync_all();
             return fatfs_sync_all();
@@ -1566,6 +1727,7 @@ static int32_t dispatch(regs_t* r) {
         case 240: return do_futex(a, b, c, d, e, f6, false);
         case 422: return do_futex(a, b, c, d, e, f6, true);       /* futex_time64 */
         case 219: return 0;                                          /* madvise: advisory */
+        case 324: return -95;                                        /* fallocate, apk asks. EOPNOTSUPP and it just writes */
         // eventfd(2), timerfd, signalfd(4), epoll*, memfd: not here yet. glib/qemu fall back
         // to pipes and poll on ENOSYS, so just say no without spamming the log
         case 323: case 328: case 322: case 325: case 326: case 321: case 327:

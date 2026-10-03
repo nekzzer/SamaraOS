@@ -230,6 +230,8 @@ int userland_install(void) {
     fs_node_t* rc = fs_resolve(fs_root(), "/etc/rc");
     if (rc) rc->mode = 0755;
     put_text("/etc/group", "root:x:0:\n");
+    put_text("/etc/fstab", "none / ramfs rw 0 0\n");   /* btop stats it */
+    if (!fs_resolve_nf(fs_root(), "/etc/mtab")) fs_symlink(fs_resolve(fs_root(), "/etc"), "mtab", "/proc/mounts");
     put_text("/etc/hosts", "127.0.0.1\tlocalhost\n10.0.2.15\tsamara\n10.0.2.2\thost gateway\n");
     put_text("/etc/resolv.conf", "nameserver 10.0.2.3\nnameserver 1.1.1.1\n");
     put_text("/etc/services", "http\t80/tcp\nhttps\t443/tcp\ndomain\t53/udp\n");
@@ -246,8 +248,13 @@ int userland_install(void) {
     /* login shells (ssh, telnet): the logo + system info, then the above */
     put_text("/etc/profile",
              "export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/games:/usr/local/bin:/opt/gcc/bin\n"
-             "export ENV=/etc/shrc\n"
+             "export ENV=/etc/shrc LANG=C.UTF-8\n"
              "case $- in *i*) samarafetch 2>/dev/null ;; esac\n"
              ". /etc/shrc\n");
+    /* zsh from apk got our bash style PS1 from the env and printed \u@\h raw */
+    const char* zrc = "PROMPT='%F{magenta}%n@%m%f:%F{blue}%~%f%# '\n"
+                      "alias ls='ls --color=auto' ll='ls -l --color=auto' la='ls -la --color=auto'\n";
+    put_text("/root/.zshrc", zrc);
+    put_text("/home/user/.zshrc", zrc);
     return count;
 }

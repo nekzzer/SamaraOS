@@ -32,6 +32,7 @@ static char *const user_env[] = {
     "COLORTERM=truecolor",
     "ENV=/etc/shrc",                  /* interactive sh: gradient prompt, colours */
     "PS1=\\u@\\h:\\w\\$ ",
+    "LANG=C.UTF-8",                   /* btop refuses to start without utf-8 */
     NULL,
 };
 

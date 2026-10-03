@@ -359,6 +359,29 @@ P=$ROOT/toolchain/ports
 [ -x "$P/fastfetch-2.21.3/build-i686/fastfetch" ] && cp "$P/fastfetch-2.21.3/build-i686/fastfetch" "$OUT/usr/bin/"
 "$XBIN/i686-linux-musl-strip" "$OUT/usr/bin/htop" "$OUT/usr/bin/fastfetch" 2>/dev/null || true
 
+# apk from alpine x86, static. packages are musl i386 so they just run
+APKV=3.20
+A=$ROOT/toolchain/apk
+if [ ! -f "$A/apk.static" ]; then
+    mkdir -p "$A" && cd "$A"
+    U=https://dl-cdn.alpinelinux.org/alpine/v$APKV/main/x86
+    for p in apk-tools-static alpine-keys; do
+        f=$(curl -s $U/ | grep -oE "href=\"$p-[0-9][^\"]*\.apk" | head -1 | cut -d'"' -f2)
+        curl -s $U/$f | tar xz 2>/dev/null || true
+    done
+    cp sbin/apk.static .
+    cd "$ROOT"
+fi
+cp "$A/apk.static" "$OUT/usr/bin/apk"
+mkdir -p "$OUT/etc/apk/keys" "$OUT/lib/apk/db"
+cp "$A"/usr/share/apk/keys/x86/*.pub "$OUT/etc/apk/keys/"
+echo x86 > "$OUT/etc/apk/arch"
+printf "https://dl-cdn.alpinelinux.org/alpine/v$APKV/main\nhttps://dl-cdn.alpinelinux.org/alpine/v$APKV/community\n" > "$OUT/etc/apk/repositories"
+# empty db = what apk --initdb makes
+: > "$OUT/etc/apk/world"
+: > "$OUT/lib/apk/db/installed"
+: > "$OUT/lib/apk/db/triggers"
+
 cd "$OUT"
 tar --format=ustar --owner=0 --group=0 -cf "$ROOT/userland/sysroot.tar" usr lib $( [ -d etc ] && echo etc )
 ls -la "$ROOT/userland/sysroot.tar"

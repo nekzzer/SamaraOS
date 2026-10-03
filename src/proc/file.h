@@ -7,7 +7,8 @@
 
 typedef enum { F_NODE = 1, F_TTY, F_PIPE_R, F_PIPE_W, F_NULL, F_ZERO, F_RANDOM, F_DISK, F_SOCKET, F_FB, F_INPUT,
                F_PTM, F_PTS,                        /* pty master / slave */
-               F_SPAIR } ftype_t;                  /* AF_UNIX socketpair end: rx=pipe, tx=pipe2 */
+               F_SPAIR,                            /* AF_UNIX socketpair end: rx=pipe, tx=pipe2 */
+               F_NETLINK } ftype_t;                /* AF_NETLINK, the answer waits in pipe */
 
 #define PIPE_SZ 8192
 
