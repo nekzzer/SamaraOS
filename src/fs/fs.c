@@ -134,8 +134,38 @@ static fs_node_t* resolve(fs_node_t* cwd, const char* path, bool follow, int dep
     return cur;
 }
 
-fs_node_t* fs_resolve(fs_node_t* cwd, const char* path)    { return resolve(cwd, path, true, 0); }
-fs_node_t* fs_resolve_nf(fs_node_t* cwd, const char* path) { return resolve(cwd, path, false, 0); }
+int (*fs_lazy_hook)(fs_node_t* n);
+
+/* last few lookups. eviction keeps its hands off them: the caller is about to
+   use ->data. was a 1 s age check on the uptime, but with lost ticks thrown
+   away the uptime crawls during disk io and nothing was ever old enough */
+static fs_node_t* recent[8];
+static int recent_i;
+
+void fs_need(fs_node_t* n) {
+    if (!n) return;
+    recent[recent_i++ & 7] = n;
+    if (n->lazy && fs_lazy_hook) fs_lazy_hook(n);
+}
+
+bool fs_recent(fs_node_t* n) {
+    for (int i = 0; i < 8; i++) if (recent[i] == n) return true;
+    return false;
+}
+
+void fs_need_tree(fs_node_t* n) {
+    fs_need(n);
+    if (n->type == FS_DIR) for (fs_node_t* c = n->child; c; c = c->next) fs_need_tree(c);
+}
+
+fs_node_t* fs_owner(fs_node_t* n) {
+    for (; n; n = n->parent) if (n->mount_id || !n->parent) return n;
+    return root_;
+}
+
+fs_node_t* fs_resolve(fs_node_t* cwd, const char* path)    { fs_node_t* n = resolve(cwd, path, true, 0); fs_need(n); return n; }
+fs_node_t* fs_resolve_nf(fs_node_t* cwd, const char* path) { fs_node_t* n = resolve(cwd, path, false, 0); fs_need(n); return n; }
+fs_node_t* fs_peek(fs_node_t* cwd, const char* path, bool follow) { return resolve(cwd, path, follow, 0); }
 
 fs_node_t* fs_symlink(fs_node_t* dir, const char* name, const char* target) {
     if (!dir || dir->type != FS_DIR || find_child(dir, name)) return NULL;
@@ -177,7 +207,7 @@ fs_node_t* fs_create(fs_node_t* cwd, const char* path, fs_type_t type) {
 }
 
 int fs_unlink(fs_node_t* cwd, const char* path) {
-    fs_node_t* n = fs_resolve_nf(cwd, path);
+    fs_node_t* n = resolve(cwd, path, false, 0);   /* no point reading it in to delete it */
     if (!n || n == root_) return -1;
     if (n->type == FS_DIR && n->child) return -1;
     fs_detach(n);
@@ -220,6 +250,7 @@ void fs_data_free(fs_node_t* n) {
     if (n->data && n->cap) kfree(n->data);
     n->data = NULL;
     n->cap = 0;
+    n->lazy = 0;                       /* whoever frees it puts new bytes in */
 }
 
 void fs_set_static(fs_node_t* n, const char* data, size_t len) {

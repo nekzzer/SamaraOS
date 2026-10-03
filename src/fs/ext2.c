@@ -142,19 +142,25 @@ static uint32_t bmap(ev_t* v, const uint8_t* ino, uint32_t lb) {
 
 static uint64_t isize64(const uint8_t* ino) { return rd32(ino + 4) | ((uint64_t)rd32(ino + 108) << 32); }
 
+static int fill_data(ev_t* v, const uint8_t* ino, uint32_t size, char* d);
 static char* read_data(ev_t* v, const uint8_t* ino, uint32_t size) {
     char* d = kmalloc_big(size + 1);
     if (!d) return NULL;
+    if (fill_data(v, ino, size, d) < 0) { kfree(d); return NULL; }
+    return d;
+}
+
+static int fill_data(ev_t* v, const uint8_t* ino, uint32_t size, char* d) {
     static uint8_t blk[4096];
     uint32_t n = (size + v->bs - 1) / v->bs;
     for (uint32_t i = 0; i < n; i++) {
         uint32_t pb = bmap(v, ino, i), take = size - i * v->bs < v->bs ? size - i * v->bs : v->bs;
         if (!pb) { memset(d + i * v->bs, 0, take); continue; }
-        if (rblk(v, pb, blk) < 0) { kfree(d); return NULL; }
+        if (rblk(v, pb, blk) < 0) return -1;
         memcpy(d + i * v->bs, blk, take);
     }
     d[size] = 0;
-    return d;
+    return 0;
 }
 
 /* ---------- node -> ent table ---------- */
@@ -375,11 +381,8 @@ static int load_dir(ev_t* v, fs_node_t* dir, uint32_t dino, int depth) {
             n = old ? old : fs_create(dir, name, FS_FILE);
             if (n) {
                 fs_data_free(n);
-                n->size = 0;
-                if (csz) {
-                    n->data = read_data(v, craw, csz);
-                    if (n->data) { n->size = csz; n->cap = csz + 1; }
-                }
+                n->size = csz;                                /* bytes come on first open */
+                if (csz) { n->lazy = ino; n->lazy_vol = (uint8_t)(E2_ID0 + (v - vols)); }
             }
             ty = FS_FILE;
         } else if ((mode & 0xF000) == 0xA000) {
@@ -605,7 +608,7 @@ static int sync_vol(ev_t* v) {
             }
         } else {
             /* same buffer, size and an old enough mtime: don't even hash it */
-            bool same = e->dp == n->data && e->sz == size && e->mt == n->mtime && n->mtime + 2 < now && e->h;
+            bool same = n->lazy || (e->dp == n->data && e->sz == size && e->mt == n->mtime && n->mtime + 2 < now && e->h);
             if (!same) {
                 uint32_t h = size ? fnv((uint8_t*)n->data, size) : 1;
                 if (h != e->h || (size + v->bs - 1) / v->bs != e->nb) {
@@ -732,6 +735,77 @@ static void lock(void) {
 }
 static void unlock(void) { busy = 0; }
 
+/* a lazy file is opened: read it now. the hash goes into its ent, else
+   the next sync would think it changed and write it all back */
+static int ext2_lazy(fs_node_t* n) {
+    ev_t* v = NULL;
+    for (int i = 0; i < E2_MAX; i++) if (vols[i].used && vols[i].id == n->lazy_vol) v = &vols[i];
+    if (!v) return -1;
+    uint32_t want = n->lazy, sz = (uint32_t)n->size;
+    /* memory first, outside the lock: reclaim needs the lock to make room.
+       fail = the node just stays lazy, open() says ENOMEM. it used to zero the
+       size and the next sync wrote the file back empty */
+    char* d = kmalloc_big(sz + 1);
+    if (!d) { klog("ext2: no memory for a lazy file\r\n"); return -1; }
+    lock();
+    if (n->lazy != want || n->size != sz) { unlock(); kfree(d); return 0; }   /* somebody beat us to it */
+    static uint8_t lb[4096];
+    uint8_t raw[256];
+    uint8_t* p = inode_ptr(v, want, lb);
+    if (!p) { unlock(); kfree(d); return -1; }
+    memcpy(raw, p, v->isize < 256 ? v->isize : 256);
+    if (fill_data(v, raw, sz, d) < 0) { klog("ext2: lazy read failed\r\n"); unlock(); kfree(d); return -1; }
+    n->data = d;
+    n->cap = sz + 1;
+    n->lazy = 0;
+    if (v->E && v->tab) {
+        int ei = t_find(v, n);
+        if (ei >= 0) {
+            ent_t* e = &v->E[ei];
+            e->dp = d; e->sz = sz; e->mt = n->mtime;
+            e->h = sz ? fnv((uint8_t*)d, sz) : 1;
+        }
+    }
+    unlock();
+    return 0;
+}
+
+/* big arena is full: drop files we can read back. only clean ones (what's
+   in memory is what's on disk), closed, and not one of the last lookups
+   (exec and the kernel shell use n->data right after fs_resolve).
+   walks the live tree, the ent array can point at freed nodes */
+static uint32_t rc_freed, rc_want;
+static void rc_walk(ev_t* v, fs_node_t* d, uint32_t now) {
+    for (fs_node_t* c = d->child; c && rc_freed < rc_want; c = c->next) {
+        if (skip(v, d, c)) continue;
+        if (c->type == FS_DIR) { rc_walk(v, c, now); continue; }
+        if (c->type != FS_FILE || c->lazy || !c->data || !c->cap || c->refs || fs_recent(c)) continue;
+        int ei = t_find(v, c);
+        if (ei < 0) continue;
+        ent_t* e = &v->E[ei];
+        if (e->dp != c->data || e->sz != c->size || e->mt != c->mtime || !e->h) continue;
+        rc_freed += (uint32_t)c->cap;
+        kfree(c->data);
+        c->data = NULL; c->cap = 0;
+        c->lazy = e->ino; c->lazy_vol = (uint8_t)v->id;
+        e->dp = NULL;
+    }
+}
+
+static void ext2_reclaim(size_t need) {
+    uint32_t f = irq_save();
+    if (busy) { irq_restore(f); return; }                  /* sync or a lazy read is on it, don't wait */
+    busy = 1;
+    rc_freed = 0;
+    rc_want = (uint32_t)need + 8 * 1024 * 1024;           /* some slack, not one file at a time */
+    uint32_t now = pit_uptime_ms();
+    for (int i = 0; i < E2_MAX && rc_freed < rc_want; i++)
+        if (vols[i].used && !vols[i].ro && vols[i].E && vols[i].tab) rc_walk(&vols[i], vols[i].root, now);
+    busy = 0;
+    irq_restore(f);
+    // { char b[16]; klog("ext2: reclaim "); utoa(rc_freed >> 10, b, 10); klog(b); klog("k\r\n"); }
+}
+
 int ext2_sync_all(void) {
     lock();
     for (int i = 0; i < E2_MAX; i++)
@@ -804,6 +878,8 @@ int ext2_mount(int disk, fs_node_t* at) {
     }
     ind_blk[0] = ind_blk[1] = ind_blk[2] = 0;
     if (load_dir(v, at, 2, 0) < 0) return -5;
+    fs_lazy_hook = ext2_lazy;
+    heap_reclaim = ext2_reclaim;
     v->used = true;
     v->id = E2_ID0 + s;
     v->root = at;

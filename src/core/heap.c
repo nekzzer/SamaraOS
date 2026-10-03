@@ -70,11 +70,20 @@ void* kmalloc(size_t n) {
     return p;
 }
 
+void (*heap_reclaim)(size_t need);
+
 void* kmalloc_big(size_t n) {
     uint32_t f = irq_save();
     void* p = arena_alloc(&big, n);
-    if (!p) p = arena_alloc(&low, n);
     irq_restore(f);
+    /* full: let ext2 throw out files it can read again, before eating the kernel heap */
+    if (!p && heap_reclaim && big.head) {
+        heap_reclaim(n);
+        f = irq_save();
+        p = arena_alloc(&big, n);
+        irq_restore(f);
+    }
+    if (!p) { f = irq_save(); p = arena_alloc(&low, n); irq_restore(f); }
     return p;
 }
 

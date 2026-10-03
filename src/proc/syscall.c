@@ -160,6 +160,18 @@ static fs_node_t* lookup_ex(int dirfd, const char* path, int* err, bool follow) 
     return n;
 }
 static fs_node_t* lookup(int dirfd, const char* path, int* err) { return lookup_ex(dirfd, path, err, true); }
+/* no reading lazy ext2 files in: stat & co only want the node */
+static fs_node_t* lookup_peek(int dirfd, const char* path, int* err, bool follow) {
+    *err = -ENOENT;
+    if (!ustr_ok(path)) { *err = -EFAULT; return NULL; }
+    if (!path[0]) return NULL;
+    fs_node_t* base = dir_base(dirfd, path, err);
+    if (!base) return NULL;
+    maybe_refresh_proc(base, path);
+    fs_node_t* n = fs_peek(base, path, follow);
+    if (!n) *err = -ENOENT;
+    return n;
+}
 
 /* Split "a/b/c/" into parent node of "c" and the name "c". */
 static fs_node_t* lookup_parent(int dirfd, const char* path, char* name, int* err) {
@@ -264,7 +276,7 @@ static int do_readlink(const char* path, char* buf, uint32_t n) {
     UCHK(buf, n);
     {
         int err;
-        fs_node_t* ln = lookup_ex(AT_FDCWD, path, &err, false);
+        fs_node_t* ln = lookup_peek(AT_FDCWD, path, &err, false);
         if (ln && ln->type == FS_LINK) {
             uint32_t k = ln->size < n ? (uint32_t)ln->size : n;
             memcpy(buf, ln->data, k);
@@ -279,6 +291,14 @@ static int do_readlink(const char* path, char* buf, uint32_t n) {
         int pid = 0;
         while (*p >= '0' && *p <= '9') pid = pid * 10 + (*p++ - '0');
         if (*p++ != '/' || pid != me()->tgid) return -EINVAL;
+    }
+    if (!strcmp(p, "exe")) {
+        proc_t* lp = proc_by_pid(me()->tgid);
+        const char* x = lp && lp->exe[0] ? lp->exe : me()->exe;
+        uint32_t k = (uint32_t)strlen(x);
+        if (k > n) k = n;
+        memcpy(buf, x, k);
+        return (int)k;
     }
     if (strncmp(p, "fd/", 3)) return -EINVAL;
     p += 3;
@@ -317,6 +337,7 @@ static int do_open(int dirfd, const char* path, int flags, int mode) {
     int err;
     fs_node_t* n = lookup(dirfd, path, &err);
     if (n && (flags & O_CREAT) && (flags & O_EXCL)) return -EEXIST;
+    if (n && n->lazy) return -ENOMEM;                 /* ext2 couldn't read it in, no room */
     if (!n) {
         if (!(flags & O_CREAT) || err != -ENOENT) return err;
         char name[FS_NAME_MAX];
@@ -430,7 +451,7 @@ static void shm_drop(fs_node_t* n);
 static int do_unlink(int dirfd, const char* path, int flags) {
     UCHK(path, 1);
     int err;
-    fs_node_t* n = lookup_ex(dirfd, path, &err, false);
+    fs_node_t* n = lookup_peek(dirfd, path, &err, false);
     if (!n) return err;
     if (flags & AT_REMOVEDIR) {
         if (n->type != FS_DIR) return -ENOTDIR;
@@ -473,11 +494,13 @@ static bool is_ancestor(fs_node_t* a, fs_node_t* n) {
 static int do_rename(int ofd, const char* from, int nfd, const char* to) {
     UCHK(from, 1); UCHK(to, 1);
     int err;
-    fs_node_t* src = lookup_ex(ofd, from, &err, false);
+    fs_node_t* src = lookup_peek(ofd, from, &err, false);
     if (!src) return err;
     char name[FS_NAME_MAX];
     fs_node_t* parent = lookup_parent(nfd, to, name, &err);
     if (!parent) return err;
+    // to another volume: lazy ext2 files have to come along in memory, fat sync reads ->data
+    if (fs_owner(src->parent) != fs_owner(parent)) fs_need_tree(src);
     if (src->type == FS_DIR && is_ancestor(src, parent)) return -EINVAL;
     fs_node_t* dst = fs_child(parent, name);
     if (dst == src) return 0;
@@ -520,7 +543,7 @@ static int do_link(int ofd, const char* from, int nfd, const char* to, int flags
 static int do_access(int dirfd, const char* path) {
     UCHK(path, 1);
     int err;
-    return lookup(dirfd, path, &err) ? 0 : err;
+    return lookup_peek(dirfd, path, &err, true) ? 0 : err;
 }
 
 static int do_dup(int fd, int from, bool cloexec) {
@@ -1455,7 +1478,7 @@ static int32_t dispatch(regs_t* r) {
         }
         case 15: case 306:
             UCHK((void*)(r->eax == 15 ? a : b), 1);
-            n = r->eax == 15 ? lookup(AT_FDCWD, (const char*)a, &err) : lookup((int)a, (const char*)b, &err);
+            n = r->eax == 15 ? lookup_peek(AT_FDCWD, (const char*)a, &err, true) : lookup_peek((int)a, (const char*)b, &err, true);
             if (!n) return err;
             n->mode = (uint16_t)((r->eax == 15 ? b : c) & 07777);
             return 0;
@@ -1699,7 +1722,7 @@ static int32_t dispatch(regs_t* r) {
         }
         case 195: case 196:                                          /* stat64 / lstat64 */
             UCHK((void*)a, 1); UCHK((void*)b, sizeof(kstat64_t));
-            n = lookup_ex(AT_FDCWD, (const char*)a, &err, r->eax == 195);
+            n = lookup_peek(AT_FDCWD, (const char*)a, &err, r->eax == 195);
             if (!n) return err;
             fill_stat_node((kstat64_t*)b, n);
             return 0;
@@ -1718,7 +1741,7 @@ static int32_t dispatch(regs_t* r) {
                 fill_stat_file((kstat64_t*)c, fl);
                 return 0;
             }
-            n = lookup_ex((int)a, (const char*)b, &err, !(d & 0x100));   /* AT_SYMLINK_NOFOLLOW */
+            n = lookup_peek((int)a, (const char*)b, &err, !(d & 0x100));   /* AT_SYMLINK_NOFOLLOW */
             if (!n) return err;
             fill_stat_node((kstat64_t*)c, n);
             return 0;
@@ -1766,7 +1789,7 @@ static int32_t dispatch(regs_t* r) {
             int dfd = (r->eax == 320 || r->eax == 412) ? (int)a : AT_FDCWD;
             if (!path) { file_t* fl = getf(dfd); if (fl && fl->type == F_NODE) fl->node->mtime = fs_now(); return 0; }
             UCHK(path, 1);
-            n = lookup(dfd, path, &err);
+            n = lookup_peek(dfd, path, &err, true);
             if (!n) return err;
             n->mtime = fs_now();
             return 0;

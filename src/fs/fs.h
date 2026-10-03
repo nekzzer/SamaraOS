@@ -22,6 +22,8 @@ typedef struct fs_node {
     int      refs;             /* open file descriptions pointing here */
     uint32_t mtime;
     uint8_t  mount_id;         /* nonzero on the root of a mounted volume */
+    uint8_t  lazy_vol;
+    uint32_t lazy;             /* ext2 ino whose bytes aren't read yet: data NULL, size is right */
 } fs_node_t;
 
 enum { FS_DEV_NONE = 0, FS_DEV_NULL, FS_DEV_ZERO, FS_DEV_TTY, FS_DEV_RANDOM, FS_DEV_FB, FS_DEV_INPUT,
@@ -37,6 +39,13 @@ void        fs_init(void);
 fs_node_t*  fs_root(void);
 fs_node_t*  fs_resolve(fs_node_t* cwd, const char* path);   /* NULL if missing; follows symlinks */
 fs_node_t*  fs_resolve_nf(fs_node_t* cwd, const char* path);  /* the last one is not followed */
+/* same, but a lazy file stays on disk: stat, access, readlink don't need the bytes */
+fs_node_t*  fs_peek(fs_node_t* cwd, const char* path, bool follow);
+extern int (*fs_lazy_hook)(fs_node_t* n);
+void        fs_need(fs_node_t* n);            /* read a lazy file in */
+bool        fs_recent(fs_node_t* n);          /* looked up just now: exec & co read ->data right after */
+void        fs_need_tree(fs_node_t* n);       /* a whole subtree (moving it to another volume) */
+fs_node_t*  fs_owner(fs_node_t* n);           /* the mount root above n */
 fs_node_t*  fs_symlink(fs_node_t* dir, const char* name, const char* target);
 fs_node_t*  fs_create(fs_node_t* cwd, const char* path, fs_type_t type);
 int         fs_unlink(fs_node_t* cwd, const char* path);
