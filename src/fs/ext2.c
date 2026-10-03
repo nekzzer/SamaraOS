@@ -7,10 +7,13 @@
 #include "boot/pit.h"
 
 /* ext2 volumes, the same way FAT works here: the whole tree is read into
-   ramfs nodes at mount, changes mark the volume dirty and a task writes the
-   tree back. Write-back lays everything out again (inodes from 11 up,
-   blocks from the first free one), keeping the metadata and the reserved
-   inodes where they are; only blocks whose contents changed are written.
+   ramfs nodes at mount, changes mark the volume dirty and a task writes
+   them back. Write-back is incremental now: every node keeps its inode and
+   its blocks between syncs (ent_t), the bitmaps come from the disk and only
+   what changed gets written. The old way laid the whole volume out again
+   and one new file early in the tree moved every block after it.
+   A volume labelled "/" is merged into the root: what's on it wins over the
+   boot files, and /usr, /lib, /etc ... changes (apk!) go back to it.
    ext3/ext4 (journal, extents, 64bit, ...) mount read-only: we can read
    extents, we just don't write them. */
 
@@ -18,16 +21,31 @@
 #define E2_ID0 8                          /* mount ids 8.. (FAT has 1..4) */
 
 typedef struct {
+    fs_node_t* n;
+    uint32_t ino, nb, nm;
+    uint32_t* bl;                         /* nb data blocks, then nm indirect ones */
+    uint32_t ib[15];                      /* i_block as on disk (or inline link) */
+    uint32_t sz, mt, h, isig;             /* what we wrote last time */
+    const char* dp;
+    uint8_t type, seen;
+} ent_t;
+
+typedef struct {
     bool used, ro;
     int id, disk;
     fs_node_t* root;
     uint32_t bs, spb, nblocks, ninodes, ipg, bpg, ngroups, first_data, first_ino, isize;
-    uint32_t gdt_blocks, resv_gdt, incompat, rocompat, compat, itb;
+    uint32_t gdt_blocks, incompat, rocompat, compat;
     uint8_t sb[1024];
     uint8_t* gdt;                         /* ngroups * 32 */
-    uint8_t* keep;                        /* block bitmap: metadata + reserved inodes' blocks */
-    uint8_t* resv;                        /* raw reserved inodes 1..first_ino-1 */
+    uint8_t* bbm, *ibm;                   /* block / inode bitmaps, one block per group */
+    uint8_t* gdirty;
     uint32_t* bhash;                      /* per block: hash of what we last wrote */
+    ent_t* E;
+    uint32_t ne, ecap;
+    int32_t* tab;                         /* node ptr -> E index, open addressing */
+    uint32_t tcap;
+    uint32_t acur, icur;
     volatile bool dirty;
     uint32_t dirty_ms;
 } ev_t;
@@ -139,6 +157,176 @@ static char* read_data(ev_t* v, const uint8_t* ino, uint32_t size) {
     return d;
 }
 
+/* ---------- node -> ent table ---------- */
+
+static uint32_t ph(fs_node_t* n, uint32_t cap) { return (((uint32_t)n >> 4) * 2654435761u) & (cap - 1); }
+
+static void t_rebuild(ev_t* v) {
+    uint32_t cap = 1024;
+    while (cap < v->ne * 2 + 64) cap <<= 1;
+    if (cap != v->tcap) {
+        if (v->tab) kfree(v->tab);
+        v->tab = kmalloc_big(cap * 4);
+        v->tcap = cap;
+    }
+    for (uint32_t i = 0; i < cap; i++) v->tab[i] = -1;
+    for (uint32_t i = 0; i < v->ne; i++) {
+        if (!v->E[i].n) continue;
+        uint32_t k = ph(v->E[i].n, cap);
+        while (v->tab[k] != -1) k = (k + 1) & (cap - 1);
+        v->tab[k] = (int32_t)i;
+    }
+}
+
+static int t_find(ev_t* v, fs_node_t* n) {
+    uint32_t k = ph(n, v->tcap);
+    for (uint32_t t = 0; t < v->tcap && v->tab[k] != -1; t++, k = (k + 1) & (v->tcap - 1))
+        if (v->tab[k] >= 0 && v->E[v->tab[k]].n == n) return v->tab[k];
+    return -1;
+}
+
+static void t_del(ev_t* v, fs_node_t* n) {
+    uint32_t k = ph(n, v->tcap);
+    for (uint32_t t = 0; t < v->tcap && v->tab[k] != -1; t++, k = (k + 1) & (v->tcap - 1))
+        if (v->tab[k] >= 0 && v->E[v->tab[k]].n == n) { v->tab[k] = -2; return; }   /* tombstone */
+}
+
+static int ent_new(ev_t* v, fs_node_t* n, uint32_t ino, uint8_t type) {
+    if (v->ne == v->ecap) {
+        uint32_t nc = v->ecap ? v->ecap * 2 : 1024;
+        ent_t* ne = kmalloc_big(nc * sizeof(ent_t));
+        if (!ne) return -1;
+        if (v->E) { memcpy(ne, v->E, v->ne * sizeof(ent_t)); kfree(v->E); }
+        v->E = ne; v->ecap = nc;
+    }
+    int i = (int)v->ne++;
+    ent_t* e = &v->E[i];
+    memset(e, 0, sizeof *e);
+    e->n = n; e->ino = ino; e->type = type; e->seen = 1;
+    if (v->ne * 2 >= v->tcap) t_rebuild(v);
+    else {
+        uint32_t k = ph(n, v->tcap);
+        while (v->tab[k] >= 0) k = (k + 1) & (v->tcap - 1);
+        v->tab[k] = i;
+    }
+    return i;
+}
+
+/* ---------- bitmaps ---------- */
+
+static bool bb_get(ev_t* v, uint32_t b) {
+    uint32_t i = b - v->first_data, k = i % v->bpg;
+    return v->bbm[(i / v->bpg) * v->bs + k / 8] & (1 << (k & 7));
+}
+static void bb_set(ev_t* v, uint32_t b, bool on) {
+    if (b < v->first_data || b >= v->nblocks) return;
+    uint32_t i = b - v->first_data, g = i / v->bpg, k = i % v->bpg;
+    uint8_t* p = v->bbm + g * v->bs + k / 8;
+    if (on) *p |= (uint8_t)(1 << (k & 7)); else *p &= (uint8_t)~(1 << (k & 7));
+    v->gdirty[g] = 1;
+}
+static uint32_t balloc(ev_t* v) {
+    uint32_t span = v->nblocks - v->first_data;
+    for (uint32_t t = 0; t < span; t++) {
+        uint32_t i = (v->acur + t) % span;
+        if ((i & 7) == 0 && i + 8 <= span && v->bbm[(i / v->bpg) * v->bs + (i % v->bpg) / 8] == 0xFF) { t += 7; continue; }
+        uint32_t b = v->first_data + i;
+        if (!bb_get(v, b)) { bb_set(v, b, true); v->acur = i + 1; v->bhash[b] = 0; return b; }
+    }
+    return 0;
+}
+
+static bool ib_get(ev_t* v, uint32_t ino) {
+    uint32_t i = ino - 1, k = i % v->ipg;
+    return v->ibm[(i / v->ipg) * v->bs + k / 8] & (1 << (k & 7));
+}
+static void ib_set(ev_t* v, uint32_t ino, bool on) {
+    uint32_t i = ino - 1, g = i / v->ipg, k = i % v->ipg;
+    uint8_t* p = v->ibm + g * v->bs + k / 8;
+    if (on) *p |= (uint8_t)(1 << (k & 7)); else *p &= (uint8_t)~(1 << (k & 7));
+    v->gdirty[g] = 1;
+}
+static uint32_t ialloc(ev_t* v) {
+    for (uint32_t t = 0; t < v->ninodes; t++) {
+        uint32_t ino = v->first_ino + (v->icur + t) % (v->ninodes - v->first_ino + 1);
+        if (!ib_get(v, ino)) { ib_set(v, ino, true); v->icur = ino - v->first_ino + 1; return ino; }
+    }
+    return 0;
+}
+
+static void free_blocks(ev_t* v, ent_t* e) {
+    for (uint32_t i = 0; i < e->nb + e->nm; i++) if (e->bl[i]) bb_set(v, e->bl[i], false);
+    if (e->bl) kfree(e->bl);
+    e->bl = NULL; e->nb = e->nm = 0;
+}
+
+static uint32_t isig(uint32_t mode, uint32_t size, uint32_t mt, uint32_t links, uint32_t iblk, const uint32_t* ib) {
+    uint32_t s[20] = { mode, size, mt, links, iblk };
+    memcpy(s + 5, ib, 60);
+    return fnv((const uint8_t*)s, sizeof(s));
+}
+
+/* ---------- mount: tree into the ramfs ---------- */
+
+/* the blocks an inode has: data in order (0 = hole), then the indirect ones */
+static int ent_load(ev_t* v, int ei, const uint8_t* raw) {
+    ent_t* e = &v->E[ei];
+    memcpy(e->ib, raw + 40, 60);
+    uint16_t mode = rd16(raw);
+    uint32_t size = rd32(raw + 4), per = v->bs / 4;
+    e->isig = isig(mode, size, rd32(raw + 16), rd16(raw + 26), rd32(raw + 28), e->ib);
+    if ((mode & 0xF000) == 0xA000 && size < 60 && !rd32(raw + 28)) return 0;   /* inline link */
+    if (e->ib[14]) return -1;                                /* triple indirect, nope */
+    uint32_t nb = (size + v->bs - 1) / v->bs, nm = 0;
+    uint32_t* dind = NULL;
+    if (e->ib[12]) nm++;
+    if (e->ib[13]) {
+        nm++;
+        dind = kmalloc(v->bs);
+        if (!dind || rblk(v, e->ib[13], dind) < 0) { if (dind) kfree(dind); return -1; }
+        for (uint32_t i = 0; i < per; i++) if (dind[i]) nm++;
+    }
+    e->bl = kmalloc((nb + nm) * 4 + 4);
+    if (!e->bl) { if (dind) kfree(dind); return -1; }
+    for (uint32_t i = 0; i < nb; i++) e->bl[i] = bmap(v, raw, i);
+    uint32_t k = nb;
+    if (e->ib[12]) e->bl[k++] = e->ib[12];
+    if (e->ib[13]) {
+        e->bl[k++] = e->ib[13];
+        for (uint32_t i = 0; i < per; i++) if (dind[i]) e->bl[k++] = dind[i];
+        kfree(dind);
+    }
+    e->nb = nb; e->nm = nm;
+    return 0;
+}
+
+/* a disk entry we didn't take (type clash with the boot files, a mount on
+   top): an ent without a node, so the first sync frees it. was leaking
+   unattached inodes before, e2fsck caught a busybox symlink */
+static void orphan(ev_t* v, uint32_t ino, int depth) {
+    static uint8_t ob[4096];
+    uint8_t raw[256];
+    uint8_t* p = inode_ptr(v, ino, ob);
+    if (!p || !v->E || depth > 40) return;
+    memcpy(raw, p, v->isize < 256 ? v->isize : 256);
+    int ei = ent_new(v, NULL, ino, 0);
+    if (ei < 0 || ent_load(v, ei, raw) < 0) { v->ro = true; return; }
+    if ((rd16(raw) & 0xF000) != 0x4000) return;
+    uint32_t sz = rd32(raw + 4);
+    char* d = read_data(v, raw, sz);
+    if (!d) return;
+    for (uint32_t o = 0; o + 8 <= sz; ) {
+        uint32_t ci = rd32((uint8_t*)d + o);
+        uint16_t rl = rd16((uint8_t*)d + o + 4);
+        uint8_t nl = (uint8_t)d[o + 6];
+        if (rl < 8) break;
+        bool dots = (nl == 1 && d[o + 8] == '.') || (nl == 2 && d[o + 8] == '.' && d[o + 9] == '.');
+        o += rl;
+        if (ci && !dots) orphan(v, ci, depth + 1);
+    }
+    kfree(d);
+}
+
 static int load_dir(ev_t* v, fs_node_t* dir, uint32_t dino, int depth) {
     static uint8_t ib[4096];
     uint8_t raw[256];
@@ -148,6 +336,11 @@ static int load_dir(ev_t* v, fs_node_t* dir, uint32_t dino, int depth) {
     uint32_t sz = rd32(raw + 4);
     char* d = read_data(v, raw, sz);
     if (!d) return -1;
+    if (v->E) {
+        int ei = ent_new(v, dir, dino, FS_DIR);
+        if (ei < 0 || ent_load(v, ei, raw) < 0) v->ro = true;
+        else v->E[ei].h = fnv((uint8_t*)d, sz);
+    }
     for (uint32_t o = 0; o + 8 <= sz; ) {
         uint32_t ino = rd32((uint8_t*)d + o);
         uint16_t rl = rd16((uint8_t*)d + o + 4);
@@ -165,290 +358,359 @@ static int load_dir(ev_t* v, fs_node_t* dir, uint32_t dino, int depth) {
         memcpy(craw, p, v->isize < 256 ? v->isize : 256);
         uint16_t mode = rd16(craw);
         uint32_t csz = (uint32_t)isize64(craw);
+        /* merging into a tree that already has stuff (the "/" volume):
+           the disk wins, except over mounts, devices and type clashes */
+        fs_node_t* old = fs_child(dir, name);
+        if (old && (old->mount_id || old->dev)) { orphan(v, ino, depth + 1); continue; }
         fs_node_t* n = NULL;
+        uint8_t ty = 0;
+        uint32_t want = (mode & 0xF000) == 0x4000 ? FS_DIR : (mode & 0xF000) == 0x8000 ? FS_FILE : (mode & 0xF000) == 0xA000 ? FS_LINK : 0;
+        if (!want || (old && old->type != want)) { orphan(v, ino, depth + 1); continue; }
         if ((mode & 0xF000) == 0x4000) {
-            n = fs_create(dir, name, FS_DIR);
+            n = old ? old : fs_create(dir, name, FS_DIR);
             if (n) load_dir(v, n, ino, depth + 1);
+            if (n) { n->mode = mode & 07777; n->mtime = rd32(craw + 16); }
+            continue;                                         /* load_dir made its ent */
         } else if ((mode & 0xF000) == 0x8000) {
-            n = fs_create(dir, name, FS_FILE);
-            if (n && csz) {
-                n->data = read_data(v, craw, csz);
-                if (n->data) { n->size = csz; n->cap = csz + 1; }
+            n = old ? old : fs_create(dir, name, FS_FILE);
+            if (n) {
+                fs_data_free(n);
+                n->size = 0;
+                if (csz) {
+                    n->data = read_data(v, craw, csz);
+                    if (n->data) { n->size = csz; n->cap = csz + 1; }
+                }
             }
+            ty = FS_FILE;
         } else if ((mode & 0xF000) == 0xA000) {
             static char tg[4096];
             if (csz < 60 && !rd32(craw + 28)) { memcpy(tg, craw + 40, csz); tg[csz] = 0; }
             else { char* t = read_data(v, craw, csz < 4000 ? csz : 4000); if (!t) continue; memcpy(tg, t, csz < 4000 ? csz : 4000); tg[csz < 4000 ? csz : 4000] = 0; kfree(t); }
-            n = fs_symlink(dir, name, tg);
+            if (old) {
+                fs_data_free(old);
+                uint32_t l = (uint32_t)strlen(tg);
+                old->data = kmalloc(l + 1);
+                if (old->data) { memcpy(old->data, tg, l + 1); old->size = l; old->cap = l + 1; }
+                n = old;
+            } else n = fs_symlink(dir, name, tg);
+            ty = FS_LINK;
         }
-        if (n) { n->mode = mode & 07777; n->mtime = rd32(craw + 16); }
+        if (!n) continue;
+        n->mode = mode & 07777;
+        n->mtime = rd32(craw + 16);
+        if (v->E) {
+            int ei = ent_new(v, n, ino, ty);
+            if (ei < 0 || ent_load(v, ei, craw) < 0) { v->ro = true; continue; }
+            ent_t* e = &v->E[ei];
+            e->dp = n->data; e->sz = (uint32_t)n->size; e->mt = n->mtime;
+            if (ty == FS_LINK) e->h = n->data ? fnv((uint8_t*)n->data, (uint32_t)n->size) : 1;
+        }
     }
+    dir->mtime = rd32(raw + 16);
     kfree(d);
     return 0;
 }
 
-static bool has_super(ev_t* v, uint32_t g) {
-    if (g <= 1 || !(v->rocompat & 1)) return true;        /* sparse_super */
-    for (uint32_t p = 3; p <= g; p *= 3) if (p == g) return true;
-    for (uint32_t p = 5; p <= g; p *= 5) if (p == g) return true;
-    for (uint32_t p = 7; p <= g; p *= 7) if (p == g) return true;
-    return false;
-}
-
-static void keep_set(ev_t* v, uint32_t b) { if (b < v->nblocks) v->keep[b >> 3] |= (uint8_t)(1 << (b & 7)); }
-static bool keep_get(ev_t* v, uint32_t b) { return v->keep[b >> 3] & (1 << (b & 7)); }
-
-/* every block an inode owns, indirect ones too */
-static void keep_inode(ev_t* v, const uint8_t* ino) {
-    if (rd32(ino + 32) & 0x80000) return;                 /* extents: ro anyway */
-    uint32_t per = v->bs / 4;
-    uint32_t* buf = kmalloc(v->bs);
-    uint32_t* buf2 = kmalloc(v->bs);
-    if (!buf || !buf2) return;
-    for (int i = 0; i < 12; i++) keep_set(v, rd32(ino + 40 + i * 4));
-    uint32_t s = rd32(ino + 88), dd = rd32(ino + 92);      /* i_block[12], [13] */
-    if (s) { keep_set(v, s); if (rblk(v, s, buf) == 0) for (uint32_t i = 0; i < per; i++) keep_set(v, buf[i]); }
-    if (dd) {
-        keep_set(v, dd);
-        if (rblk(v, dd, buf) == 0)
-            for (uint32_t i = 0; i < per; i++) if (buf[i]) {
-                keep_set(v, buf[i]);
-                if (rblk(v, buf[i], buf2) == 0) for (uint32_t k = 0; k < per; k++) keep_set(v, buf2[k]);
-            }
-    }
-    kfree(buf); kfree(buf2);
-}
-
 /* ---------- write back ---------- */
 
-typedef struct { fs_node_t* n; uint32_t ino, parent, nb, nind, blk[15], links; char* dirbuf; uint32_t dirlen, dlast; } wn_t;
-
-static wn_t* W;
-static int nW, capW;
-static uint32_t cur_blk;
-
-static uint32_t alloc_blk(ev_t* v) {
-    while (cur_blk < v->nblocks && keep_get(v, cur_blk)) cur_blk++;
-    return cur_blk < v->nblocks ? cur_blk++ : 0;
+static uint32_t meta_for(ev_t* v, uint32_t nb) {
+    uint32_t per = v->bs / 4;
+    if (nb <= 12) return 0;
+    if (nb <= 12 + per) return 1;
+    return 2 + (nb - 12 - per + per - 1) / per;
 }
 
-static void collect(fs_node_t* d, uint32_t parent) {
-    for (fs_node_t* c = d->child; c; c = c->next) {
-        if (c->dev || c->unlinked) continue;
-        if (nW == capW) {
-            int nc = capW ? capW * 2 : 1024;
-            wn_t* nw = kmalloc_big((uint32_t)nc * sizeof(wn_t));
-            if (!nw) return;
-            if (W) { memcpy(nw, W, (size_t)nW * sizeof(wn_t)); kfree(W); }
-            W = nw; capW = nc;
+/* content into the ent's blocks, same blocks again if the count fits */
+static int put_blocks(ev_t* v, int ei, const char* data, uint32_t len) {
+    uint32_t per = v->bs / 4, nb = (len + v->bs - 1) / v->bs;
+    if (nb > 12 + per + per * per) return -1;
+    uint32_t nm = meta_for(v, nb);
+    ent_t* e = &v->E[ei];
+    if (nb != e->nb || nm != e->nm) {
+        uint32_t* nl = kmalloc((nb + nm) * 4 + 4);
+        if (!nl) return -1;
+        uint32_t k = 0, old = e->nb + e->nm;
+        for (uint32_t i = 0; i < old; i++) {
+            if (!e->bl[i]) continue;
+            if (k < nb + nm) nl[k++] = e->bl[i];
+            else bb_set(v, e->bl[i], false);
         }
-        int me = nW++;
-        memset(&W[me], 0, sizeof(wn_t));
-        W[me].n = c;
-        W[me].parent = parent;
-        if (c->type == FS_DIR) collect(c, (uint32_t)me);
+        while (k < nb + nm) nl[k++] = 0;
+        if (e->bl) kfree(e->bl);
+        e->bl = nl; e->nb = nb; e->nm = nm;
     }
-}
-
-/* data blocks for len bytes (plus indirect ones), written out */
-static int put_data(ev_t* v, wn_t* w, const char* data, uint32_t len) {
-    uint32_t per = v->bs / 4, n = (len + v->bs - 1) / v->bs;
+    for (uint32_t i = 0; i < nb + nm; i++)
+        if (!e->bl[i] && !(e->bl[i] = balloc(v))) return -1;  /* holes too */
     static uint8_t blk[4096];
-    uint32_t* ind = NULL, *dind = NULL, *ind2 = NULL;
-    uint32_t ind_b = 0, dind_b = 0, ind2_b = 0;
-    w->nb = n;
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t b = alloc_blk(v);
-        if (!b) return -1;
+    for (uint32_t i = 0; i < nb; i++) {
         uint32_t take = len - i * v->bs < v->bs ? len - i * v->bs : v->bs;
-        memset(blk, 0, v->bs);
         memcpy(blk, data + i * v->bs, take);
-        wblk(v, b, blk);
-        if (i < 12) { w->blk[i] = b; continue; }
-        uint32_t j = i - 12;
-        if (j < per) {
-            if (!ind) { ind = kmalloc(v->bs); memset(ind, 0, v->bs); ind_b = alloc_blk(v); w->blk[12] = ind_b; w->nind++; }
-            ind[j] = b;
-            continue;
-        }
-        j -= per;
-        if (j >= per * per) return -1;                 /* > ~4 GB with 4k blocks, no */
-        if (!dind) { dind = kmalloc(v->bs); memset(dind, 0, v->bs); dind_b = alloc_blk(v); w->blk[13] = dind_b; w->nind++; }
-        if (j % per == 0) {
-            if (ind2) { wblk(v, ind2_b, ind2); kfree(ind2); }
-            ind2 = kmalloc(v->bs); memset(ind2, 0, v->bs);
-            ind2_b = alloc_blk(v); w->nind++;
-            dind[j / per] = ind2_b;
-        }
-        ind2[j % per] = b;
+        if (take < v->bs) memset(blk + take, 0, v->bs - take);
+        wblk(v, e->bl[i], blk);
     }
-    if (ind) { wblk(v, ind_b, ind); kfree(ind); }
-    if (ind2) { wblk(v, ind2_b, ind2); kfree(ind2); }
-    if (dind) { wblk(v, dind_b, dind); kfree(dind); }
+    memset(e->ib, 0, 60);
+    for (uint32_t i = 0; i < nb && i < 12; i++) e->ib[i] = e->bl[i];
+    if (nm) {
+        uint32_t* ind = (uint32_t*)blk;
+        memset(blk, 0, v->bs);
+        for (uint32_t i = 12; i < nb && i < 12 + per; i++) ind[i - 12] = e->bl[i];
+        e->ib[12] = e->bl[nb];
+        wblk(v, e->bl[nb], blk);
+    }
+    if (nm > 1) {
+        uint32_t nd = nm - 2;
+        e->ib[13] = e->bl[nb + 1];
+        uint32_t* ind = (uint32_t*)blk;
+        for (uint32_t j = 0; j < nd; j++) {
+            memset(blk, 0, v->bs);
+            for (uint32_t i = 0; i < per; i++) {
+                uint32_t lb = 12 + per + j * per + i;
+                if (lb < nb) ind[i] = e->bl[lb];
+            }
+            wblk(v, e->bl[nb + 2 + j], blk);
+        }
+        memset(blk, 0, v->bs);
+        for (uint32_t j = 0; j < nd; j++) ind[j] = e->bl[nb + 2 + j];
+        wblk(v, e->bl[nb + 1], blk);
+    }
     return 0;
 }
 
-static void dir_add(ev_t* v, wn_t* d, uint32_t ino, const char* name, uint8_t type) {
-    uint32_t* last = &d->dlast;
+typedef struct { char* buf; uint32_t len, last; } db_t;
+
+static void dir_add(ev_t* v, db_t* d, uint32_t ino, const char* name, uint8_t type) {
     uint32_t nl = (uint32_t)strlen(name), rl = (8 + nl + 3) & ~3u;
-    uint32_t off = d->dirlen;
+    uint32_t off = d->len;
     if (off / v->bs != (off + rl - 1) / v->bs) {           /* would cross a block: stretch the last one */
         uint32_t end = (off / v->bs + 1) * v->bs;
-        wr16((uint8_t*)d->dirbuf + *last + 4, (uint16_t)(end - *last));
+        wr16((uint8_t*)d->buf + d->last + 4, (uint16_t)(end - d->last));
         off = end;
     }
-    uint8_t* e = (uint8_t*)d->dirbuf + off;
+    uint8_t* e = (uint8_t*)d->buf + off;
     wr32(e, ino);
     wr16(e + 4, (uint16_t)rl);
     e[6] = (uint8_t)nl;
     e[7] = type;
     memcpy(e + 8, name, nl);
-    *last = off;
-    d->dirlen = off + rl;
+    d->last = off;
+    d->len = off + rl;
+}
+
+/* what never goes to disk */
+static bool skip(ev_t* v, fs_node_t* d, fs_node_t* c) {
+    if (c->dev || c->unlinked) return true;
+    if (c->mount_id && c->mount_id != v->id) return true;
+    if (c->type == FS_FILE && c->data && !c->cap && c->size) return true;   /* still the boot archive's bytes */
+    if (d == v->root && v->root == fs_root())
+        if (!strcmp(c->name, "proc") || !strcmp(c->name, "dev") || !strcmp(c->name, "tmp") || !strcmp(c->name, "sys"))
+            return true;
+    return false;
+}
+
+static void walk(ev_t* v, fs_node_t* d) {
+    for (fs_node_t* c = d->child; c; c = c->next) {
+        if (skip(v, d, c)) continue;
+        int ei = t_find(v, c);
+        if (ei >= 0 && (v->E[ei].type != c->type || v->E[ei].seen)) { t_del(v, c); v->E[ei].n = NULL; ei = -1; }
+        if (ei < 0) {
+            uint32_t ino = ialloc(v);
+            if (!ino) { klog("ext2: out of inodes\r\n"); continue; }
+            ei = ent_new(v, c, ino, (uint8_t)c->type);
+            if (ei < 0) continue;
+        }
+        v->E[ei].seen = 1;
+        if (c->type == FS_DIR) walk(v, c);
+    }
 }
 
 static int sync_vol(ev_t* v) {
-    nW = 0;
-    /* W[0] is the root */
-    if (!capW) { capW = 1024; W = kmalloc_big((uint32_t)capW * sizeof(wn_t)); if (!W) return -1; }
-    memset(&W[0], 0, sizeof(wn_t));
-    W[0].n = v->root;
-    nW = 1;
-    collect(v->root, 0);
-    if ((uint32_t)nW + v->first_ino > v->ninodes) { klog("ext2: out of inodes\r\n"); return -1; }
-    W[0].ino = 2;
-    for (int i = 1; i < nW; i++) W[i].ino = v->first_ino + (uint32_t)i - 1;
+    uint32_t now = fs_now();
+    uint8_t* dib = kmalloc_big(v->ninodes / 8 + 1);          /* inodes to write this time */
+    int32_t* i2e = kmalloc_big((v->ninodes + 1) * 4);
+    if (!dib || !i2e) { if (dib) kfree(dib); if (i2e) kfree(i2e); return -1; }
+    memset(dib, 0, v->ninodes / 8 + 1);
+    for (uint32_t i = 0; i <= v->ninodes; i++) i2e[i] = -1;
+
+    for (uint32_t i = 0; i < v->ne; i++) v->E[i].seen = 0;
+    t_rebuild(v);
+    int ri = t_find(v, v->root);
+    if (ri < 0) ri = ent_new(v, v->root, 2, FS_DIR);
+    v->E[ri].seen = 1;
+    walk(v, v->root);
+
+    /* gone from the tree: free the blocks, zero the inode */
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < v->ne; i++) {
+        ent_t* e = &v->E[i];
+        if (!e->seen || !e->n) {
+            free_blocks(v, e);
+            if (e->ino >= v->first_ino) { ib_set(v, e->ino, false); dib[e->ino >> 3] |= (uint8_t)(1 << (e->ino & 7)); }
+            continue;
+        }
+        if (w != i) v->E[w] = *e;
+        w++;
+    }
+    v->ne = w;
+    t_rebuild(v);
+
     bool ft = v->incompat & 2;
-    /* directories: entries first, their blocks go with the rest */
-    for (int i = 0; i < nW; i++) {
-        fs_node_t* n = W[i].n;
-        if (n->type != FS_DIR) continue;
-        uint32_t cnt = 2, bytes = 0;
-        for (fs_node_t* c = n->child; c; c = c->next) if (!c->dev && !c->unlinked) { cnt++; bytes += (uint32_t)strlen(c->name) + 12; }
-        W[i].dirbuf = kmalloc_big(bytes + 24 + cnt * 4 + v->bs * 2);
-        if (!W[i].dirbuf) return -1;
-        memset(W[i].dirbuf, 0, bytes + 24 + cnt * 4 + v->bs * 2);
-        W[i].links = 2;
-    }
-    for (int i = 0; i < nW; i++) {
-        if (W[i].n->type != FS_DIR) continue;
-        dir_add(v, &W[i], W[i].ino, ".", ft ? 2 : 0);
-        dir_add(v, &W[i], W[W[i].parent].ino, "..", ft ? 2 : 0);
-    }
-    for (int i = 1; i < nW; i++) {
-        wn_t* p = &W[W[i].parent];
-        fs_node_t* n = W[i].n;
-        uint8_t t = n->type == FS_DIR ? 2 : n->type == FS_LINK ? 7 : 1;
-        dir_add(v, p, W[i].ino, n->name, ft ? t : 0);
-        if (n->type == FS_DIR) p->links++;
-    }
-    for (int i = 0; i < nW; i++) {                          /* last entry of each dir fills its block */
-        if (W[i].n->type != FS_DIR) continue;
-        uint32_t o = W[i].dlast;
-        uint32_t end = ((W[i].dirlen + v->bs - 1) / v->bs) * v->bs;
-        wr16((uint8_t*)W[i].dirbuf + o + 4, (uint16_t)(end - o));
-        W[i].dirlen = end;
-    }
-    /* blocks */
-    cur_blk = v->first_data;
-    for (int i = 0; i < nW; i++) {
-        fs_node_t* n = W[i].n;
-        int r = 0;
-        if (n->type == FS_DIR) r = put_data(v, &W[i], W[i].dirbuf, W[i].dirlen);
-        else if (n->type == FS_LINK && n->size >= 60) r = put_data(v, &W[i], n->data, (uint32_t)n->size);
-        else if (n->type == FS_FILE && n->size) r = put_data(v, &W[i], n->data, (uint32_t)n->size);
-        if (r < 0) { klog("ext2: disk full\r\n"); return -1; }
-        W[i].links = n->type == FS_DIR ? W[i].links : 1;
-    }
-    for (int i = 0; i < nW; i++) if (W[i].dirbuf) { kfree(W[i].dirbuf); W[i].dirbuf = NULL; }
-    /* inode tables, bitmaps and group descriptors, group by group */
-    uint8_t* tab = kmalloc_big(v->itb * v->bs);
-    uint8_t* bmp = kmalloc_big(v->bs);
-    if (!tab || !bmp) return -1;
-    uint32_t free_b = 0, free_i = 0;
-    int wi = 0;                                             /* W index walking in ino order */
-    for (uint32_t g = 0; g < v->ngroups; g++) {
-        uint8_t* gd = v->gdt + g * 32;
-        memset(tab, 0, v->itb * v->bs);
-        uint32_t i0 = g * v->ipg + 1, dirs = 0, ui = 0;
-        for (uint32_t k = 0; k < v->ipg; k++) {
-            uint32_t ino = i0 + k;
-            uint8_t* e = tab + k * v->isize;
-            wn_t* w = NULL;
-            if (ino < v->first_ino) {                     /* reserved: as they were, but root is ours */
-                memcpy(e, v->resv + (ino - 1) * v->isize, v->isize);
-                if (ino != 2) { ui++; continue; }
-                w = &W[0];
-            } else {
-                while (wi < nW && W[wi].ino < ino) wi++;
-                if (wi < nW && W[wi].ino == ino) w = &W[wi];
+    int err = 0;
+    for (uint32_t i = 0; i < v->ne && !err; i++) {
+        ent_t* e = &v->E[i];
+        fs_node_t* n = e->n;
+        uint32_t links = 1, size = (uint32_t)n->size;
+        if (n->type == FS_DIR) {
+            /* children backwards: link_child prepends, this keeps the disk order */
+            uint32_t cnt = 0, bytes = 0;
+            for (fs_node_t* c = n->child; c; c = c->next) { cnt++; bytes += (uint32_t)strlen(c->name) + 12; }
+            fs_node_t** arr = kmalloc(cnt * sizeof(fs_node_t*) + 4);
+            db_t db = { kmalloc_big(bytes * 2 + v->bs * 2 + 64), 0, 0 };
+            if (!arr || !db.buf) { if (arr) kfree(arr); if (db.buf) kfree(db.buf); err = -1; break; }
+            memset(db.buf, 0, bytes * 2 + v->bs * 2 + 64);
+            cnt = 0;
+            for (fs_node_t* c = n->child; c; c = c->next) arr[cnt++] = c;
+            uint32_t pino = e->ino;
+            if (n != v->root && n->parent) { int pe = t_find(v, n->parent); if (pe >= 0) pino = v->E[pe].ino; }
+            dir_add(v, &db, e->ino, ".", ft ? 2 : 0);
+            dir_add(v, &db, pino, "..", ft ? 2 : 0);
+            links = 2;
+            while (cnt--) {
+                fs_node_t* c = arr[cnt];
+                int ce = t_find(v, c);
+                if (ce < 0 || skip(v, n, c)) continue;
+                uint8_t t = c->type == FS_DIR ? 2 : c->type == FS_LINK ? 7 : 1;
+                dir_add(v, &db, v->E[ce].ino, c->name, ft ? t : 0);
+                if (c->type == FS_DIR) links++;
             }
-            if (w) {
-                {
-                    fs_node_t* n = w->n;
-                    memset(e, 0, 128);
-                    uint16_t ty = n->type == FS_DIR ? 0x4000 : n->type == FS_LINK ? 0xA000 : 0x8000;
-                    wr16(e, (uint16_t)(ty | (n->mode & 07777)));
-                    uint32_t sz = n->type == FS_DIR ? w->nb * v->bs : (uint32_t)n->size;
-                    wr32(e + 4, sz);
-                    wr32(e + 8, n->mtime); wr32(e + 12, n->mtime); wr32(e + 16, n->mtime);
-                    wr16(e + 26, (uint16_t)w->links);
-                    wr32(e + 28, (w->nb + w->nind) * v->spb);
-                    if (n->type == FS_LINK && n->size < 60) memcpy(e + 40, n->data, n->size);
-                    else for (int b = 0; b < 15; b++) wr32(e + 40 + b * 4, w->blk[b]);
-                    if (v->isize > 128) wr16(e + 128, 32);           /* i_extra_isize */
-                    if (n->type == FS_DIR) dirs++;
-                    ui++;
+            kfree(arr);
+            uint32_t end = ((db.len + v->bs - 1) / v->bs) * v->bs;
+            wr16((uint8_t*)db.buf + db.last + 4, (uint16_t)(end - db.last));
+            db.len = end;
+            uint32_t h = fnv((uint8_t*)db.buf, db.len);
+            e = &v->E[i];
+            if (h != e->h) {
+                if (put_blocks(v, (int)i, db.buf, db.len) < 0) err = -1;
+                v->E[i].h = h;
+            }
+            kfree(db.buf);
+            e = &v->E[i];
+            size = e->nb * v->bs;
+        } else if (n->type == FS_LINK && n->size < 60) {
+            uint32_t h = n->data ? fnv((uint8_t*)n->data, (uint32_t)n->size) : 1;
+            if (h != e->h || e->nb) {
+                free_blocks(v, e);
+                memset(e->ib, 0, 60);
+                if (n->data) memcpy(e->ib, n->data, n->size);
+                e->h = h;
+            }
+        } else {
+            /* same buffer, size and an old enough mtime: don't even hash it */
+            bool same = e->dp == n->data && e->sz == size && e->mt == n->mtime && n->mtime + 2 < now && e->h;
+            if (!same) {
+                uint32_t h = size ? fnv((uint8_t*)n->data, size) : 1;
+                if (h != e->h || (size + v->bs - 1) / v->bs != e->nb) {
+                    if (put_blocks(v, (int)i, n->data, size) < 0) err = -1;
+                    e = &v->E[i];
                 }
+                e->h = h;
+                e->dp = n->data; e->sz = size; e->mt = n->mtime;
             }
         }
-        uint32_t tb = rd32(gd + 8);
-        for (uint32_t b = 0; b < v->itb; b++) wblk(v, tb + b, tab + b * v->bs);
-        /* inode bitmap */
-        memset(bmp, 0xFF, v->bs);
-        for (uint32_t k = 0; k < v->ipg; k++) {
-            uint32_t ino = i0 + k;
-            bool used = ino < v->first_ino;
-            if (!used) {
-                /* W is sorted by ino, ino = first_ino + i - 1 */
-                uint32_t i = ino - v->first_ino + 1;
-                used = i < (uint32_t)nW;
-            }
-            if (!used) bmp[k >> 3] &= (uint8_t)~(1 << (k & 7));
+        e = &v->E[i];
+        uint32_t ty = n->type == FS_DIR ? 0x4000 : n->type == FS_LINK ? 0xA000 : 0x8000;
+        uint32_t used = e->nm;
+        for (uint32_t k = 0; k < e->nb; k++) if (e->bl[k]) used++;
+        uint32_t s = isig(ty | (n->mode & 07777), size, n->mtime, links, used * v->spb, e->ib);
+        if (s != e->isig) {
+            e->isig = s;
+            dib[e->ino >> 3] |= (uint8_t)(1 << (e->ino & 7));
+            i2e[e->ino] = (int32_t)i;
         }
-        wblk(v, rd32(gd + 4), bmp);
-        /* block bitmap */
-        memset(bmp, 0xFF, v->bs);
-        uint32_t b0 = v->first_data + g * v->bpg, fb = 0;
-        for (uint32_t k = 0; k < v->bpg; k++) {
-            uint32_t b = b0 + k;
-            if (b >= v->nblocks) break;
-            if (!keep_get(v, b) && b >= cur_blk) { bmp[k >> 3] &= (uint8_t)~(1 << (k & 7)); fb++; }
-        }
-        wblk(v, rd32(gd), bmp);
-        wr16(gd + 12, (uint16_t)fb);
-        wr16(gd + 14, (uint16_t)(v->ipg - ui));
-        wr16(gd + 16, (uint16_t)dirs);
-        wr16(gd + 18, 0);                                   /* bg_flags: no uninit tricks */
-        free_b += fb; free_i += v->ipg - ui;
     }
-    kfree(tab); kfree(bmp);
-    /* group descriptors (primary copy) and the superblock */
-    uint32_t gb = v->first_data + 1;
+    if (err) klog("ext2: disk full\r\n");
+
+    /* inodes, read-modify-write so whatever we don't know about stays */
+    static uint8_t tb[4096];
+    uint32_t cur = 0;
+    for (uint32_t ino = 1; ino <= v->ninodes; ino++) {
+        if (!(dib[ino >> 3] & (1 << (ino & 7)))) continue;
+        uint32_t g = (ino - 1) / v->ipg, off = ((ino - 1) % v->ipg) * v->isize;
+        uint32_t b = rd32(v->gdt + g * 32 + 8) + off / v->bs;
+        if (b != cur) {
+            if (cur) wblk(v, cur, tb);
+            if (rblk(v, b, tb) < 0) { cur = 0; continue; }
+            cur = b;
+        }
+        uint8_t* p = tb + off % v->bs;
+        if (i2e[ino] < 0) {                                  /* deleted */
+            memset(p, 0, v->isize);
+            wr32(p + 20, now);
+            continue;
+        }
+        ent_t* e = &v->E[i2e[ino]];
+        fs_node_t* n = e->n;
+        if (!rd16(p + 26) || !rd16(p)) {                    /* fresh one */
+            memset(p, 0, v->isize);
+            if (v->isize > 128) wr16(p + 128, 32);
+        }
+        uint16_t ty = n->type == FS_DIR ? 0x4000 : n->type == FS_LINK ? 0xA000 : 0x8000;
+        wr16(p, (uint16_t)(ty | (n->mode & 07777)));
+        uint32_t size = n->type == FS_DIR ? e->nb * v->bs : (uint32_t)n->size;
+        wr32(p + 4, size);
+        wr32(p + 8, n->mtime); wr32(p + 12, n->mtime); wr32(p + 16, n->mtime);
+        wr32(p + 20, 0);
+        uint32_t links = 1;
+        if (n->type == FS_DIR) { links = 2; for (fs_node_t* c = n->child; c; c = c->next) if (c->type == FS_DIR && !skip(v, n, c) && t_find(v, c) >= 0) links++; }
+        wr16(p + 26, (uint16_t)links);
+        uint32_t used = e->nm;
+        for (uint32_t k = 0; k < e->nb; k++) if (e->bl[k]) used++;
+        wr32(p + 28, used * v->spb);
+        wr32(p + 32, rd32(p + 32) & ~0x81000u);             /* no extents, no htree: we write plain */
+        memcpy(p + 40, e->ib, 60);
+        wr32(p + 108, 0);
+    }
+    if (cur) wblk(v, cur, tb);
+    kfree(dib); kfree(i2e);
+
+    /* bitmaps and counts of the groups we touched */
+    uint32_t* dirs = kmalloc(v->ngroups * 4);
+    if (dirs) {
+        memset(dirs, 0, v->ngroups * 4);
+        for (uint32_t i = 0; i < v->ne; i++) if (v->E[i].type == FS_DIR) dirs[(v->E[i].ino - 1) / v->ipg]++;
+    }
+    for (uint32_t g = 0; g < v->ngroups; g++) {
+        if (!v->gdirty[g]) continue;
+        v->gdirty[g] = 0;
+        uint8_t* gd = v->gdt + g * 32;
+        wblk(v, rd32(gd), v->bbm + g * v->bs);
+        wblk(v, rd32(gd + 4), v->ibm + g * v->bs);
+        uint32_t fb = 0, fi = 0;
+        for (uint32_t k = 0; k < v->bpg; k++) {
+            uint32_t b = v->first_data + g * v->bpg + k;
+            if (b >= v->nblocks) break;
+            if (!bb_get(v, b)) fb++;
+        }
+        for (uint32_t k = 0; k < v->ipg; k++) if (!ib_get(v, g * v->ipg + k + 1)) fi++;
+        wr16(gd + 12, (uint16_t)fb);
+        wr16(gd + 14, (uint16_t)fi);
+        if (dirs) wr16(gd + 16, (uint16_t)dirs[g]);
+    }
+    if (dirs) kfree(dirs);
+    uint32_t free_b = 0, free_i = 0;
+    for (uint32_t g = 0; g < v->ngroups; g++) { free_b += rd16(v->gdt + g * 32 + 12); free_i += rd16(v->gdt + g * 32 + 14); }
     uint8_t* gbuf = kmalloc_big(v->gdt_blocks * v->bs);
     if (gbuf) {
         memset(gbuf, 0, v->gdt_blocks * v->bs);
         memcpy(gbuf, v->gdt, v->ngroups * 32);
-        for (uint32_t b = 0; b < v->gdt_blocks; b++) wblk(v, gb + b, gbuf + b * v->bs);
+        for (uint32_t b = 0; b < v->gdt_blocks; b++) wblk(v, v->first_data + 1 + b, gbuf + b * v->bs);
         kfree(gbuf);
     }
     wr32(v->sb + 12, free_b);
     wr32(v->sb + 16, free_i);
-    extern uint32_t fs_now(void);
-    wr32(v->sb + 48, fs_now());                             /* s_wtime */
+    wr32(v->sb + 48, now);                                  /* s_wtime */
     wr16(v->sb + 58, 1);                                    /* clean */
     ata_write(v->disk, 2, 2, v->sb);
-    return 0;
+    return err;
 }
 
 /* ---------- mount, sync task ---------- */
@@ -510,46 +772,38 @@ int ext2_mount(int disk, fs_node_t* at) {
     v->first_ino = rev ? rd32(sb + 84) : 11;
     v->isize = rev ? rd16(sb + 88) : 128;
     v->compat = rd32(sb + 92); v->incompat = rd32(sb + 96); v->rocompat = rd32(sb + 100);
-    v->resv_gdt = (v->compat & 0x10) ? rd16(sb + 206) : 0;
     if (v->bs > 4096 || !v->ipg || !v->bpg || v->isize < 128 || v->isize > 1024) return -22;
     if (v->incompat & 0x80) return -22;                     /* 64bit descriptors: not here */
     v->spb = v->bs / 512;
     v->ngroups = (v->nblocks - v->first_data + v->bpg - 1) / v->bpg;
     v->gdt_blocks = (v->ngroups * 32 + v->bs - 1) / v->bs;
-    v->itb = (v->ipg * v->isize + v->bs - 1) / v->bs;
     /* write only what we fully understand: filetype and sparse_super, large_file */
     v->ro = (v->incompat & ~2u) || (v->rocompat & ~3u) || (v->compat & 4);
     v->gdt = kmalloc(v->gdt_blocks * v->bs);
     if (!v->gdt) return -12;
     for (uint32_t b = 0; b < v->gdt_blocks; b++)
         if (rblk(v, v->first_data + 1 + b, v->gdt + b * v->bs) < 0) return -5;
+    if (!v->ro) {
+        v->bbm = kmalloc_big(v->ngroups * v->bs);
+        v->ibm = kmalloc_big(v->ngroups * v->bs);
+        v->gdirty = kmalloc(v->ngroups);
+        v->bhash = kmalloc_big(v->nblocks * 4);
+        if (!v->bbm || !v->ibm || !v->gdirty || !v->bhash) v->ro = true;
+    }
+    if (!v->ro) {
+        memset(v->gdirty, 0, v->ngroups);
+        memset(v->bhash, 0, v->nblocks * 4);
+        for (uint32_t g = 0; g < v->ngroups && !v->ro; g++) {
+            uint8_t* gd = v->gdt + g * 32;
+            if (rblk(v, rd32(gd), v->bbm + g * v->bs) < 0 || rblk(v, rd32(gd + 4), v->ibm + g * v->bs) < 0) v->ro = true;
+        }
+        t_rebuild(v);
+        v->E = kmalloc_big(1024 * sizeof(ent_t));
+        v->ecap = v->E ? 1024 : 0;
+        if (!v->E) v->ro = true;
+    }
     ind_blk[0] = ind_blk[1] = ind_blk[2] = 0;
     if (load_dir(v, at, 2, 0) < 0) return -5;
-    if (!v->ro) {
-        v->keep = kmalloc_big(v->nblocks / 8 + 1);
-        v->bhash = kmalloc_big(v->nblocks * 4);
-        v->resv = kmalloc_big(v->first_ino * v->isize);
-        if (!v->keep || !v->bhash || !v->resv) v->ro = true;
-    }
-    if (!v->ro) {
-        memset(v->keep, 0, v->nblocks / 8 + 1);
-        memset(v->bhash, 0, v->nblocks * 4);
-        for (uint32_t b = 0; b <= v->first_data; b++) keep_set(v, b);
-        for (uint32_t g = 0; g < v->ngroups; g++) {
-            uint32_t base = v->first_data + g * v->bpg;
-            if (has_super(v, g)) for (uint32_t b = 0; b < 1 + v->gdt_blocks + v->resv_gdt; b++) keep_set(v, base + b);
-            uint8_t* gd = v->gdt + g * 32;
-            keep_set(v, rd32(gd)); keep_set(v, rd32(gd + 4));
-            for (uint32_t b = 0; b < v->itb; b++) keep_set(v, rd32(gd + 8) + b);
-        }
-        static uint8_t ib[4096];
-        for (uint32_t ino = 1; ino < v->first_ino; ino++) {
-            uint8_t* p = inode_ptr(v, ino, ib);
-            if (!p) continue;
-            memcpy(v->resv + (ino - 1) * v->isize, p, v->isize);
-            if (ino != 2) keep_inode(v, v->resv + (ino - 1) * v->isize);
-        }
-    }
     v->used = true;
     v->id = E2_ID0 + s;
     v->root = at;

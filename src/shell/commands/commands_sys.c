@@ -10,6 +10,8 @@
 #include "gfx/gfx.h"
 #include "gui/wm.h"
 #include "net/net.h"
+#include "fs/ext2.h"
+#include "fs/fatfs.h"
 
 void cmd_uptime(int argc, char **argv) {
   (void)argc;
@@ -111,6 +113,8 @@ void cmd_shutdown(int argc, char **argv) {
   (void)argc;
   (void)argv;
   vga_puts("shutdown...\n");
+  ext2_sync_all();  /* root disk, apk stuff */
+  fatfs_sync_all();
   outw(0x604, 0x2000);  /* QEMU >= 2.0 */
   outw(0xB004, 0x2000); /* older QEMU/Bochs */
   outw(0x4004, 0x3400); /* virtualbox */
@@ -121,6 +125,8 @@ void cmd_reboot(int argc, char **argv) {
   (void)argc;
   (void)argv;
   vga_puts("rebooting...\n");
+  ext2_sync_all();
+  fatfs_sync_all();
   while (inb(0x64) & 0x02) {
   }
   outb(0x64, 0xFE);

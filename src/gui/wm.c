@@ -13,6 +13,8 @@
 #include "drivers/keyboard.h"
 #include "drivers/mouse.h"
 #include "fs/fs.h"
+#include "fs/ext2.h"
+#include "fs/fatfs.h"
 #include "gfx/font.h"
 #include "gfx/gfx.h"
 #include "gfx/gfx_term.h"
@@ -775,8 +777,8 @@ static void menu_run(int action) {
         case 5:  wm_open_info(W / 2 - 180, H / 2 - 120, 360, 190, "About", about_text); break;
         case 6:  wm_open_info(W / 2 - 200, H / 2 - 120, 400, 200, "Welcome", welcome_text); break;
         case 7:  wm_open_info(W / 2 - 200, H / 2 - 120, 400, 210, "System Info", wm_sysinfo_text()); break;
-        case 8:  while (inb(0x64) & 0x02) {} outb(0x64, 0xFE); break;
-        case 9:  outw(0x604, 0x2000); outw(0xB004, 0x2000); break;
+        case 8:  ext2_sync_all(); fatfs_sync_all(); while (inb(0x64) & 0x02) {} outb(0x64, 0xFE); break;
+        case 9:  ext2_sync_all(); fatfs_sync_all(); outw(0x604, 0x2000); outw(0xB004, 0x2000); break;
         case 10: exit_requested = true; break;
     }
 }

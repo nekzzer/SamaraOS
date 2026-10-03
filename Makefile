@@ -275,6 +275,7 @@ NET_DRIVE := -netdev user,id=n0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,hostf
 # writes changes back, so files there survive reboots. Created on first run;
 # on the host: `mdir -i disk.img ::` / `mcopy -i disk.img ::file .`
 DISK_IMG ?= disk.img
+ROOTDISK ?= build/root.img
 DISK_DRIVE := -device ahci,id=ahci -drive id=sata0,file=$(DISK_IMG),format=raw,if=none \
               -device ide-hd,drive=sata0,bus=ahci.0
 
@@ -309,7 +310,7 @@ SELF_KERNEL := build/samara-self.elf
 BOOT_MODS   := $(GCC_TAR),$(SRC_TAR)
 RUN_MODULES = $(if $(wildcard $(GCC_TAR)),-initrd "$(BOOT_MODS)")
 
-run: $(KERNEL) $(DISK_IMG) src-tar
+run: $(KERNEL) $(DISK_IMG) $(ROOTDISK) src-tar
 	@mkdir -p $(MUSIC_DIR)
 	@test -f $(GCC_TAR) || $(MAKE) --no-print-directory $(GCC_TAR) || echo "(no gcc module: toolchain/gcc-native missing)"
 	K=$$(python3 tools/pick-kernel.py $(DISK_IMG) $(KERNEL) $(SELF_KERNEL)) && \
@@ -337,6 +338,15 @@ NET_DRIVE += $(foreach i,$(shell seq 2 $(NICS) 2>/dev/null),-netdev user,id=n$(i
 VDISK ?=
 comma := ,
 DISK_DRIVE += $(if $(VDISK),-drive file=$(VDISK)$(comma)format=raw$(comma)if=virtio)
+
+# ext2 disk labelled "/": merged into the root at boot, so apk add and what
+# you change in /usr /lib /etc /root survives a reboot. ROOTDISK= to go
+# without it, rm build/root.img to start clean.
+DISK_DRIVE += $(if $(ROOTDISK),-drive file=$(ROOTDISK)$(comma)format=raw$(comma)if=virtio)
+build/root.img:
+	@mkdir -p build
+	truncate -s 2G $@
+	mke2fs -q -t ext2 -b 4096 -O ^dir_index,^resize_inode -L / $@
 
 # Run with DOOM1.WAD attached as the primary disk so 'doom' command works.
 WAD ?= Doom1.WAD
