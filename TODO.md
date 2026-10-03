@@ -56,7 +56,7 @@ make run SELF=0 NICS=3                      # + virtio-net cards eth1, eth2
 3. **virtio-gpu** (skipped): needs the modern virtio PCI transport.
 4. **Browser leftovers:** progressive JPEG, SVG (at least icons), `z-index`,
    `box-shadow`, `transform`, `:hover`.
-5. **X:** no mode switching (boot resolution), xkb layout is us only, no
+5. **X:** no mode switching (boot resolution), no
    signalfd. The X root background needs `xsetroot` a few seconds late.
 6. **ext2:** a type clash between a boot file and a disk entry keeps the
    boot file; old root disks still carry stale boot-made /etc files (rm once).
