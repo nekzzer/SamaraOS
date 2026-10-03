@@ -757,6 +757,109 @@ static uint32_t* shm_frames(fs_node_t* n, uint32_t pages) {
     return fr;
 }
 
+/* SysV shm through ipc(117), musl on i386 goes that way. a segment is a
+   dummy node in the shm[] table above, so every shmat maps the same frames.
+   for MIT-SHM: glxgears sent every frame down the socket without it */
+#define SV_MAX 64
+static struct { int key; uint32_t size; fs_node_t* node; int nattch; bool rm; int cpid; uint16_t mode; } sv[SV_MAX];
+static struct { int tgid; uint32_t addr, len; int seg; } sva[128];
+
+static void sv_free(int i) {
+    shm_drop(sv[i].node);
+    kfree(sv[i].node);
+    sv[i].node = NULL;
+}
+
+static int do_ipc(uint32_t call, int first, uint32_t second, uint32_t third, uint32_t ptr) {
+    proc_t* p = me();
+    switch (call & 0xFFFF) {
+        case 23: {                                                    /* shmget(key, size, flags) */
+            int key = first;
+            uint32_t size = second, flg = third;
+            if (key) for (int i = 0; i < SV_MAX; i++)
+                if (sv[i].node && sv[i].key == key && !sv[i].rm) {
+                    if ((flg & 03000) == 03000) return -EEXIST;        /* IPC_CREAT|IPC_EXCL */
+                    return i + 1;
+                }
+            if (!(flg & 01000) && key) return -ENOENT;            /* no IPC_CREAT */
+            if (!size || size > 256u << 20) return -EINVAL;
+            for (int i = 0; i < SV_MAX; i++) {
+                if (sv[i].node) continue;
+                fs_node_t* n = kmalloc(sizeof(fs_node_t));
+                if (!n) return -ENOMEM;
+                memset(n, 0, sizeof(*n));
+                uint32_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+                sv[i].node = n;
+                if (!shm_frames(n, pages)) { kfree(n); sv[i].node = NULL; return -ENOMEM; }
+                sv[i].key = key; sv[i].size = size; sv[i].nattch = 0; sv[i].rm = false;
+                sv[i].cpid = p->tgid; sv[i].mode = (uint16_t)(flg & 0777);
+                return i + 1;
+            }
+            return -28;                                           /* ENOSPC */
+        }
+        case 21: {                                                    /* shmat(id, flags, &ret, addr) */
+            int i = first - 1;
+            if (i < 0 || i >= SV_MAX || !sv[i].node) return -EINVAL;
+            UCHK((void*)third, 4);
+            uint32_t len = (sv[i].size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1), addr = ptr;
+            if (addr) {
+                if (addr & (PAGE_SIZE - 1)) { if (second & 020000) addr &= ~(PAGE_SIZE - 1); else return -EINVAL; }   /* SHM_RND */
+                if (!vmm_range_unmapped(p->pd, addr, len)) return -EINVAL;
+            } else {
+                addr = vmm_find_free(p->pd, USER_MMAP_BASE, USER_STACK_TOP - USER_STACK_MAX, len);
+                if (!addr) return -ENOMEM;
+            }
+            int slot = -1;
+            for (int k = 0; k < 128; k++) if (!sva[k].len) { slot = k; break; }
+            if (slot < 0) return -EMFILE;
+            uint32_t* fr = shm_frames(sv[i].node, len / PAGE_SIZE);
+            if (!fr) return -ENOMEM;
+            for (uint32_t k = 0; k < len / PAGE_SIZE; k++)
+                vmm_map_frame(p->pd, addr + k * PAGE_SIZE, fr[k], !(second & 010000));   /* SHM_RDONLY */
+            vmm_flush();
+            sva[slot].tgid = p->tgid; sva[slot].addr = addr; sva[slot].len = len; sva[slot].seg = i;
+            sv[i].nattch++;
+            *(uint32_t*)third = addr;
+            return 0;
+        }
+        case 22: {                                                    /* shmdt(addr) */
+            for (int k = 0; k < 128; k++) {
+                if (!sva[k].len || sva[k].tgid != p->tgid || sva[k].addr != ptr) continue;
+                vmm_free_range(p->pd, ptr, sva[k].len);
+                vmm_flush();
+                int i = sva[k].seg;
+                sva[k].len = 0;
+                if (--sv[i].nattch <= 0 && sv[i].rm) sv_free(i);
+                return 0;
+            }
+            return -EINVAL;
+        }
+        case 24: {                                                    /* shmctl(id, cmd, buf) */
+            int i = first - 1, cmd = (int)(second & 0xFF);
+            if (i < 0 || i >= SV_MAX || !sv[i].node) return -EINVAL;
+            if (cmd == 0) {                                           /* IPC_RMID */
+                sv[i].rm = true;
+                if (sv[i].nattch <= 0) sv_free(i);
+                return 0;
+            }
+            if (cmd == 2 || cmd == 13) {                              /* IPC_STAT, SHM_STAT: shmid64_ds */
+                UCHK((void*)ptr, 84);
+                uint8_t* b = (uint8_t*)ptr;
+                memset(b, 0, 84);
+                *(int*)b = sv[i].key;
+                *(uint16_t*)(b + 20) = sv[i].mode;                    /* uid/gid/cuid/cgid 0 */
+                *(uint32_t*)(b + 36) = sv[i].size;
+                *(uint32_t*)(b + 64) = (uint32_t)sv[i].cpid;
+                *(uint32_t*)(b + 72) = (uint32_t)sv[i].nattch;
+                return 0;
+            }
+            if (cmd == 1) return 0;                                   /* IPC_SET: sure */
+            return -EINVAL;
+        }
+    }
+    return -ENOSYS;                                                   /* sem*, msg*: not here */
+}
+
 #define MAP_SHARED 0x01
 #define MAP_FIXED 0x10
 #define MAP_ANON  0x20
@@ -2107,6 +2210,7 @@ static int32_t dispatch(regs_t* r) {
         case 240: return do_futex(a, b, c, d, e, f6, false);
         case 422: return do_futex(a, b, c, d, e, f6, true);       /* futex_time64 */
         case 219: return 0;                                          /* madvise: advisory */
+        case 117: return do_ipc(a, (int)b, c, d, e);                 /* ipc: shm* */
         case 272: case 250: return 0;                                /* fadvise64(_64): advice taken, ignored */
         case 324: return -95;                                        /* fallocate, apk asks. EOPNOTSUPP and it just writes */
         // eventfd(2), timerfd, signalfd(4), epoll*, memfd: not here yet. glib/qemu fall back

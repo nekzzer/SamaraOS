@@ -268,10 +268,14 @@ static int pipe_read(file_t* f, pipe_t* p, char* buf, uint32_t n) {
         task_yield();
     }
     uint32_t got = 0;
-    while (got < n && p->count > 0) {
-        buf[got++] = p->buf[p->tail];
-        p->tail = (p->tail + 1) % PIPE_SZ;
-        p->count--;
+    while (got < n && p->count > 0) {                /* at most two runs around the ring */
+        uint32_t k = PIPE_SZ - (uint32_t)p->tail;
+        if (k > (uint32_t)p->count) k = (uint32_t)p->count;
+        if (k > n - got) k = n - got;
+        memcpy(buf + got, p->buf + p->tail, k);
+        got += k;
+        p->tail = (p->tail + (int)k) % PIPE_SZ;
+        p->count -= (int)k;
     }
     return (int)got;
 }
@@ -290,9 +294,13 @@ static int pipe_write(file_t* f, pipe_t* p, const char* buf, uint32_t n) {
             task_yield();
             continue;
         }
-        p->buf[p->head] = buf[put++];
-        p->head = (p->head + 1) % PIPE_SZ;
-        p->count++;
+        uint32_t k = PIPE_SZ - (uint32_t)p->head, room = PIPE_SZ - (uint32_t)p->count;
+        if (k > room) k = room;
+        if (k > n - put) k = n - put;
+        memcpy(p->buf + p->head, buf + put, k);
+        put += k;
+        p->head = (p->head + (int)k) % PIPE_SZ;
+        p->count += (int)k;
     }
     return (int)put;
 }

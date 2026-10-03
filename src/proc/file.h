@@ -12,7 +12,7 @@ typedef enum { F_NODE = 1, F_TTY, F_PIPE_R, F_PIPE_W, F_NULL, F_ZERO, F_RANDOM, 
                F_USOCK, F_ULISTEN,                 /* AF_UNIX not connected yet / listening (ux) */
                F_EPOLL } ftype_t;
 
-#define PIPE_SZ 8192
+#define PIPE_SZ 65536           /* was 8k, x11 images through a socketpair crawled */
 
 typedef struct pipe {
     char buf[PIPE_SZ];
