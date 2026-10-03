@@ -1,4 +1,5 @@
 #include "gfx/gfx.h"
+#include "drivers/fbdev.h"
 #include "gfx/uifont.h"
 #include "gfx/font.h"
 #include "core/string.h"
@@ -246,8 +247,10 @@ void gfx_disable_double_buffer(void) {
 }
 void gfx_target_back(void)  { if (back_buf) fb = back_buf; }
 void gfx_target_front(void) { fb = real_fb; }
+bool gfx_on_front(void) { return fb == real_fb; }
 void gfx_present(void) {
     if (!back_buf || !real_fb) return;
+    if (fbdev_active()) return;           /* X or doom own the screen, the console wrote over xorg */
     uint32_t n = (uint32_t)(fb_pitch_bytes * fb_h) / 4;
     void* d = real_fb;
     void* s = back_buf;
@@ -262,6 +265,7 @@ void gfx_present(void) {
 
 void gfx_present_rect(int x, int y, int w, int h) {
     if (!back_buf || !real_fb) return;
+    if (fbdev_active()) return;
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
     if (x + w > fb_w) w = fb_w - x;

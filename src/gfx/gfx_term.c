@@ -1,4 +1,5 @@
 #include "gfx/gfx_term.h"
+#include "drivers/fbdev.h"
 #include "gfx/gfx.h"
 #include "gfx/termfont.h"
 #include "core/heap.h"
@@ -113,7 +114,13 @@ static bool cursor_at(int x, int y) {
     return x == px && y == cy;
 }
 
+static bool missed;      /* cells skipped while somebody owned the screen */
+
+static void render_all(void);
 static void render_cell(int x, int y) {
+    /* xorg/doom have /dev/fb0: the console drew its text right over them */
+    if (gfx_on_front() && fbdev_active()) { missed = true; return; }
+    if (missed) { missed = false; render_all(); return; }
     const cell_t* p = shown(x, y);
     termfont_cell(term_x_px + x * CW, term_y_px + y * CH, p->cp, p->fg, p->bg,
                   (uint8_t)(p->at | (cursor_at(x, y) ? TF_CURSOR : 0)));

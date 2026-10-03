@@ -20,6 +20,7 @@ void     gfx_present_rect(int x, int y, int w, int h); /* partial back -> front 
 int      gfx_w(void);
 /* The real (front) framebuffer, bypassing any back buffer. NULL if no gfx. */
 uint8_t* gfx_front_fb(int* pitch_bytes, int* bpp);
+bool     gfx_on_front(void);                   /* drawing straight into the real framebuffer */
 int      gfx_h(void);
 
 void     gfx_clear(uint32_t color);
