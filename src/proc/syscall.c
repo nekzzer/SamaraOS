@@ -2120,7 +2120,14 @@ static int32_t dispatch(regs_t* r) {
         case 192: return do_mmap(a, b, (int)c, (int)d, (int)e, f6 * PAGE_SIZE);
         case 91:  return do_munmap(a, b);
         case 125: return do_mprotect(a, b, (int)c);
-        case 163: return -ENOMEM;                                    /* mremap: musl falls back */
+        case 163: {                                                  /* mremap: never moves, musl falls back */
+            /* but musl's pthread_getattr_np walks down the main stack with it until
+               the answer isn't ENOMEM. always ENOMEM = node spun through all 4 GB.
+               the whole 8 MB stack window counts as mapped, it grows on demand */
+            bool stk = a >= USER_STACK_TOP - USER_STACK_MAX && a < USER_STACK_TOP;
+            if (!stk && !(vmm_pte(me()->pd, a & ~(PAGE_SIZE - 1)) & PTE_P)) return -EFAULT;
+            return -ENOMEM;
+        }
         case 92: case 193: {                                         /* truncate(64) */
             UCHK((void*)a, 1);
             n = lookup(AT_FDCWD, (const char*)a, &err);
@@ -2224,6 +2231,18 @@ static int32_t dispatch(regs_t* r) {
         case 422: return do_futex(a, b, c, d, e, f6, true);       /* futex_time64 */
         case 219: return 0;                                          /* madvise: advisory */
         case 117: return do_ipc(a, (int)b, c, d, e);                 /* ipc: shm* */
+        case 184: {                                                  /* capget: root, every cap there is */
+            UCHK((void*)a, 8);
+            uint32_t ver = *(uint32_t*)a;
+            if (ver != 0x19980330 && ver != 0x20071026 && ver != 0x20080522) { *(uint32_t*)a = 0x20080522; return b ? -EINVAL : 0; }
+            if (b) {
+                int n = ver == 0x19980330 ? 1 : 2;
+                UCHK((void*)b, (uint32_t)n * 12);
+                for (int k = 0; k < n; k++) { ((uint32_t*)b)[k * 3] = ~0u; ((uint32_t*)b)[k * 3 + 1] = ~0u; ((uint32_t*)b)[k * 3 + 2] = 0; }
+            }
+            return 0;
+        }
+        case 185: return 0;                                          /* capset: sure */
         case 272: case 250: return 0;                                /* fadvise64(_64): advice taken, ignored */
         case 324: return -95;                                        /* fallocate, apk asks. EOPNOTSUPP and it just writes */
         // eventfd(2), timerfd, signalfd(4), epoll*, memfd: not here yet. glib/qemu fall back

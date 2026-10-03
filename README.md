@@ -25,7 +25,7 @@ xsamara        # X11 + Mesa, once the X packages are in (see "X11")
 * graphical desktop with a compositing window manager at 60 FPS
 * ~210 Linux system calls: `fork`, `execve`, `clone` threads, `futex`,
   signals, pipes, unix and inet sockets (with fd passing), ptys, netlink,
-  `epoll`, SysV shm
+  `epoll`, `eventfd`, `timerfd`, `memfd`, SysV shm
 * dynamic linking (`ld-musl`), PIE and static PIE binaries
 * own TCP/IP stack with DHCP, several network cards (RTL8139, Intel e1000,
   virtio-net), SSH and telnet servers
@@ -101,7 +101,7 @@ the `main` and `community` repositories and an empty package database, so
 the same ABI the kernel runs.
 
 Tested: python3, git, vim, lua, jq, tree, neofetch, btop, zsh, openssh,
-figlet. What it took on the kernel side:
+figlet, openjdk8, nodejs 20 (http server and client, fs, timers). What it took on the kernel side:
 
 * `recvmsg` now fills `msg_name`: musl 1.2.5 drops DNS answers without a
   source address, every lookup timed out
@@ -434,7 +434,6 @@ Pass them with `make run APPEND="..."`.
 
 * one CPU core
 * IPv4 only
-* no `eventfd`, `timerfd`, `memfd` yet (nodejs and friends fail)
 * X has no hardware acceleration (llvmpipe on one core) and no mode
   switching: it runs in the boot resolution
 * the file cache is ~340 MB of a 1 GB guest; a single file bigger than
@@ -490,5 +489,5 @@ dynamic linking with `.so` files, htop and fastfetch, procfs threads and
 maps, yutani, a CSS engine for the browser, many terminals, threads,
 bash 5.2, USB mouse, QuickJS with `node` and `domjs`.
 
-**Next:** SMP, `eventfd`/`timerfd`/`memfd`, interrupts off for too long
+**Next:** SMP, signalfd, interrupts off for too long
 at boot (KVM then replays timer ticks, see the KVM note).
