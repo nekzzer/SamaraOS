@@ -9,7 +9,8 @@ typedef enum { F_NODE = 1, F_TTY, F_PIPE_R, F_PIPE_W, F_NULL, F_ZERO, F_RANDOM, 
                F_PTM, F_PTS,                        /* pty master / slave */
                F_SPAIR,                            /* AF_UNIX socketpair end: rx=pipe, tx=pipe2 */
                F_NETLINK,                          /* AF_NETLINK, the answer waits in pipe */
-               F_USOCK, F_ULISTEN } ftype_t;       /* AF_UNIX not connected yet / listening (ux) */
+               F_USOCK, F_ULISTEN,                 /* AF_UNIX not connected yet / listening (ux) */
+               F_EPOLL } ftype_t;
 
 #define PIPE_SZ 8192
 
@@ -34,6 +35,7 @@ typedef struct file {
     struct sock* sock;      /* F_SOCKET */
     int        pty;         /* F_PTM / F_PTS: pair index */
     struct ux* ux;          /* F_USOCK / F_ULISTEN */
+    struct ep* ep;          /* F_EPOLL */
 } file_t;
 
 file_t* file_new(ftype_t type, int flags);

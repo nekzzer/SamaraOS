@@ -90,6 +90,7 @@ void file_close(file_t* f) {
     if (f->type == F_PTM) pty_master_close(f->pty);
     if (f->type == F_PTS) pty_slave_close(f->pty);
     if (f->type == F_USOCK || f->type == F_ULISTEN) ux_release(f);
+    if (f->type == F_EPOLL && f->ep) kfree(f->ep);
     if (f->type == F_SPAIR) {
         spair_shutdown(f, 2);
         if (f->pipe->readers <= 0 && f->pipe->writers <= 0) kfree(f->pipe);
@@ -297,7 +298,7 @@ static int pipe_write(file_t* f, pipe_t* p, const char* buf, uint32_t n) {
 
 int file_read(file_t* f, char* buf, uint32_t n) {
     switch (f->type) {
-        case F_NULL: case F_NETLINK: case F_USOCK: case F_ULISTEN: return 0;   // netlink goes through recv
+        case F_NULL: case F_NETLINK: case F_USOCK: case F_ULISTEN: case F_EPOLL: return 0;   // netlink goes through recv
         case F_ZERO: memset(buf, 0, n); return (int)n;
         case F_RANDOM: for (uint32_t i = 0; i < n; i++) buf[i] = (char)rnd8(); return (int)n;
         case F_TTY:  return tty_read(buf, (int)n, (f->flags & O_NONBLOCK) != 0);
@@ -330,6 +331,7 @@ int file_write(file_t* f, const char* buf, uint32_t n) {
     switch (f->type) {
         case F_NULL: case F_ZERO: case F_RANDOM: case F_NETLINK: return (int)n;
         case F_USOCK: case F_ULISTEN: return -107;   /* ENOTCONN */
+        case F_EPOLL: return -22;
         case F_TTY:  return tty_write(buf, (int)n);
         case F_PTM: case F_PTS:
             return pty_write(f->pty, f->type == F_PTM, buf, (int)n, (f->flags & O_NONBLOCK) != 0);

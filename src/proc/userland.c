@@ -232,6 +232,12 @@ int userland_install(void) {
     put_text("/etc/group", "root:x:0:\n");
     put_text("/etc/fstab", "none / ramfs rw 0 0\n");   /* btop stats it */
     if (!fs_resolve_nf(fs_root(), "/etc/mtab")) fs_symlink(fs_resolve(fs_root(), "/etc"), "mtab", "/proc/mounts");
+    /* a bit of /sys: xorg's fbdevhw readlinks /sys/class/graphics/fb0 and
+       refuses anything that isn't there or sits on pci */
+    mkdir_p("/sys/class/graphics");
+    mkdir_p("/sys/devices/platform/vesa-framebuffer.0/graphics/fb0");
+    if (!fs_resolve_nf(fs_root(), "/sys/class/graphics/fb0"))
+        fs_symlink(fs_resolve(fs_root(), "/sys/class/graphics"), "fb0", "../../devices/platform/vesa-framebuffer.0/graphics/fb0");
     put_text("/etc/hosts", "127.0.0.1\tlocalhost\n10.0.2.15\tsamara\n10.0.2.2\thost gateway\n");
     put_text("/etc/resolv.conf", "nameserver 10.0.2.3\nnameserver 1.1.1.1\n");
     put_text("/etc/services", "http\t80/tcp\nhttps\t443/tcp\ndomain\t53/udp\n");

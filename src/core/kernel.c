@@ -140,6 +140,8 @@ static void boot_autorun(void) {
     if (!key) return;
     extern bool tty_serial_mirror;
     tty_serial_mirror = true;
+    /* "autogfx": framebuffer console first, so /dev/fb0 works (Xorg tests) */
+    if (strstr(boot_cmdline, "autogfx")) console_gfx_start();
     char* argv[] = { "sh", "-c", (char*)key + 7, NULL };
     shell_exec_program("/bin/sh", 3, argv);
     const char* bye = "\r\n[autosh done]\r\n";

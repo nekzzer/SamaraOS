@@ -8,6 +8,7 @@
 #include "proc/pty.h"
 #include "proc/file.h"
 #include "drivers/fbdev.h"
+#include "gfx/gfx.h"
 #include "proc/tty.h"
 #include "core/heap.h"
 #include "core/string.h"
@@ -620,6 +621,10 @@ static int do_ioctl(int fd, uint32_t req, uint32_t arg) {
     if (f->type == F_FB) {
         if (req == FBIOGET_VSCREENINFO) { UCHK((void*)arg, 160); fbdev_vscreeninfo((uint32_t*)arg); return 0; }
         if (req == FBIOGET_FSCREENINFO) { UCHK((void*)arg, 68);  fbdev_fscreeninfo((uint32_t*)arg); return 0; }
+        /* PUT_VSCREENINFO: no mode setting here, say yes and hand back what we have
+           (linux does that too when it rounds to the hw). xorg wants it to work */
+        if (req == 0x4601) { UCHK((void*)arg, 160); fbdev_vscreeninfo((uint32_t*)arg); return 0; }
+        if (req == 0x4606 || req == 0x4611 || req == 0x4604 || req == 0x4605) return 0;   /* pan, blank, cmap */
         if (req == FBIO_BLIT8) {
             UCHK((void*)arg, sizeof(fb_blit8_t));
             const fb_blit8_t* b = (const fb_blit8_t*)arg;
@@ -765,7 +770,7 @@ static int32_t do_mmap(uint32_t addr, uint32_t len, int prot, int flags, int fd,
     if (!(flags & MAP_ANON)) {
         f = getf(fd);
         if (!f) return -EBADF;
-        if (f->type != F_NODE && f->type != F_ZERO) return -EACCES;
+        if (f->type != F_NODE && f->type != F_ZERO && f->type != F_FB) return -EACCES;
     }
     uint32_t lo = USER_MMAP_BASE, hi = USER_STACK_TOP - USER_STACK_MAX;
     if (flags & MAP_FIXED) {
@@ -785,6 +790,18 @@ static int32_t do_mmap(uint32_t addr, uint32_t len, int prot, int flags, int fd,
         if (!fr) return -ENOMEM;
         for (uint32_t k = 0; k < np; k++)
             vmm_map_frame(p->pd, addr + k * PAGE_SIZE, fr[first + k], (prot & PROT_WRITE) != 0);
+        vmm_flush();
+        return (int32_t)addr;
+    }
+    if (f && f->type == F_FB) {
+        /* the real lfb pages, shared. pmm_ref/unref skip frames outside the
+           pool, so munmap/exit can't hand video memory out as ram. xorg fbdev */
+        int pitch, bpp;
+        uint32_t fb = (uint32_t)gfx_front_fb(&pitch, &bpp);
+        uint32_t size = (uint32_t)pitch * (uint32_t)gfx_h();
+        if (!fb || off >= size) return -EINVAL;
+        for (uint32_t k = 0; k < len / PAGE_SIZE && off + k * PAGE_SIZE < size; k++)
+            vmm_map_frame(p->pd, addr + k * PAGE_SIZE, fb + off + k * PAGE_SIZE, (prot & PROT_WRITE) != 0);
         vmm_flush();
         return (int32_t)addr;
     }
@@ -847,6 +864,21 @@ static int do_clock_gettime(int clk, uint32_t* ts, bool t64) {
 
 typedef struct { int fd; int16_t events, revents; } pollfd_t;
 
+static int16_t ep_ready(file_t* f);
+
+/* what poll would say about one file. epoll uses it too */
+static int16_t fd_revents(file_t* f, int16_t want) {
+    int16_t ev = 0;
+    if (f->type == F_EPOLL) return (want & 0x1) && ep_ready(f) ? 0x1 : 0;
+    if ((want & 0x1) && file_readable(f)) ev |= 0x1;
+    if ((want & 0x4) && file_writable(f)) ev |= 0x4;
+    if (f->type == F_PIPE_R && f->pipe->writers <= 0) ev |= 0x10; /* POLLHUP */
+    if (f->type == F_SOCKET && sock_hup(f->sock)) ev |= 0x10;
+    if (f->type == F_SPAIR && f->pipe->writers <= 0) ev |= 0x10;
+    if (f->type == F_PIPE_W && f->pipe->readers <= 0) ev |= 0x8;  /* POLLERR */
+    return ev;
+}
+
 static int poll_once(pollfd_t* fds, uint32_t n) {
     int ready = 0;
     for (uint32_t i = 0; i < n; i++) {
@@ -854,17 +886,102 @@ static int poll_once(pollfd_t* fds, uint32_t n) {
         if (fds[i].fd < 0) continue;
         file_t* f = getf(fds[i].fd);
         if (!f) { fds[i].revents = 0x20; ready++; continue; }        /* POLLNVAL */
-        int16_t ev = 0;
-        if ((fds[i].events & 0x1) && file_readable(f)) ev |= 0x1;
-        if ((fds[i].events & 0x4) && file_writable(f)) ev |= 0x4;
-        if (f->type == F_PIPE_R && f->pipe->writers <= 0) ev |= 0x10; /* POLLHUP */
-        if (f->type == F_SOCKET && sock_hup(f->sock)) ev |= 0x10;
-        if (f->type == F_SPAIR && f->pipe->writers <= 0) ev |= 0x10;
-        if (f->type == F_PIPE_W && f->pipe->readers <= 0) ev |= 0x8;  /* POLLERR */
+        int16_t ev = fd_revents(f, fds[i].events);
         fds[i].revents = ev;
         if (ev) ready++;
     }
     return ready;
+}
+
+/* epoll on top of the same readiness checks, level triggered (EPOLLET is
+   taken as level, good enough so far). xorg's ospoll has no poll fallback */
+typedef struct ep {
+    int n, cap;
+    struct { int fd; file_t* f; uint32_t ev; uint32_t d0, d1; } it[];
+} ep_t;
+
+static int16_t ep_ready(file_t* f) {
+    ep_t* e = f->ep;
+    for (int i = 0; e && i < e->n; i++) {
+        file_t* x = getf(e->it[i].fd);
+        if (x && x == e->it[i].f && x->type != F_EPOLL && fd_revents(x, (int16_t)(e->it[i].ev & 0xFF))) return 1;
+    }
+    return 0;
+}
+
+static int do_epoll_create(int flags) {
+    file_t* f = file_new(F_EPOLL, 2);
+    if (!f) return -ENOMEM;
+    f->ep = kmalloc(sizeof(ep_t) + 32 * sizeof(f->ep->it[0]));
+    if (!f->ep) { kfree(f); return -ENOMEM; }
+    f->ep->n = 0; f->ep->cap = 32;
+    return install_fd(f, 0, (flags & 02000000) != 0);
+}
+
+static int do_epoll_ctl(int epfd, int op, int fd, uint32_t* uev) {
+    file_t* f = getf(epfd);
+    if (!f) return -EBADF;
+    if (f->type != F_EPOLL) return -EINVAL;
+    file_t* x = getf(fd);
+    if (!x) return -EBADF;
+    if (x == f) return -EINVAL;
+    ep_t* e = f->ep;
+    int i = 0;
+    while (i < e->n && !(e->it[i].fd == fd && e->it[i].f == x)) i++;
+    if (op == 2) {                                                /* DEL */
+        if (i == e->n) return -ENOENT;
+        e->it[i] = e->it[--e->n];
+        return 0;
+    }
+    UCHK(uev, 12);                                                /* packed: events, u64 data */
+    if (op == 1) {                                                /* ADD */
+        if (i < e->n) return -EEXIST;
+        if (e->n == e->cap) {
+            ep_t* ne = kmalloc(sizeof(ep_t) + (uint32_t)e->cap * 2 * sizeof(e->it[0]));
+            if (!ne) return -ENOMEM;
+            memcpy(ne, e, sizeof(ep_t) + (uint32_t)e->n * sizeof(e->it[0]));
+            ne->cap = e->cap * 2;
+            kfree(e);
+            f->ep = e = ne;
+        }
+        i = e->n++;
+        e->it[i].fd = fd; e->it[i].f = x;
+    } else if (op == 3) {                                         /* MOD */
+        if (i == e->n) return -ENOENT;
+    } else return -EINVAL;
+    e->it[i].ev = uev[0];
+    e->it[i].d0 = uev[1]; e->it[i].d1 = uev[2];
+    return 0;
+}
+
+static int do_epoll_wait(int epfd, uint32_t* out, int max, int timeout_ms) {
+    file_t* f = getf(epfd);
+    if (!f) return -EBADF;
+    if (f->type != F_EPOLL || max <= 0) return -EINVAL;
+    UCHK(out, (uint32_t)max * 12);
+    uint32_t start = pit_uptime_ms();
+    for (;;) {
+        net_poll();
+        ep_t* e = f->ep;
+        int got = 0;
+        for (int i = 0; i < e->n && got < max; i++) {
+            file_t* x = getf(e->it[i].fd);
+            if (!x || x != e->it[i].f) { e->it[i] = e->it[--e->n]; i--; continue; }   /* closed: gone, like linux */
+            uint32_t want = e->it[i].ev;
+            int16_t r = fd_revents(x, (int16_t)((want & 0xFF) | 0x18));
+            r &= (int16_t)(want | 0x18);                          /* ERR and HUP always */
+            if (!r) continue;
+            out[got * 3] = (uint32_t)(uint16_t)r;
+            out[got * 3 + 1] = e->it[i].d0;
+            out[got * 3 + 2] = e->it[i].d1;
+            got++;
+            if (want & (1u << 30)) e->it[i].ev = 1u << 30;        /* EPOLLONESHOT: off until MOD */
+        }
+        if (got || timeout_ms == 0) return got;
+        if (timeout_ms > 0 && pit_uptime_ms() - start >= (uint32_t)timeout_ms) return 0;
+        if (proc_interrupted()) return -EINTR;
+        task_sleep_ms(1);
+    }
 }
 
 static int do_poll(pollfd_t* fds, uint32_t n, int timeout_ms) {
@@ -1990,12 +2107,17 @@ static int32_t dispatch(regs_t* r) {
         case 240: return do_futex(a, b, c, d, e, f6, false);
         case 422: return do_futex(a, b, c, d, e, f6, true);       /* futex_time64 */
         case 219: return 0;                                          /* madvise: advisory */
+        case 272: case 250: return 0;                                /* fadvise64(_64): advice taken, ignored */
         case 324: return -95;                                        /* fallocate, apk asks. EOPNOTSUPP and it just writes */
         // eventfd(2), timerfd, signalfd(4), epoll*, memfd: not here yet. glib/qemu fall back
         // to pipes and poll on ENOSYS, so just say no without spamming the log
         case 323: case 328: case 322: case 325: case 326: case 321: case 327:
-        case 254: case 329: case 255: case 256: case 319: case 356: case 375:
+        case 356: case 375:
             return -ENOSYS;
+        case 254: return do_epoll_create(0);                         /* epoll_create(size) */
+        case 329: return do_epoll_create((int)a);                    /* epoll_create1 */
+        case 255: return do_epoll_ctl((int)a, (int)b, (int)c, (uint32_t*)d);
+        case 256: case 319: return do_epoll_wait((int)a, (uint32_t*)b, (int)c, (int)d);   /* pwait: mask ignored */
         case 242:                                                    /* sched_getaffinity: one cpu, no smp yet */
             if (c < 4) return -EINVAL;
             UCHK((void*)d, c);

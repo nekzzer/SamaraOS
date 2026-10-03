@@ -212,7 +212,9 @@ uint32_t vmm_clone_space(uint32_t pd) {
             uint32_t* np = pte_slot(npd, va, true);
             if (!np) { vmm_destroy_space(npd); return 0; }
             uint32_t fr = pt[j] & ~0xFFFu;
-            if (pt[j] & PTE_RW) {
+            /* device pages (the lfb mapped by xorg) are shared, not copied: P2V of
+               0xFD000000 wrapped to 0x3D000000 and the fork for xkbcomp faulted */
+            if ((pt[j] & PTE_RW) && frame_idx(fr) >= 0) {
                 uint32_t nf = pmm_alloc();
                 if (!nf) { vmm_destroy_space(npd); return 0; }
                 memcpy(P2V(nf), P2V(fr), PAGE_SIZE);
