@@ -320,7 +320,7 @@ static void save_cmdline(proc_t* p, const kargs_t* a) {
 
 static int load_program(fs_node_t* cwd, const char* path, kargs_t* a,
                         uint32_t* pd_out, regs_t* frame, uint32_t* brk_out,
-                        char* name_out) {
+                        char* name_out, char* exe_out) {
     char cur[256];
     strncpy(cur, path, sizeof(cur) - 1);
     cur[sizeof(cur) - 1] = 0;
@@ -328,6 +328,7 @@ static int load_program(fs_node_t* cwd, const char* path, kargs_t* a,
     for (int depth = 0;; depth++) {
         n = fs_resolve(cwd, cur);
         if (!n) return -ENOENT;
+        if (n->lazy) return -ENOMEM;                  /* still on disk: no memory to read it */
         if (n->type == FS_DIR) return -EACCES;
         if (!(n->mode & 0111) || n->dev) return -EACCES;
         if (n->size >= 2 && n->data[0] == '#' && n->data[1] == '!') {
@@ -360,6 +361,7 @@ static int load_program(fs_node_t* cwd, const char* path, kargs_t* a,
         break;
     }
     if (!elf_ok(n)) return -ENOEXEC;
+    fs_path(n, exe_out, 128);
 
     uint32_t pd = vmm_new_space();
     if (!pd) return -ENOMEM;
@@ -375,7 +377,8 @@ static int load_program(fs_node_t* cwd, const char* path, kargs_t* a,
         ipath[sizeof(ipath) - 1] = 0;
         fs_node_t* in = fs_resolve(fs_root(), ipath);
         image_t ii;
-        if (!in || in->type == FS_DIR || !elf_ok(in) || elf_interp(in)) r = -ENOENT;
+        if (in && in->lazy) r = -ENOMEM;
+        else if (!in || in->type == FS_DIR || !elf_ok(in) || elf_interp(in)) r = -ENOENT;
         else {
             const elf_ehdr_t* h = (const elf_ehdr_t*)in->data;
             const elf_phdr_t* ph = (const elf_phdr_t*)(in->data + h->phoff);
@@ -426,7 +429,7 @@ static int spawn(const char* path, char* const argv[], char* const envp[], bool 
     if (!p) { kargs_free(&a); return -EAGAIN; }
     regs_t frame;
     save_cmdline(p, &a);
-    r = load_program(cwd, path, &a, &p->pd, &frame, &p->sh->brk_start, p->name);
+    r = load_program(cwd, path, &a, &p->pd, &frame, &p->sh->brk_start, p->name, p->exe);
     kargs_free(&a);
     if (r < 0) { p->state = P_FREE; return r; }
     p->sh->brk = p->sh->brk_start;
@@ -767,6 +770,7 @@ static int do_fork(regs_t* r, bool share) {
     c->ss_sp = parent->ss_sp; c->ss_size = parent->ss_size;
     memcpy(c->sh->sa, parent->sh->sa, sizeof(c->sh->sa));
     memcpy(c->name, parent->name, sizeof(c->name));
+    memcpy(c->exe, parent->exe, sizeof(c->exe));
     memcpy(c->cmdline, parent->cmdline, sizeof(c->cmdline));
     c->cmdline_len = parent->cmdline_len;
     for (int i = 0; i < MAX_FDS; i++) {
@@ -839,6 +843,7 @@ int proc_clone(regs_t* r) {
     c->sig_mask = parent->sig_mask;
     c->tls_base = parent->tls_base;
     memcpy(c->name, parent->name, sizeof(c->name));
+    memcpy(c->exe, parent->exe, sizeof(c->exe));
     memcpy(c->cmdline, parent->cmdline, sizeof(c->cmdline));
     c->cmdline_len = parent->cmdline_len;
     if (fl & CLONE_SETTLS) {
@@ -933,8 +938,8 @@ int proc_execve(regs_t* r, const char* path, char* const argv[], char* const env
     uint16_t cmdline_len = cmdline_of(cmdline, sizeof(cmdline), &a);
     uint32_t pd, brk;
     regs_t frame;
-    char name[32];
-    e = load_program(p->sh->cwd, kpath, &a, &pd, &frame, &brk, name);
+    char name[32], exe[128];
+    e = load_program(p->sh->cwd, kpath, &a, &pd, &frame, &brk, name, exe);
     kargs_free(&a);
     if (e < 0) return e;
 
@@ -947,6 +952,7 @@ int proc_execve(regs_t* r, const char* path, char* const argv[], char* const env
     p->tls_base = 0;
     gdt_set_tls(0);
     memcpy(p->name, name, sizeof(p->name));
+    memcpy(p->exe, exe, sizeof(p->exe));
     memcpy(p->cmdline, cmdline, sizeof(p->cmdline));
     p->cmdline_len = cmdline_len;
     strncpy(task_current()->name, name, 31);

@@ -112,7 +112,8 @@ static void fill_pid_dir(fs_node_t* d, proc_t* p, char* mem, uint32_t cap) {
     sb_num(&b, start); sb_putc(&b, ' ');
     sb_num(&b, vsz_kb * 1024); sb_putc(&b, ' ');
     sb_num(&b, pages);
-    sb_puts(&b, " 4294967295 134512640 134512640 1073741824 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n");
+    // startstack was 0x40000000, the very end: java's find_vma never matched [stack]
+    sb_puts(&b, " 4294967295 134512640 134512640 1073737728 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n");
     put(d, "stat", &b);
 
     b = (sb_t){ mem, 0, cap };
@@ -208,8 +209,11 @@ static void fill_globals(char* mem, uint32_t cap) {
     sb_puts(&b, "MemTotal:       "); sb_pad(&b, total_kb, 8); sb_puts(&b, " kB\n");
     sb_puts(&b, "MemFree:        "); sb_pad(&b, free_kb, 8); sb_puts(&b, " kB\n");
     sb_puts(&b, "MemAvailable:   "); sb_pad(&b, free_kb, 8); sb_puts(&b, " kB\n");
-    sb_puts(&b, "Buffers:               0 kB\nCached:                0 kB\nSwapCached:            0 kB\n");
+    sb_puts(&b, "Buffers:               0 kB\n");
+    sb_puts(&b, "Cached:         "); sb_pad(&b, heap_big_used() / 1024, 8); sb_puts(&b, " kB\n");   /* file data */
+    sb_puts(&b, "SwapCached:            0 kB\n");
     sb_puts(&b, "KernelHeap:     "); sb_pad(&b, heap_total() / 1024, 8); sb_puts(&b, " kB\n");
+    sb_puts(&b, "FileArena:      "); sb_pad(&b, heap_big_total() / 1024, 8); sb_puts(&b, " kB\n");
     sb_puts(&b, "UserPool:       "); sb_pad(&b, pmm_total_frames() * 4, 8); sb_puts(&b, " kB\n");
     sb_puts(&b, "SwapTotal:             0 kB\nSwapFree:              0 kB\nShmem:                 0 kB\n");
     sb_puts(&b, "SReclaimable:          0 kB\n");
