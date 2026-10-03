@@ -250,6 +250,8 @@ bool file_readable(file_t* f) {
         case F_SPAIR:  return f->pipe->count > 0 || f->pipe->writers <= 0 || (f->shut & 1);
         case F_SOCKET: return sock_readable(f->sock);
         case F_ULISTEN: return ux_pending(f);
+        case F_EVENTFD: return f->cnt > 0;
+        case F_TIMERFD: return f->t_next && (int32_t)(pit_uptime_ms() - f->t_next) >= 0;
         case F_USOCK:  return false;
         case F_INPUT:  return input_pending(f->disk);
         case F_PTM:    return pty_readable(f->pty, true);
@@ -315,6 +317,28 @@ static int pipe_write(file_t* f, pipe_t* p, const char* buf, uint32_t n) {
 int file_read(file_t* f, char* buf, uint32_t n) {
     switch (f->type) {
         case F_NULL: case F_NETLINK: case F_USOCK: case F_ULISTEN: case F_EPOLL: return 0;   // netlink goes through recv
+        case F_EVENTFD: case F_TIMERFD: {               /* both hand out a u64 */
+            if (n < 8) return -22;
+            uint64_t v;
+            for (;;) {
+                if (f->type == F_EVENTFD && f->cnt) {
+                    v = (f->flags & 0x10000000) ? 1 : f->cnt;  /* EFD_SEMAPHORE, kept in a spare flag bit */
+                    f->cnt -= v;
+                    break;
+                }
+                if (f->type == F_TIMERFD && f->t_next && (int32_t)(pit_uptime_ms() - f->t_next) >= 0) {
+                    uint32_t now = pit_uptime_ms();
+                    if (f->t_int) { v = 1 + (now - f->t_next) / f->t_int; f->t_next += (uint32_t)v * f->t_int; }
+                    else { v = 1; f->t_next = 0; }
+                    break;
+                }
+                if (f->flags & O_NONBLOCK) return -11;
+                if (proc_interrupted()) return -4;
+                task_sleep_ms(1);
+            }
+            memcpy(buf, &v, 8);
+            return 8;
+        }
         case F_ZERO: memset(buf, 0, n); return (int)n;
         case F_RANDOM: for (uint32_t i = 0; i < n; i++) buf[i] = (char)rnd8(); return (int)n;
         case F_TTY:  return tty_read(buf, (int)n, (f->flags & O_NONBLOCK) != 0);
@@ -346,6 +370,15 @@ int file_read(file_t* f, char* buf, uint32_t n) {
 int file_write(file_t* f, const char* buf, uint32_t n) {
     switch (f->type) {
         case F_NULL: case F_ZERO: case F_RANDOM: case F_NETLINK: return (int)n;
+        case F_EVENTFD: {
+            if (n < 8) return -22;
+            uint64_t v;
+            memcpy(&v, buf, 8);
+            if (v == ~0ull) return -22;
+            f->cnt += v;
+            return 8;
+        }
+        case F_TIMERFD: return -22;
         case F_USOCK: case F_ULISTEN: return -107;   /* ENOTCONN */
         case F_EPOLL: return -22;
         case F_TTY:  return tty_write(buf, (int)n);

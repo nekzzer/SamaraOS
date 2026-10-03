@@ -129,7 +129,7 @@ int vmm_map_frame(uint32_t pd, uint32_t va, uint32_t fr, bool rw) {
     if (!p) return -1;
     pmm_ref(fr);
     if (*p & PTE_P) pmm_unref(*p & ~0xFFFu);
-    *p = fr | PTE_P | PTE_US | (rw ? PTE_RW : 0);
+    *p = fr | PTE_P | PTE_US | (rw ? PTE_RW : 0) | PTE_SHARED;   /* every caller maps something shared */
     return 0;
 }
 
@@ -214,7 +214,7 @@ uint32_t vmm_clone_space(uint32_t pd) {
             uint32_t fr = pt[j] & ~0xFFFu;
             /* device pages (the lfb mapped by xorg) are shared, not copied: P2V of
                0xFD000000 wrapped to 0x3D000000 and the fork for xkbcomp faulted */
-            if ((pt[j] & PTE_RW) && frame_idx(fr) >= 0) {
+            if ((pt[j] & PTE_RW) && frame_idx(fr) >= 0 && !(pt[j] & PTE_SHARED)) {   /* shm/memfd: shared, not copied */
                 uint32_t nf = pmm_alloc();
                 if (!nf) { vmm_destroy_space(npd); return 0; }
                 memcpy(P2V(nf), P2V(fr), PAGE_SIZE);

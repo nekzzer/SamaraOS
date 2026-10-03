@@ -732,6 +732,7 @@ static uint32_t do_brk(uint32_t want) {
 static struct { fs_node_t* node; uint32_t* fr; uint32_t n; } shm[SHM_MAX];
 
 static bool is_shm(fs_node_t* n) {
+    if (!n->parent && !strncmp(n->name, "memfd:", 6)) return true;    /* memfd_create: shared like /dev/shm */
     return n->parent && !strcmp(n->parent->name, "shm") && n->parent->parent &&
            !strcmp(n->parent->parent->name, "dev");
 }
@@ -2227,9 +2228,70 @@ static int32_t dispatch(regs_t* r) {
         case 324: return -95;                                        /* fallocate, apk asks. EOPNOTSUPP and it just writes */
         // eventfd(2), timerfd, signalfd(4), epoll*, memfd: not here yet. glib/qemu fall back
         // to pipes and poll on ENOSYS, so just say no without spamming the log
-        case 323: case 328: case 322: case 325: case 326: case 321: case 327:
-        case 356: case 375:
+        case 321: case 327: case 375:                                /* signalfd(4), membarrier: not yet */
             return -ENOSYS;
+        case 323: case 328: {                                        /* eventfd(2) */
+            int fl = r->eax == 328 ? (int)b : 0;
+            file_t* f = file_new(F_EVENTFD, 2 | ((fl & 04000) ? O_NONBLOCK : 0) | ((fl & 1) ? 0x10000000 : 0));
+            if (!f) return -ENOMEM;
+            f->cnt = a;
+            return install_fd(f, 0, (fl & 02000000) != 0);
+        }
+        case 322: {                                                  /* timerfd_create */
+            file_t* f = file_new(F_TIMERFD, 2 | (((int)b & 04000) ? O_NONBLOCK : 0));
+            if (!f) return -ENOMEM;
+            f->disk = (int)a;                                        /* clock id */
+            return install_fd(f, 0, (b & 02000000) != 0);
+        }
+        case 325: case 411: case 326: case 410: {                   /* timerfd_settime(64) / gettime(64) */
+            file_t* f = getf((int)a);
+            if (!f) return -EBADF;
+            if (f->type != F_TIMERFD) return -EINVAL;
+            bool t64 = r->eax == 411 || r->eax == 410, set = r->eax == 325 || r->eax == 411;
+            uint32_t sz = t64 ? 32 : 16, now = pit_uptime_ms();
+            uint32_t* oldp = (uint32_t*)(set ? d : b);
+            if (oldp) {                                              /* old / current: interval, value left */
+                UCHK(oldp, sz);
+                uint32_t left = f->t_next && (int32_t)(f->t_next - now) > 0 ? f->t_next - now : (f->t_next ? 1 : 0);
+                uint32_t v[4] = { f->t_int / 1000, (f->t_int % 1000) * 1000000u, left / 1000, (left % 1000) * 1000000u };
+                if (t64) { for (int k = 0; k < 4; k++) { oldp[k * 2] = v[k]; oldp[k * 2 + 1] = 0; } }
+                else memcpy(oldp, v, 16);
+            }
+            if (!set) return 0;
+            UCHK((void*)c, sz);
+            uint32_t* nv = (uint32_t*)c;
+            uint32_t is = nv[0], ins = nv[t64 ? 2 : 1], vs = nv[t64 ? 4 : 2], vns = nv[t64 ? 6 : 3];
+            uint32_t ims = is * 1000 + ins / 1000000, vms = vs * 1000 + vns / 1000000;
+            f->t_int = ims;
+            if (!vs && !vns) { f->t_next = 0; return 0; }            /* disarm */
+            if (b & 1) {                                             /* TFD_TIMER_ABSTIME */
+                uint32_t target;
+                if (f->disk == 0) {                                  /* REALTIME: from the wall clock */
+                    uint32_t ws, wns; clock_now(&ws, &wns);
+                    uint64_t wnow = (uint64_t)ws * 1000 + wns / 1000000, want = (uint64_t)vs * 1000 + vns / 1000000;
+                    target = want > wnow ? now + (uint32_t)(want - wnow) : now;
+                } else target = vms;                                 /* MONOTONIC: uptime */
+                f->t_next = target ? target : 1;
+            } else f->t_next = now + (vms ? vms : 1);
+            return 0;
+        }
+        case 356: {                                                  /* memfd_create: a node nobody can find by name */
+            UCHK((void*)a, 1);
+            fs_node_t* n = kmalloc(sizeof(fs_node_t));
+            if (!n) return -ENOMEM;
+            memset(n, 0, sizeof(*n));
+            strcpy(n->name, "memfd:");
+            strncpy(n->name + 6, (const char*)a, FS_NAME_MAX - 8);
+            n->type = FS_FILE;
+            n->mode = 0600;
+            n->mtime = fs_now();
+            n->unlinked = true;                                      /* freed on the last close */
+            n->refs = 1;
+            file_t* f = file_new(F_NODE, 2);
+            if (!f) { kfree(n); return -ENOMEM; }
+            f->node = n;
+            return install_fd(f, 0, (b & 1) != 0);                   /* MFD_CLOEXEC */
+        }
         case 254: return do_epoll_create(0);                         /* epoll_create(size) */
         case 329: return do_epoll_create((int)a);                    /* epoll_create1 */
         case 255: return do_epoll_ctl((int)a, (int)b, (int)c, (uint32_t*)d);
@@ -2361,4 +2423,5 @@ static void syscall_isr(void) {
 void syscall_init(void) {
     /* DPL 3 interrupt gate: callable from ring 3, IF cleared on entry. */
     idt_set_gate(0x80, syscall_isr, 0x08, 0xEE);
+    fs_free_hook = shm_drop;
 }

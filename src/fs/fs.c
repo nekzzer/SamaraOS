@@ -237,9 +237,12 @@ void fs_attach(fs_node_t* dir, fs_node_t* n) {
     fs_touch(dir);
 }
 
+void (*fs_free_hook)(fs_node_t* n);
+
 void fs_release(fs_node_t* n) {
     if (!n || --n->refs > 0) return;
     if (n->unlinked) {
+        if (fs_free_hook) fs_free_hook(n);       /* memfd: its shm frames go too */
         fs_data_free(n);
         kfree(n);
     }

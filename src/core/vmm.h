@@ -41,6 +41,7 @@ static inline bool dma_ok(const void* v) {
 #define PTE_P  0x001u
 #define PTE_RW 0x002u
 #define PTE_US 0x004u
+#define PTE_SHARED 0x200u          /* avl bit: MAP_SHARED / shmat page, fork shares it */
 
 void     pmm_init(uint32_t pool_start, uint32_t pool_end);
 uint32_t pmm_alloc(void);             /* zeroed frame, 0 when exhausted */

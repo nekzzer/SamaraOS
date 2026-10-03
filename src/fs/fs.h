@@ -65,5 +65,6 @@ uint32_t    fs_now(void);
 /* Note a change at/under `n` so the owning mounted volume gets synced. */
 void        fs_touch(fs_node_t* n);
 extern void (*fs_dirty_hook)(int mount_id);
+extern void (*fs_free_hook)(fs_node_t* n);    /* an unlinked node is about to be freed */
 
 #endif
