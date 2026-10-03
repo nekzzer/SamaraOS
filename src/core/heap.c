@@ -113,6 +113,36 @@ void kfree(void* p) {
     irq_restore(f);
 }
 
+/* grow a block in place if the one after it is free. a file written in
+   chunks (apk unpacking libLLVM, 161 MB) used to need old + new copies at
+   once, and that never fit in the file arena */
+bool kgrow(void* p, size_t n) {
+    if (!p) return false;
+    uint32_t f = irq_save();
+    arena_t* a = arena_of(p);
+    block_t* b = (block_t*)((uint8_t*)p - sizeof(block_t));
+    n = ALIGN8(n);
+    bool ok = b->size >= n;
+    block_t* nx = b->next;
+    if (!ok && nx && nx->free && b->size + sizeof(block_t) + nx->size >= n) {
+        a->used -= b->size + sizeof(block_t);
+        b->size += sizeof(block_t) + nx->size;
+        b->next = nx->next;
+        if (b->size >= n + sizeof(block_t) + 16) {
+            block_t* split = (block_t*)((uint8_t*)b + sizeof(block_t) + n);
+            split->size = b->size - n - sizeof(block_t);
+            split->next = b->next;
+            split->free = 1;
+            b->size = n;
+            b->next = split;
+        }
+        a->used += b->size + sizeof(block_t);
+        ok = true;
+    }
+    irq_restore(f);
+    return ok;
+}
+
 size_t heap_used(void)      { return low.used; }
 size_t heap_total(void)     { return low.size; }
 size_t heap_big_used(void)  { return big.used; }

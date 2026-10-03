@@ -154,6 +154,7 @@ static int node_reserve(fs_node_t* n, uint32_t need) {
     uint32_t cap = n->cap ? n->cap : 64;
     if (cap < n->size + 1) cap = n->size + 1;
     while (cap < need + 1) cap = cap < (1u << 20) ? cap * 2 : cap + cap / 4;   /* big files: gentle growth */
+    if (n->data && n->cap && kgrow(n->data, cap)) { n->cap = cap; return 0; }   /* no copy, no second buffer */
     char* nb = (char*)kmalloc_big(cap);
     if (!nb) return -ENOMEM;
     if (n->data) memcpy(nb, n->data, n->size);

@@ -8,6 +8,7 @@ void* kmalloc(size_t n);
 void* kmalloc_big(size_t n);                   /* file data: big arena, else main */
 extern void (*heap_reclaim)(size_t need);     /* big arena full: drop cached file data */
 void  kfree(void* p);
+bool  kgrow(void* p, size_t n);                 /* in place, if the next block is free */
 size_t heap_used(void);
 size_t heap_total(void);
 size_t heap_big_used(void);
