@@ -121,8 +121,8 @@ memory runs low. When a program hits a missing syscall the kernel prints
 ## X11
 
 ```
-apk add xorg-server xf86-video-fbdev xf86-input-evdev xterm twm font-misc-misc \
-        mesa-dri-gallium llvm17-libs mesa-demos
+apk add xorg-server xf86-video-fbdev xf86-input-evdev xterm twm xsetroot \
+        font-misc-misc font-cursor-misc mesa-dri-gallium llvm17-libs mesa-demos
 xsamara
 ```
 
