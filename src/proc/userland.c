@@ -37,8 +37,21 @@ static fs_node_t* put_file(const char* path, const char* data, uint32_t len, uin
     return n;
 }
 
+/* boot-made files point at the kernel's own string: to the ext2 root disk
+   they look like sysroot files and don't get saved until somebody edits
+   them. before, every /etc file and xsamara went to disk once and that
+   stale copy won over the kernel's newer one forever */
+static fs_node_t* put_static(const char* path, const char* text, uint16_t mode) {
+    fs_node_t* n = fs_resolve(fs_root(), path);
+    if (!n) n = fs_create(fs_root(), path, FS_FILE);
+    if (!n) return NULL;
+    fs_set_static(n, text, strlen(text));
+    n->mode = mode;
+    return n;
+}
+
 static void put_text(const char* path, const char* text) {
-    put_file(path, text, strlen(text), 0644);
+    put_static(path, text, 0644);
 }
 
 static uint32_t octal(const char* s, int n) {
@@ -262,7 +275,7 @@ int userland_install(void) {
             "if [ -x \"$HOME/.xinitrc\" ]; then \"$HOME/.xinitrc\" >/tmp/xsamara.log 2>&1\n"
             "else twm >/tmp/xsamara.log 2>&1 & xterm -geometry 80x24+20+20 >>/tmp/xsamara.log 2>&1; fi\n"
             "kill $X 2>/dev/null; wait $X 2>/dev/null\n";
-        put_file("/usr/bin/xsamara", xs, strlen(xs), 0755);
+        put_static("/usr/bin/xsamara", xs, 0755);
     }
     /* a bit of /sys: xorg's fbdevhw readlinks /sys/class/graphics/fb0 and
        refuses anything that isn't there or sits on pci */
