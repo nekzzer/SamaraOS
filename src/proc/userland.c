@@ -258,8 +258,9 @@ int userland_install(void) {
             "i=0\n"
             "while [ ! -S /tmp/.X11-unix/X$D ] && [ $i -lt 150 ]; do sleep 0.1; i=$((i+1)); done\n"
             "export DISPLAY=:$D\n"
-            "if [ -x \"$HOME/.xinitrc\" ]; then \"$HOME/.xinitrc\"\n"
-            "else twm & xterm -geometry 80x24+20+20; fi\n"
+            "# their chatter would land on the console, which draws right over X\n"
+            "if [ -x \"$HOME/.xinitrc\" ]; then \"$HOME/.xinitrc\" >/tmp/xsamara.log 2>&1\n"
+            "else twm >/tmp/xsamara.log 2>&1 & xterm -geometry 80x24+20+20 >>/tmp/xsamara.log 2>&1; fi\n"
             "kill $X 2>/dev/null; wait $X 2>/dev/null\n";
         put_file("/usr/bin/xsamara", xs, strlen(xs), 0755);
     }
