@@ -44,6 +44,7 @@ static file_t* open_pty_slave(int i, int flags) {
 
 file_t* file_open_node(fs_node_t* n, int flags) {
     static const ftype_t dev_type[] = { 0, F_NULL, F_ZERO, F_TTY, F_RANDOM, F_FB, F_INPUT };
+    if (n->dev == FS_DEV_SOCK) return NULL;                   /* sockets get connect(), not open() */
     if (n->dev == FS_DEV_PTMX) {                               /* new pty pair */
         int i = pty_alloc();
         if (i < 0) return NULL;
@@ -88,6 +89,7 @@ void file_close(file_t* f) {
     if (f->type == F_INPUT) input_close();
     if (f->type == F_PTM) pty_master_close(f->pty);
     if (f->type == F_PTS) pty_slave_close(f->pty);
+    if (f->type == F_USOCK || f->type == F_ULISTEN) ux_release(f);
     if (f->type == F_SPAIR) {
         spair_shutdown(f, 2);
         if (f->pipe->readers <= 0 && f->pipe->writers <= 0) kfree(f->pipe);
@@ -238,6 +240,8 @@ bool file_readable(file_t* f) {
         case F_PIPE_W: return false;
         case F_SPAIR:  return f->pipe->count > 0 || f->pipe->writers <= 0 || (f->shut & 1);
         case F_SOCKET: return sock_readable(f->sock);
+        case F_ULISTEN: return ux_pending(f);
+        case F_USOCK:  return false;
         case F_INPUT:  return input_pending();
         case F_PTM:    return pty_readable(f->pty, true);
         case F_PTS:    return pty_readable(f->pty, false);
@@ -250,6 +254,7 @@ bool file_writable(file_t* f) {
     if (f->type == F_SOCKET) return sock_writable(f->sock);
     if (f->type == F_SPAIR) return (f->shut & 2) || f->pipe2->count < PIPE_SZ || f->pipe2->readers <= 0;
     if (f->type == F_PTM || f->type == F_PTS) return pty_writable(f->pty, f->type == F_PTM);
+    if (f->type == F_USOCK || f->type == F_ULISTEN) return false;
     return f->type != F_PIPE_R;
 }
 
@@ -292,7 +297,7 @@ static int pipe_write(file_t* f, pipe_t* p, const char* buf, uint32_t n) {
 
 int file_read(file_t* f, char* buf, uint32_t n) {
     switch (f->type) {
-        case F_NULL: case F_NETLINK: return 0;   // netlink goes through recv
+        case F_NULL: case F_NETLINK: case F_USOCK: case F_ULISTEN: return 0;   // netlink goes through recv
         case F_ZERO: memset(buf, 0, n); return (int)n;
         case F_RANDOM: for (uint32_t i = 0; i < n; i++) buf[i] = (char)rnd8(); return (int)n;
         case F_TTY:  return tty_read(buf, (int)n, (f->flags & O_NONBLOCK) != 0);
@@ -324,6 +329,7 @@ int file_read(file_t* f, char* buf, uint32_t n) {
 int file_write(file_t* f, const char* buf, uint32_t n) {
     switch (f->type) {
         case F_NULL: case F_ZERO: case F_RANDOM: case F_NETLINK: return (int)n;
+        case F_USOCK: case F_ULISTEN: return -107;   /* ENOTCONN */
         case F_TTY:  return tty_write(buf, (int)n);
         case F_PTM: case F_PTS:
             return pty_write(f->pty, f->type == F_PTM, buf, (int)n, (f->flags & O_NONBLOCK) != 0);

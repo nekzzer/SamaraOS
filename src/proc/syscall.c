@@ -231,6 +231,8 @@ static void fill_stat_node(kstat64_t* st, fs_node_t* n) {
                       idx >= DISK_AHCI_BASE ? ((8u << 8) | (uint32_t)(idx - DISK_AHCI_BASE) * 16)
                                             : ((3u << 8) | (uint32_t)idx * 64);
         st->st_size = (int64_t)ata_drive_sectors(idx) * 512;
+    } else if (n->dev == FS_DEV_SOCK) {
+        st->st_mode = 0140000 | (n->mode & 07777);                 /* S_IFSOCK */
     } else if (n->dev) {
         st->st_mode = S_IFCHR | (n->mode & 07777);
         st->st_rdev = n->dev == FS_DEV_TTY  ? (5u << 8) :
@@ -264,7 +266,7 @@ static void fill_stat_file(kstat64_t* st, file_t* f) {
     st->st_nlink = 1;
     st->st_blksize = 4096;
     if (f->type == F_PIPE_R || f->type == F_PIPE_W) st->st_mode = S_IFIFO | 0600;
-    else if (f->type == F_SOCKET || f->type == F_SPAIR || f->type == F_NETLINK) st->st_mode = 0140000 | 0777;          /* S_IFSOCK */
+    else if (f->type == F_SOCKET || f->type == F_SPAIR || f->type == F_NETLINK || f->type == F_USOCK || f->type == F_ULISTEN) st->st_mode = 0140000 | 0777;          /* S_IFSOCK */
     else { st->st_mode = S_IFCHR | 0666; st->st_rdev = f->type == F_TTY ? (5u << 8) : (1u << 8) | 3; }
     st->st_atime = st->st_mtime = st->st_ctime = clock_epoch();
 }
@@ -321,7 +323,7 @@ static int do_readlink(const char* path, char* buf, uint32_t n) {
         case F_NULL: strcpy(out, "/dev/null"); break;
         case F_ZERO: strcpy(out, "/dev/zero"); break;
         case F_RANDOM: strcpy(out, "/dev/urandom"); break;
-        case F_SOCKET: case F_SPAIR: case F_NETLINK: strcpy(out, "socket:[1]"); break;
+        case F_SOCKET: case F_SPAIR: case F_NETLINK: case F_USOCK: case F_ULISTEN: strcpy(out, "socket:[1]"); break;
         default:     strcpy(out, "pipe:[1]"); break;
     }
     uint32_t l = strlen(out);
@@ -1106,8 +1108,9 @@ static int do_socketpair(uint32_t domain, uint32_t type, uint32_t proto, int* sv
     return 0;
 }
 
-/* send/recv/shutdown/setsockopt on a socketpair end map onto the pipes. */
-static int spair_call(int call, file_t* f, uint32_t b, uint32_t c, uint32_t d) {
+/* send/recv/shutdown/setsockopt on a socketpair end map onto the pipes.
+   connected AF_UNIX sockets are the same thing (ux below). */
+static int spair_call(int call, file_t* f, uint32_t b, uint32_t c, uint32_t d, uint32_t e) {
     switch (call) {
         case 9: case 11: {                                            /* send / sendto */
             UCHK((void*)b, c);
@@ -1125,10 +1128,237 @@ static int spair_call(int call, file_t* f, uint32_t b, uint32_t c, uint32_t d) {
             f->flags = ofl;
             return r;
         }
+        case 16: case 17: {                                           /* sendmsg / recvmsg: xcb lives on these */
+            UCHK((void*)b, 28);
+            uint32_t* m = (uint32_t*)b;              /* name, namelen, iov, iovlen, ctl, ctllen, flags */
+            iovec_t* iov = (iovec_t*)m[2];
+            UCHK(iov, m[3] * sizeof(iovec_t));
+            int ofl = f->flags;
+            if (c & 0x40) f->flags |= O_NONBLOCK;
+            int total = 0, r = 0;
+            if (call == 16 && m[4] && m[5] >= 16) {                  /* SCM_RIGHTS out: refs ride along with the bytes */
+                UCHK((void*)m[4], m[5]);
+                uint32_t* cm = (uint32_t*)m[4];
+                if (cm[1] == 1 && cm[2] == 1)
+                    for (uint32_t k = 0; k < (cm[0] - 12) / 4 && f->pipe2->nfds < 8; k++) {
+                        file_t* x = getf((int)cm[3 + k]);
+                        if (x) { file_ref(x); f->pipe2->fds[f->pipe2->nfds++] = x; }
+                    }
+            }
+            for (uint32_t i = 0; i < m[3]; i++) {
+                if (!iov[i].len) continue;
+                UCHK((void*)iov[i].base, iov[i].len);
+                r = call == 16 ? file_write(f, (const char*)iov[i].base, iov[i].len)
+                               : file_read(f, (char*)iov[i].base, iov[i].len);
+                if (r < 0) break;
+                total += r;
+                if ((uint32_t)r < iov[i].len) break;
+                if (call == 17) f->flags |= O_NONBLOCK;            /* rest of the iovs: only what's there */
+            }
+            f->flags = ofl;
+            if (r < 0 && !total) return r;
+            if (call == 17) {
+                uint32_t room = m[5];
+                m[5] = 0; m[6] = 0;
+                if (m[1]) m[1] = 0;
+                pipe_t* q = f->pipe;
+                if (q->nfds && m[4] && room >= 16) {                 /* SCM_RIGHTS in */
+                    UCHK((void*)m[4], room);
+                    uint32_t* cm = (uint32_t*)m[4];
+                    uint32_t k = 0;
+                    while (q->nfds && 12 + (k + 1) * 4 <= room) {
+                        file_t* x = q->fds[0];
+                        for (int j = 1; j < q->nfds; j++) q->fds[j - 1] = q->fds[j];
+                        q->nfds--;
+                        int nfd = install_fd(x, 0, (c & 0x40000000) != 0);   /* MSG_CMSG_CLOEXEC */
+                        if (nfd < 0) { file_close(x); continue; }
+                        cm[3 + k++] = (uint32_t)nfd;
+                    }
+                    cm[0] = 12 + k * 4; cm[1] = 1; cm[2] = 1;
+                    m[5] = (12 + k * 4 + 3) & ~3u;
+                }
+            }
+            return total;
+        }
         case 13: return spair_shutdown(f, (int)b);
         case 14: return 0;                                            /* setsockopt */
-        case 6: case 7: return 0;                                     /* get{sock,peer}name */
+        case 15: {                                                    /* getsockopt(level b, opt c, val d, len e) */
+            if (!d || !e) return -EFAULT;
+            UCHK((void*)e, 4);
+            uint32_t cap = *(uint32_t*)e;
+            UCHK((void*)d, cap);
+            if (c == 17 && cap >= 12) {                               /* SO_PEERCRED: us, root */
+                ((uint32_t*)d)[0] = (uint32_t)me()->tgid; ((uint32_t*)d)[1] = 0; ((uint32_t*)d)[2] = 0;
+                *(uint32_t*)e = 12;
+                return 0;
+            }
+            if (cap < 4) return -EINVAL;
+            *(uint32_t*)d = c == 3 ? 1 : c == 7 || c == 8 ? 65536 : 0;   /* SO_TYPE stream, buffers, SO_ERROR 0 */
+            *(uint32_t*)e = 4;
+            return 0;
+        }
+        case 6: case 7: {                                             /* get{sock,peer}name: AF_UNIX, no name */
+            if (!b || !c) return 0;
+            UCHK((void*)c, 4);
+            if (*(uint32_t*)c >= 2) { UCHK((void*)b, 2); *(uint16_t*)b = 1; }
+            *(uint32_t*)c = 2;
+            return 0;
+        }
     }
+    return -95;
+}
+
+/* AF_UNIX stream sockets with names (X11 needs them). connect() makes a
+   socketpair: the caller's file turns into one end, the other waits in the
+   listener's queue for accept(). names live in a small table, path ones get
+   a FS_DEV_SOCK node too so ls/stat see them. */
+typedef struct ux {
+    char name[112];          /* absolute path, or '@' + abstract name */
+    int  nlen;
+    bool bound, listening;
+    file_t* q[16];
+    int  nq;
+} ux_t;
+
+static ux_t* ureg[32];
+
+static int ux_name(uint32_t addr, uint32_t len, char* out, int* olen) {
+    if (len < 3 || len > 110) return -EINVAL;
+    UCHK((void*)addr, len);
+    const char* sp = (const char*)addr + 2;
+    if (*(const uint16_t*)addr != 1) return -97;
+    if (!sp[0]) {                                                 /* abstract: bytes, NULs and all */
+        out[0] = '@';
+        memcpy(out + 1, sp + 1, len - 3);
+        *olen = (int)len - 2;
+        return 0;
+    }
+    /* the user's own sun_path: lookup_parent wants a user pointer (UCHK) */
+    int k = 0;
+    while (k < (int)len - 2 && sp[k]) k++;
+    if (k == (int)len - 2) return -EINVAL;                     /* no NUL inside */
+    int err;
+    char base[FS_NAME_MAX];
+    fs_node_t* par = lookup_parent(AT_FDCWD, sp, base, &err);
+    if (!par) return err;
+    fs_path(par, out, 100);
+    int l = (int)strlen(out);
+    if (l > 1) out[l++] = '/';
+    int bl = (int)strlen(base);
+    if (l + bl > 110) return -36;                                /* ENAMETOOLONG */
+    memcpy(out + l, base, (size_t)bl);
+    *olen = l + bl;
+    out[*olen] = 0;
+    return 0;
+}
+
+static ux_t* ux_find(const char* name, int nlen) {
+    for (int i = 0; i < 32; i++)
+        if (ureg[i] && ureg[i]->listening && ureg[i]->nlen == nlen && !memcmp(ureg[i]->name, name, (size_t)nlen)) return ureg[i];
+    return NULL;
+}
+
+bool ux_pending(file_t* f) { return f->ux && f->ux->nq > 0; }
+
+void ux_release(file_t* f) {
+    ux_t* u = f->ux;
+    if (!u) return;
+    for (int i = 0; i < 32; i++) if (ureg[i] == u) ureg[i] = NULL;
+    for (int i = 0; i < u->nq; i++) file_close(u->q[i]);
+    kfree(u);
+    f->ux = NULL;
+}
+
+static int ux_call(int call, file_t* f, int fd, uint32_t b, uint32_t c, uint32_t d, uint32_t e) {
+    ux_t* u = f->ux;
+    int err;
+    switch (call) {
+        case 2: {                                                     /* bind */
+            if (u->bound) return -EINVAL;
+            char nm[112]; int nl;
+            if ((err = ux_name(b, c, nm, &nl)) < 0) return err;
+            for (int i = 0; i < 32; i++)
+                if (ureg[i] && ureg[i]->nlen == nl && !memcmp(ureg[i]->name, nm, (size_t)nl)) return -98;   /* EADDRINUSE */
+            if (nm[0] == '/') {
+                if (fs_peek(fs_root(), nm, false)) return -98;
+                fs_node_t* n = fs_create(fs_root(), nm, FS_FILE);
+                if (!n) return -ENOENT;
+                n->dev = FS_DEV_SOCK;
+                n->mode = 0777;
+            }
+            int slot = -1;
+            for (int i = 0; i < 32; i++) if (!ureg[i]) { slot = i; break; }
+            if (slot < 0) return -ENOMEM;
+            memcpy(u->name, nm, (size_t)nl);
+            u->nlen = nl;
+            u->bound = true;
+            ureg[slot] = u;
+            return 0;
+        }
+        case 4:                                                       /* listen */
+            if (!u->bound) return -EINVAL;
+            u->listening = true;
+            f->type = F_ULISTEN;
+            return 0;
+        case 3: {                                                     /* connect */
+            if (f->type == F_ULISTEN) return -EINVAL;
+            char nm[112]; int nl;
+            if ((err = ux_name(b, c, nm, &nl)) < 0) return err;
+            ux_t* l = ux_find(nm, nl);
+            if (!l) return nm[0] == '/' && !fs_peek(fs_root(), nm, true) ? -ENOENT : -111;   /* ECONNREFUSED */
+            if (l->nq >= 16) return -EAGAIN;
+            file_t *x, *y;
+            if ((err = spair_create(&x, &y)) < 0) return err;
+            /* our file becomes end x, in place: the fd keeps pointing at it */
+            ux_release(f);
+            f->type = F_SPAIR;
+            f->pipe = x->pipe;
+            f->pipe2 = x->pipe2;
+            f->shut = 0;
+            kfree(x);
+            l->q[l->nq++] = y;
+            return 0;
+        }
+        case 5: case 18: {                                            /* accept(4) */
+            if (f->type != F_ULISTEN) return -EINVAL;
+            while (!u->nq) {
+                if (f->flags & O_NONBLOCK) return -EAGAIN;
+                if (proc_interrupted()) return -EINTR;
+                task_yield();
+            }
+            file_t* y = u->q[0];
+            for (int i = 1; i < u->nq; i++) u->q[i - 1] = u->q[i];
+            u->nq--;
+            if (call == 18 && (d & 04000)) y->flags |= O_NONBLOCK;
+            if (b && c) { UCHK((void*)c, 4); if (*(uint32_t*)c >= 2) { UCHK((void*)b, 2); *(uint16_t*)b = 1; } *(uint32_t*)c = 2; }
+            int nfd = install_fd(y, 0, call == 18 && (d & 02000000));
+            if (nfd < 0) file_close(y);
+            return nfd;
+        }
+        case 6: case 7: {                                             /* getsockname / getpeername */
+            if (call == 7) return -107;
+            if (!b || !c) return 0;
+            UCHK((void*)c, 4);
+            uint32_t cap = *(uint32_t*)c, want = 2 + (u->bound ? (uint32_t)u->nlen + (u->name[0] == '/' ? 1 : 0) : 0);
+            uint8_t sa[112];
+            memset(sa, 0, sizeof(sa));
+            *(uint16_t*)sa = 1;
+            if (u->bound) {
+                if (u->name[0] == '@') memcpy(sa + 3, u->name + 1, (size_t)u->nlen - 1);
+                else memcpy(sa + 2, u->name, (size_t)u->nlen);
+            }
+            uint32_t n = cap < want ? cap : want;
+            UCHK((void*)b, n);
+            memcpy((void*)b, sa, n);
+            *(uint32_t*)c = want;
+            return 0;
+        }
+        case 14: return 0;                                            /* setsockopt */
+        case 15: return spair_call(15, f, b, c, d, e);
+        case 13: return -107;
+        case 9: case 10: case 11: case 12: case 16: case 17: return -107;   /* ENOTCONN */
+    }
+    (void)fd;
     return -95;
 }
 
@@ -1265,11 +1495,21 @@ static int32_t sys_socket_call(int call, uint32_t a, uint32_t b, uint32_t c,
     file_t* fl;
     if (call != 1 && call != 8) {
         file_t* pf = getf((int)a);
-        if (pf && pf->type == F_SPAIR) return spair_call(call, pf, b, c, d);
+        if (pf && pf->type == F_SPAIR) return spair_call(call, pf, b, c, d, e);
         if (pf && pf->type == F_NETLINK) return nl_call(call, pf, b, c, d, e, f6);
+        if (pf && (pf->type == F_USOCK || pf->type == F_ULISTEN)) return ux_call(call, pf, (int)a, b, c, d, e);
     }
     switch (call) {
         case 1: {                                                     /* socket */
+            if (a == 1) {                                             /* AF_UNIX */
+                if ((b & 0xF) != 1) return -93;                       /* stream only, no dgram yet */
+                fl = file_new(F_USOCK, 2 | ((b & 04000) ? O_NONBLOCK : 0));
+                if (!fl) return -ENOMEM;
+                fl->ux = (ux_t*)kmalloc(sizeof(ux_t));
+                if (!fl->ux) { kfree(fl); return -ENOMEM; }
+                memset(fl->ux, 0, sizeof(ux_t));
+                return install_fd(fl, 0, (b & 02000000) != 0);
+            }
             if (a == 16) {                                            /* AF_NETLINK */
                 fl = file_new(F_NETLINK, 2 | ((b & 04000) ? O_NONBLOCK : 0));
                 if (!fl) return -ENOMEM;

@@ -27,7 +27,7 @@ typedef struct fs_node {
 } fs_node_t;
 
 enum { FS_DEV_NONE = 0, FS_DEV_NULL, FS_DEV_ZERO, FS_DEV_TTY, FS_DEV_RANDOM, FS_DEV_FB, FS_DEV_INPUT,
-       FS_DEV_PTMX };
+       FS_DEV_PTMX, FS_DEV_SOCK };     /* SOCK: a bound AF_UNIX path, /tmp/.X11-unix/X0 */
 #define FS_DEV_DISK 16                 /* FS_DEV_DISK + ata index: /dev/hda.. /dev/sda.. */
 #define FS_DEV_PTS  64                 /* FS_DEV_PTS + n: /dev/pts/n (pty slaves) */
 #define FS_DEV_IS_DISK(d) ((d) >= FS_DEV_DISK && (d) < FS_DEV_PTS)

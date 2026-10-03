@@ -8,7 +8,8 @@
 typedef enum { F_NODE = 1, F_TTY, F_PIPE_R, F_PIPE_W, F_NULL, F_ZERO, F_RANDOM, F_DISK, F_SOCKET, F_FB, F_INPUT,
                F_PTM, F_PTS,                        /* pty master / slave */
                F_SPAIR,                            /* AF_UNIX socketpair end: rx=pipe, tx=pipe2 */
-               F_NETLINK } ftype_t;                /* AF_NETLINK, the answer waits in pipe */
+               F_NETLINK,                          /* AF_NETLINK, the answer waits in pipe */
+               F_USOCK, F_ULISTEN } ftype_t;       /* AF_UNIX not connected yet / listening (ux) */
 
 #define PIPE_SZ 8192
 
@@ -16,6 +17,8 @@ typedef struct pipe {
     char buf[PIPE_SZ];
     int  head, tail, count;
     int  readers, writers;
+    struct file* fds[8];    /* SCM_RIGHTS in flight (unix sockets) */
+    int  nfds;
 } pipe_t;
 
 typedef struct file {
@@ -30,6 +33,7 @@ typedef struct file {
     int        disk;        /* F_DISK: ata index */
     struct sock* sock;      /* F_SOCKET */
     int        pty;         /* F_PTM / F_PTS: pair index */
+    struct ux* ux;          /* F_USOCK / F_ULISTEN */
 } file_t;
 
 file_t* file_new(ftype_t type, int flags);
@@ -46,6 +50,8 @@ int     pipe_create(file_t** rd, file_t** wr);
 int     spair_create(file_t** a, file_t** b);
 int     spair_shutdown(file_t* f, int how);
 uint32_t file_disk_size(file_t* f);
+void    ux_release(file_t* f);                     /* syscall.c: unbind, drop the backlog */
+bool    ux_pending(file_t* f);                     /* a connection waits for accept() */
 
 /* ramfs helpers */
 int     node_write_at(fs_node_t* n, uint32_t off, const char* buf, uint32_t len);
