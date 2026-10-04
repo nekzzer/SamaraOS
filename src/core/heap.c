@@ -15,7 +15,7 @@ typedef struct block {
     size_t size;          /* size of payload */
     struct block* next;   /* next block in address order */
     int free;
-} block_t;
+} __attribute__((aligned(16))) block_t;
 
 typedef struct {
     uint8_t* base;
@@ -26,7 +26,7 @@ typedef struct {
 
 static arena_t low, big;
 
-#define ALIGN8(x) (((x) + 7u) & ~7u)
+#define ALIGN8(x) (((x) + 15ul) & ~15ul)
 
 static void arena_init(arena_t* a, void* base, size_t size) {
     a->base = (uint8_t*)base;

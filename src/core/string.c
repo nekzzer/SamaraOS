@@ -111,7 +111,7 @@ static void reverse(char* s, int n) {
     }
 }
 
-void utoa(uint32_t v, char* buf, int base) {
+void utoa(uint64_t v, char* buf, int base) {
     const char* digits = "0123456789abcdef";
     int n = 0;
     if (v == 0) { buf[n++] = '0'; buf[n] = 0; return; }

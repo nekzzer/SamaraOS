@@ -7,7 +7,7 @@
    reach the bytes through P2V(). Each one is a ustar archive unpacked into
    the ramfs without copying (see proc/userland.c). */
 typedef struct {
-    uint32_t start, end;
+    uint64_t start, end;
     char     name[64];
 } bootmod_t;
 

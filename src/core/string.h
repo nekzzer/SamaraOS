@@ -16,6 +16,6 @@ char* strchr(const char* s, int c);
 char* strstr(const char* hay, const char* needle);
 int   atoi(const char* s);
 void  itoa(int v, char* buf, int base);
-void  utoa(uint32_t v, char* buf, int base);
+void  utoa(uint64_t v, char* buf, int base);
 
 #endif

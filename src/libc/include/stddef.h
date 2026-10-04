@@ -9,7 +9,7 @@
 
 #define offsetof(t, m) __builtin_offsetof(t, m)
 
-typedef int ptrdiff_t;
+typedef long ptrdiff_t;
 typedef unsigned int wchar_t;
 
 #endif

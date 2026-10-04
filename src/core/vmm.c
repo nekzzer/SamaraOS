@@ -1,38 +1,45 @@
 #include "core/vmm.h"
 #include "core/string.h"
 #include "core/task.h"
+#include "core/heap.h"
 #include "boot/paging.h"
 
 /* ---------------- physical frame pool ---------------- */
 
-static uint32_t pool_base, pool_frames, pool_free, hint;
-static uint8_t  refcnt[(DMAP_SIZE >> 12)];     /* frames live in the direct map */
+/* refcnt per frame, indexed by pfn. 0xFF = not ours (kernel, holes, mmio) */
+static uint8_t* refcnt;
+static uint64_t max_pfn, pool_frames, pool_free, hint;
 
-void pmm_init(uint32_t start, uint32_t end) {
-    start = (start + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    end &= ~(PAGE_SIZE - 1);
-    if (end > DMAP_SIZE) end = DMAP_SIZE;
-    if (end <= start) { pool_frames = 0; return; }
-    pool_base = start;
-    pool_frames = (end - start) >> 12;
-    pool_free = pool_frames;
-    hint = 0;
-    memset(refcnt, 0, sizeof(refcnt));
+void pmm_init(uint64_t top) {
+    max_pfn = top >> 12;
+    refcnt = (uint8_t*)kmalloc(max_pfn);
+    memset(refcnt, 0xFF, max_pfn);
+    pool_frames = pool_free = hint = 0;
 }
 
-uint32_t pmm_free_frames(void)  { return pool_free; }
-uint32_t pmm_total_frames(void) { return pool_frames; }
+void pmm_add(uint64_t start, uint64_t end) {
+    start = (start + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    end &= ~(PAGE_SIZE - 1);
+    for (uint64_t a = start; a < end && (a >> 12) < max_pfn; a += PAGE_SIZE) {
+        refcnt[a >> 12] = 0;
+        pool_frames++;
+        pool_free++;
+    }
+}
 
-uint32_t pmm_alloc(void) {
-    uint32_t f = irq_save();
-    uint32_t frame = 0;
-    for (uint32_t n = 0; n < pool_frames; n++) {
-        uint32_t i = (hint + n) % pool_frames;
+uint64_t pmm_free_frames(void)  { return pool_free; }
+uint64_t pmm_total_frames(void) { return pool_frames; }
+
+uint64_t pmm_alloc(void) {
+    uint64_t f = irq_save();
+    uint64_t frame = 0;
+    for (uint64_t n = 0; n < max_pfn; n++) {
+        uint64_t i = (hint + n) % max_pfn;
         if (refcnt[i]) continue;
         refcnt[i] = 1;
         pool_free--;
         hint = i + 1;
-        frame = pool_base + (i << 12);
+        frame = i << 12;
         break;
     }
     irq_restore(f);
@@ -40,95 +47,95 @@ uint32_t pmm_alloc(void) {
     return frame;
 }
 
-static int frame_idx(uint32_t frame) {
-    if (frame < pool_base) return -1;
-    uint32_t i = (frame - pool_base) >> 12;
-    return i < pool_frames ? (int)i : -1;
+static bool ours(uint64_t frame) {
+    uint64_t i = frame >> 12;
+    return i < max_pfn && refcnt[i] != 0xFF;
 }
 
-void pmm_ref(uint32_t frame) {
-    int i = frame_idx(frame);
-    if (i >= 0 && refcnt[i] < 255) refcnt[i]++;
+void pmm_ref(uint64_t frame) {
+    if (ours(frame) && refcnt[frame >> 12] < 254) refcnt[frame >> 12]++;
 }
 
-void pmm_unref(uint32_t frame) {
-    int i = frame_idx(frame);
-    if (i < 0 || !refcnt[i]) return;
-    uint32_t f = irq_save();
-    if (--refcnt[i] == 0) pool_free++;
+void pmm_unref(uint64_t frame) {
+    if (!ours(frame) || !refcnt[frame >> 12]) return;
+    uint64_t f = irq_save();
+    if (--refcnt[frame >> 12] == 0) pool_free++;
     irq_restore(f);
 }
 
-/* ---------------- page directories ---------------- */
+/* ---------------- page tables ---------------- */
 
-#define PDI(va) ((va) >> 22)
-#define PTI(va) (((va) >> 12) & 0x3FF)
+#define IDX(va, lvl) (((va) >> (12 + 9 * (lvl))) & 0x1FF)
 
 void vmm_flush(void) {
-    uint32_t cr3;
+    uint64_t cr3;
     __asm__ volatile ("mov %%cr3, %0; mov %0, %%cr3" : "=r"(cr3) : : "memory");
 }
 
-uint32_t vmm_new_space(void) {
-    uint32_t pd = pmm_alloc();
+uint64_t vmm_new_space(void) {
+    uint64_t pd = pmm_alloc();
     if (!pd) return 0;
-    const uint32_t* kpd = (const uint32_t*)P2V(task_kernel_cr3());
-    uint32_t* d = (uint32_t*)P2V(pd);
-    for (int i = 0; i < 1024; i++)
-        d[i] = (i >= (int)PDI(USER_BASE) && i < (int)PDI(USER_TOP)) ? 0 : kpd[i];
+    const uint64_t* k = (const uint64_t*)P2V(task_kernel_cr3());
+    uint64_t* d = (uint64_t*)P2V(pd);
+    for (int i = 256; i < 512; i++) d[i] = k[i];
     return pd;
 }
 
-static uint32_t* pte_slot(uint32_t pd, uint32_t va, bool create) {
-    uint32_t* d = (uint32_t*)P2V(pd);
-    uint32_t pde = d[PDI(va)];
-    if (!(pde & PTE_P)) {
-        if (!create) return NULL;
-        uint32_t pt = pmm_alloc();
-        if (!pt) return NULL;
-        d[PDI(va)] = pt | PTE_P | PTE_RW | PTE_US;
-        pde = d[PDI(va)];
+/* walk down to the pte for va. next level tables are made on the way when `create` */
+static uint64_t* pte_slot(uint64_t pd, uint64_t va, bool create) {
+    uint64_t* t = (uint64_t*)P2V(pd);
+    for (int lvl = 3; lvl > 0; lvl--) {
+        uint64_t* e = &t[IDX(va, lvl)];
+        if (!(*e & PTE_P)) {
+            if (!create) return NULL;
+            uint64_t n = pmm_alloc();
+            if (!n) return NULL;
+            *e = n | PTE_P | PTE_RW | PTE_US;
+        }
+        t = (uint64_t*)P2V(*e & PTE_ADDR);
     }
-    return (uint32_t*)P2V(pde & ~0xFFFu) + PTI(va);
+    return &t[IDX(va, 0)];
 }
 
-uint32_t vmm_pte(uint32_t pd, uint32_t va) {
-    if (va < USER_BASE || va >= USER_TOP) return 0;
-    uint32_t* p = pte_slot(pd, va, false);
+static bool uaddr(uint64_t a) { return a >= USER_BASE && a < USER_TOP; }
+
+uint64_t vmm_pte(uint64_t pd, uint64_t va) {
+    if (!uaddr(va)) return 0;
+    uint64_t* p = pte_slot(pd, va, false);
     return p ? *p : 0;
 }
 
-int vmm_alloc_range(uint32_t pd, uint32_t va, uint32_t len, bool writable) {
-    uint32_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    for (uint32_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
-        if (a < USER_BASE || a >= USER_TOP) return -1;
-        uint32_t* p = pte_slot(pd, a, true);
+int vmm_alloc_range(uint64_t pd, uint64_t va, uint64_t len, bool writable) {
+    uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
+        if (!uaddr(a)) return -1;
+        uint64_t* p = pte_slot(pd, a, true);
         if (!p) return -1;
         if (*p & PTE_P) {
             if (writable) *p |= PTE_RW;
             continue;
         }
-        uint32_t fr = pmm_alloc();
+        uint64_t fr = pmm_alloc();
         if (!fr) return -1;
         *p = fr | PTE_P | PTE_US | (writable ? PTE_RW : 0);
     }
     return 0;
 }
 
-void vmm_set_writable(uint32_t pd, uint32_t va, uint32_t len, bool writable) {
-    uint32_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    for (uint32_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
-        uint32_t* p = pte_slot(pd, a, false);
+void vmm_set_writable(uint64_t pd, uint64_t va, uint64_t len, bool writable) {
+    uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
+        uint64_t* p = pte_slot(pd, a, false);
         if (!p || !(*p & (PTE_P | PTE_LAZY))) continue;
         if (writable) *p |= PTE_RW; else *p &= ~PTE_RW;
     }
 }
 
-int vmm_map_frame(uint32_t pd, uint32_t va, uint32_t fr, bool rw) {
-    uint32_t* p = pte_slot(pd, va, true);
+int vmm_map_frame(uint64_t pd, uint64_t va, uint64_t fr, bool rw) {
+    uint64_t* p = pte_slot(pd, va, true);
     if (!p) return -1;
     pmm_ref(fr);
-    if (*p & PTE_P) pmm_unref(*p & ~0xFFFu);
+    if (*p & PTE_P) pmm_unref(*p & PTE_ADDR);
     *p = fr | PTE_P | PTE_US | (rw ? PTE_RW : 0) | PTE_SHARED;   /* every caller maps something shared */
     return 0;
 }
@@ -136,71 +143,84 @@ int vmm_map_frame(uint32_t pd, uint32_t va, uint32_t fr, bool rw) {
 /* java reserves hundreds of MB (heap, metaspace, thread stacks, code cache)
    and touches a fraction. every byte of it used to be a real frame up
    front: minecraft ran the box out of memory while making the world */
-int vmm_lazy_range(uint32_t pd, uint32_t va, uint32_t len, bool rw, bool user) {
-    uint32_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    for (uint32_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
-        if (a < USER_BASE || a >= USER_TOP) return -1;
-        uint32_t* p = pte_slot(pd, a, true);
+int vmm_lazy_range(uint64_t pd, uint64_t va, uint64_t len, bool rw, bool user) {
+    uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
+        if (!uaddr(a)) return -1;
+        uint64_t* p = pte_slot(pd, a, true);
         if (!p) return -1;
-        if (*p & PTE_P) pmm_unref(*p & ~0xFFFu);
+        if (*p & PTE_P) pmm_unref(*p & PTE_ADDR);
         *p = PTE_LAZY | (rw ? PTE_RW : 0) | (user ? PTE_US : 0);
     }
     return 0;
 }
 
-bool vmm_fault_in(uint32_t pd, uint32_t va) {
-    uint32_t* p = pte_slot(pd, va & ~(PAGE_SIZE - 1), false);
+bool vmm_fault_in(uint64_t pd, uint64_t va) {
+    uint64_t* p = pte_slot(pd, va & ~(PAGE_SIZE - 1), false);
     if (!p || (*p & PTE_P) || !(*p & PTE_LAZY)) return false;
-    uint32_t fr = pmm_alloc();                     /* zeroed */
+    uint64_t fr = pmm_alloc();                     /* zeroed */
     if (!fr) return false;
     *p = fr | PTE_P | (*p & (PTE_RW | PTE_US));
     return true;
 }
 
 // PROT_NONE = present but supervisor only, so user access faults
-void vmm_set_user(uint32_t pd, uint32_t va, uint32_t len, bool user) {
-    uint32_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    for (uint32_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
-        uint32_t* p = pte_slot(pd, a, false);
+void vmm_set_user(uint64_t pd, uint64_t va, uint64_t len, bool user) {
+    uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
+        uint64_t* p = pte_slot(pd, a, false);
         if (!p || !(*p & (PTE_P | PTE_LAZY))) continue;
         if (user) *p |= PTE_US; else *p &= ~PTE_US;
     }
 }
 
-void vmm_free_range(uint32_t pd, uint32_t va, uint32_t len) {
-    uint32_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    for (uint32_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
-        if (a < USER_BASE || a >= USER_TOP) continue;
-        uint32_t* p = pte_slot(pd, a, false);
+void vmm_free_range(uint64_t pd, uint64_t va, uint64_t len) {
+    uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
+        if (!uaddr(a)) continue;
+        uint64_t* p = pte_slot(pd, a, false);
         if (!p || !(*p & (PTE_P | PTE_LAZY))) continue;
-        if (*p & PTE_P) pmm_unref(*p & ~0xFFFu);
+        if (*p & PTE_P) pmm_unref(*p & PTE_ADDR);
         *p = 0;
     }
 }
 
-bool vmm_range_unmapped(uint32_t pd, uint32_t va, uint32_t len) {
-    uint32_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    for (uint32_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
-        uint32_t* p = pte_slot(pd, a, false);
+bool vmm_range_unmapped(uint64_t pd, uint64_t va, uint64_t len) {
+    uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
+        uint64_t* p = pte_slot(pd, a, false);
         if (p && (*p & (PTE_P | PTE_LAZY))) return false;
     }
     return true;
 }
 
-uint32_t vmm_find_free(uint32_t pd, uint32_t from, uint32_t limit, uint32_t len) {
+/* how much address space from va up is certainly empty because an upper
+   level entry is missing, 0 if the walk reaches a pte table */
+static uint64_t hole_at(uint64_t pd, uint64_t va) {
+    uint64_t* t = (uint64_t*)P2V(pd);
+    for (int lvl = 3; lvl > 0; lvl--) {
+        uint64_t e = t[IDX(va, lvl)];
+        if (!(e & PTE_P)) return 1ul << (12 + 9 * lvl);
+        t = (uint64_t*)P2V(e & PTE_ADDR);
+    }
+    return 0;
+}
+
+uint64_t vmm_find_free(uint64_t pd, uint64_t from, uint64_t limit, uint64_t len) {
     len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    uint32_t run = 0, start = from;
-    for (uint32_t a = from; a < limit; a += PAGE_SIZE) {
-        uint32_t* d = (uint32_t*)P2V(pd);
-        if (!(d[PDI(a)] & PTE_P) && (a & 0x3FFFFF) == 0 && run == 0) {
-            /* Whole empty 4 MiB table: take it in one step. */
-            start = a;
-            run = 0x400000;
+    uint64_t run = 0, start = from;
+    for (uint64_t a = from; a < limit; a += PAGE_SIZE) {
+        uint64_t h = hole_at(pd, a);
+        if (h) {
+            /* whole empty table: take it in one step */
+            uint64_t nx = (a & ~(h - 1)) + h;
+            if (run == 0) start = a;
+            run += nx - a;
             if (run >= len) return start;
-            a += 0x400000 - PAGE_SIZE;
+            a = nx - PAGE_SIZE;
             continue;
         }
-        uint32_t* p = pte_slot(pd, a, false);
+        uint64_t* p = pte_slot(pd, a, false);
         if (p && (*p & (PTE_P | PTE_LAZY))) { run = 0; continue; }
         if (run == 0) start = a;
         run += PAGE_SIZE;
@@ -209,67 +229,85 @@ uint32_t vmm_find_free(uint32_t pd, uint32_t from, uint32_t limit, uint32_t len)
     return 0;
 }
 
-void vmm_destroy_space(uint32_t pd) {
-    uint32_t* d = (uint32_t*)P2V(pd);
-    for (uint32_t i = PDI(USER_BASE); i < PDI(USER_TOP); i++) {
-        if (!(d[i] & PTE_P)) continue;
-        uint32_t ptf = d[i] & ~0xFFFu;
-        uint32_t* pt = (uint32_t*)P2V(ptf);
-        for (int j = 0; j < 1024; j++)
-            if (pt[j] & PTE_P) pmm_unref(pt[j] & ~0xFFFu);
-        pmm_unref(ptf);
-        d[i] = 0;
+static void free_tables(uint64_t tbl, int lvl) {
+    uint64_t* t = (uint64_t*)P2V(tbl);
+    for (int i = 0; i < 512; i++) {
+        if (!(t[i] & PTE_P)) continue;
+        if (lvl == 0) pmm_unref(t[i] & PTE_ADDR);
+        else free_tables(t[i] & PTE_ADDR, lvl - 1);
     }
+    pmm_unref(tbl);
+}
+
+void vmm_destroy_space(uint64_t pd) {
+    uint64_t* d = (uint64_t*)P2V(pd);
+    for (int i = 0; i < 256; i++)
+        if (d[i] & PTE_P) { free_tables(d[i] & PTE_ADDR, 2); d[i] = 0; }
     pmm_unref(pd);
 }
 
-uint32_t vmm_clone_space(uint32_t pd) {
-    uint32_t npd = vmm_new_space();
-    if (!npd) return 0;
-    uint32_t* d = (uint32_t*)P2V(pd);
-    for (uint32_t i = PDI(USER_BASE); i < PDI(USER_TOP); i++) {
-        if (!(d[i] & PTE_P)) continue;
-        uint32_t* pt = (uint32_t*)P2V(d[i] & ~0xFFFu);
-        for (int j = 0; j < 1024; j++) {
-            if (!(pt[j] & PTE_P)) {
-                if (!(pt[j] & PTE_LAZY)) continue;
-                uint32_t* lp = pte_slot(npd, (i << 22) | ((uint32_t)j << 12), true);   /* untouched: stays lazy */
-                if (!lp) { vmm_destroy_space(npd); return 0; }
-                *lp = pt[j];
-                continue;
-            }
-            uint32_t va = (i << 22) | ((uint32_t)j << 12);
-            uint32_t* np = pte_slot(npd, va, true);
-            if (!np) { vmm_destroy_space(npd); return 0; }
-            uint32_t fr = pt[j] & ~0xFFFu;
-            /* device pages (the lfb mapped by xorg) are shared, not copied: P2V of
-               0xFD000000 wrapped to 0x3D000000 and the fork for xkbcomp faulted */
-            if ((pt[j] & PTE_RW) && frame_idx(fr) >= 0 && !(pt[j] & PTE_SHARED)) {   /* shm/memfd: shared, not copied */
-                uint32_t nf = pmm_alloc();
-                if (!nf) { vmm_destroy_space(npd); return 0; }
-                memcpy(P2V(nf), P2V(fr), PAGE_SIZE);
-                *np = nf | (pt[j] & 0xFFFu);
-            } else {
-                pmm_ref(fr);                 /* read-only text: share */
-                *np = pt[j];
-            }
+static bool clone_level(uint64_t src, uint64_t dst, int lvl, uint64_t base) {
+    uint64_t* s = (uint64_t*)P2V(src);
+    uint64_t* d = (uint64_t*)P2V(dst);
+    for (int i = 0; i < 512; i++) {
+        uint64_t e = s[i];
+        if (lvl > 0) {
+            if (!(e & PTE_P)) continue;
+            uint64_t n = pmm_alloc();
+            if (!n) return false;
+            d[i] = n | (e & 0xFFF);
+            if (!clone_level(e & PTE_ADDR, n, lvl - 1, base | ((uint64_t)i << (12 + 9 * lvl)))) return false;
+            continue;
+        }
+        if (!(e & PTE_P)) {
+            if (e & PTE_LAZY) d[i] = e;            /* untouched: stays lazy */
+            continue;
+        }
+        uint64_t fr = e & PTE_ADDR;
+        /* device pages (the lfb mapped by xorg) are shared, not copied */
+        if ((e & PTE_RW) && ours(fr) && !(e & PTE_SHARED)) {   /* shm/memfd: shared, not copied */
+            uint64_t nf = pmm_alloc();
+            if (!nf) return false;
+            memcpy(P2V(nf), P2V(fr), PAGE_SIZE);
+            d[i] = nf | (e & ~PTE_ADDR);
+        } else {
+            pmm_ref(fr);                 /* read-only text: share */
+            d[i] = e;
         }
     }
-    return npd;
+    return true;
 }
 
-int vmm_copy_to(uint32_t pd, uint32_t va, const void* src, uint32_t len) {
+uint64_t vmm_clone_space(uint64_t pd) {
+    uint64_t npd = vmm_new_space();
+    if (!npd) return 0;
+    uint64_t* s = (uint64_t*)P2V(pd);
+    uint64_t* d = (uint64_t*)P2V(npd);
+    for (int i = 0; i < 256; i++) {
+        if (!(s[i] & PTE_P)) continue;
+        uint64_t n = pmm_alloc();
+        if (!n) goto fail;
+        d[i] = n | (s[i] & 0xFFF);
+        if (!clone_level(s[i] & PTE_ADDR, n, 2, (uint64_t)i << 39)) goto fail;
+    }
+    return npd;
+fail:
+    vmm_destroy_space(npd);
+    return 0;
+}
+
+int vmm_copy_to(uint64_t pd, uint64_t va, const void* src, uint64_t len) {
     const uint8_t* s = (const uint8_t*)src;
     while (len) {
-        uint32_t pte = vmm_pte(pd, va);
+        uint64_t pte = vmm_pte(pd, va);
         if (!(pte & PTE_P)) {
             if (!vmm_fault_in(pd, va)) return -1;
             pte = vmm_pte(pd, va);
         }
-        uint32_t off = va & 0xFFF;
-        uint32_t n = PAGE_SIZE - off;
+        uint64_t off = va & 0xFFF;
+        uint64_t n = PAGE_SIZE - off;
         if (n > len) n = len;
-        uint8_t* dst = (uint8_t*)P2V(pte & ~0xFFFu) + off;
+        uint8_t* dst = (uint8_t*)P2V(pte & PTE_ADDR) + off;
         if (s) { memcpy(dst, s, n); s += n; }
         else   memset(dst, 0, n);
         va += n; len -= n;
@@ -277,13 +315,20 @@ int vmm_copy_to(uint32_t pd, uint32_t va, const void* src, uint32_t len) {
     return 0;
 }
 
-uint32_t vmm_count_pages(uint32_t pd) {
-    uint32_t* d = (uint32_t*)P2V(pd);
-    uint32_t n = 0;
-    for (uint32_t i = PDI(USER_BASE); i < PDI(USER_TOP); i++) {
-        if (!(d[i] & PTE_P)) continue;
-        uint32_t* pt = (uint32_t*)P2V(d[i] & ~0xFFFu);
-        for (int j = 0; j < 1024; j++) if (pt[j] & PTE_P) n++;
+static uint64_t count_level(uint64_t tbl, int lvl) {
+    uint64_t* t = (uint64_t*)P2V(tbl);
+    uint64_t n = 0;
+    for (int i = 0; i < 512; i++) {
+        if (!(t[i] & PTE_P)) continue;
+        n += lvl ? count_level(t[i] & PTE_ADDR, lvl - 1) : 1;
     }
+    return n;
+}
+
+uint64_t vmm_count_pages(uint64_t pd) {
+    uint64_t* d = (uint64_t*)P2V(pd);
+    uint64_t n = 0;
+    for (int i = 0; i < 256; i++)
+        if (d[i] & PTE_P) n += count_level(d[i] & PTE_ADDR, 2);
     return n;
 }

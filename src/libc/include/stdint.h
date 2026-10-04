@@ -3,8 +3,6 @@
 
 #include "../../core/types.h"
 
-typedef int32_t  intptr_t;
-typedef uint32_t uintptr_t;
 
 #define INT8_MAX   0x7f
 #define INT16_MAX  0x7fff

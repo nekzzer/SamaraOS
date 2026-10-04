@@ -7,9 +7,9 @@
 #include "i_system.h"
 #include "doomtype.h"
 
-extern void* kmalloc(unsigned int n);
+extern void* kmalloc(unsigned long n);
 extern void  kfree(void* p);
-extern void* memset(void* d, int v, unsigned int n);
+extern void* memset(void* d, int v, unsigned long n);
 
 #define ZMAGIC 0x5a4f4e45u   /* 'ZONE' */
 
