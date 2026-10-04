@@ -141,7 +141,7 @@ int uring_setup(uint32_t entries, void* params) {
     struct io_uring_params* pr = params;
     if (!entries || entries > MAX_ENTRIES * 8) return -EINVAL;
     if (!sys_uok(pr, sizeof(*pr))) return -EFAULT;
-    if (pr->flags & IORING_SETUP_SQPOLL) return -EINVAL;
+    if (pr->flags & ~0x33F9u) return -EINVAL;           // no sqpoll, sqe128, cqe32 and the newer ones
     if (entries > MAX_ENTRIES) {
         if (!(pr->flags & IORING_SETUP_CLAMP)) return -EINVAL;
         entries = MAX_ENTRIES;
@@ -242,6 +242,7 @@ static void req_done(req_t* q, int res) {
     for (req_t** pp = &reqs; *pp; pp = &(*pp)->next)
         if (*pp == q) { *pp = q->next; break; }
     cq_post(r, q->sqe.user_data, res, 0);
+    if (q->sqe.opcode == IORING_OP_TIMEOUT && res == -ETIME) r->ncq--;      // expiries do not count for other timeouts
     req_t* lt = q->lt;
     req_t* nx = q->link;
     if (q->target) q->target->lt = NULL;
@@ -315,8 +316,10 @@ static req_t* prep(uring_t* r, struct io_uring_sqe* s) {
         case IORING_OP_LINK_TIMEOUT: case IORING_OP_ASYNC_CANCEL: case IORING_OP_OPENAT:
         case IORING_OP_STATX: case IORING_OP_POLL_REMOVE:
             needf = false; break;
+        case IORING_OP_REMOVE_BUFFERS: needf = false; q->bad = -ENOENT; break;      // nothing is ever provided
         case IORING_OP_CLOSE: needf = false; break;
         case IORING_OP_READV: case IORING_OP_WRITEV: case IORING_OP_READ: case IORING_OP_WRITE:
+        case IORING_OP_SYNC_FILE_RANGE:
         case IORING_OP_READ_FIXED: case IORING_OP_WRITE_FIXED: case IORING_OP_FSYNC:
         case IORING_OP_POLL_ADD: case IORING_OP_ACCEPT: case IORING_OP_CONNECT:
         case IORING_OP_SEND: case IORING_OP_RECV: case IORING_OP_SENDMSG: case IORING_OP_RECVMSG:
@@ -333,7 +336,8 @@ static req_t* prep(uring_t* r, struct io_uring_sqe* s) {
         uint32_t ms = 0;
         int e = 0;
         if (s->timeout_flags & ~0xAFu) e = -EINVAL;            // abs, update, boottime, realtime, immediate
-        else if (!(s->timeout_flags & 0x80)) e = ts_ms(s->addr, &ms);
+        else if (s->timeout_flags & 0x80) ms = (uint32_t)((s->addr + 999999) / 1000000);    // immediate arg: ns in addr
+        else e = ts_ms(s->addr, &ms);
         if (e < 0) q->bad = e;
         else {
             if (s->timeout_flags & IORING_TIMEOUT_ABS) {
@@ -405,6 +409,23 @@ static int do_sock(req_t* q, int call) {
     return ret;
 }
 
+// move a fresh fd into the registered table (direct descriptors). ~0 = any free slot
+static int to_fixed(uring_t* r, int fd, uint32_t idx) {
+    if (fd < 0) return fd;
+    if (!r->files) { sys_close(fd); return -EBADF; }
+    if (idx == ~0u) {
+        idx = 0;
+        while (idx < r->nfiles && r->files[idx]) idx++;
+    } else idx--;
+    if (idx >= r->nfiles) { sys_close(fd); return -EBADF; }
+    file_t* f = sys_getf(fd);
+    file_ref(f);
+    sys_close(fd);
+    file_close(r->files[idx]);
+    r->files[idx] = f;
+    return 0;
+}
+
 static req_t* find_ud(uring_t* r, uint64_t ud, int op_only) {
     for (req_t* q = reqs; q; q = q->next)
         if (q->r == r && q->sqe.user_data == ud && (op_only < 0 || q->sqe.opcode == op_only)) return q;
@@ -437,7 +458,7 @@ static int do_cancel(req_t* me, uint64_t ud, uint32_t fl, int fd) {
 
 static int do_probe(void* arg, uint32_t nr) {
     struct io_uring_probe* p = arg;
-    static const uint8_t ok[] = { IORING_OP_NOP, IORING_OP_READV, IORING_OP_WRITEV, IORING_OP_FSYNC,
+    static const uint8_t ok[] = { IORING_OP_NOP, IORING_OP_READV, IORING_OP_WRITEV, IORING_OP_FSYNC, IORING_OP_SYNC_FILE_RANGE,
         IORING_OP_READ_FIXED, IORING_OP_WRITE_FIXED, IORING_OP_POLL_ADD, IORING_OP_POLL_REMOVE,
         IORING_OP_SENDMSG, IORING_OP_RECVMSG, IORING_OP_TIMEOUT, IORING_OP_TIMEOUT_REMOVE,
         IORING_OP_ACCEPT, IORING_OP_ASYNC_CANCEL, IORING_OP_LINK_TIMEOUT, IORING_OP_CONNECT,
@@ -467,14 +488,19 @@ static int req_exec(req_t* q) {
                 a - r->bufs[i].base > r->bufs[i].len - s->len) return -EFAULT;
             return do_rw(q, (char*)a, s->len, s->opcode == IORING_OP_WRITE_FIXED);
         }
-        case IORING_OP_FSYNC: ext2_sync_all(); fatfs_sync_all(); return 0;
+        case IORING_OP_FSYNC: case IORING_OP_SYNC_FILE_RANGE: ext2_sync_all(); fatfs_sync_all(); return 0;
         case IORING_OP_SEND: return do_sock(q, 11);
         case IORING_OP_RECV: return do_sock(q, 12);
         case IORING_OP_SENDMSG: return do_sock(q, 16);
         case IORING_OP_RECVMSG: return do_sock(q, 17);
-        case IORING_OP_ACCEPT: return do_sock(q, 18);
+        case IORING_OP_ACCEPT:
+            if (s->file_index) return to_fixed(r, do_sock(q, 18), s->file_index);
+            return do_sock(q, 18);
         case IORING_OP_CONNECT: return do_sock(q, 3);
-        case IORING_OP_OPENAT: return sys_openat(s->fd, (const char*)(uintptr_t)s->addr, s->open_flags, s->len);
+        case IORING_OP_OPENAT: {
+            int fd = sys_openat(s->fd, (const char*)(uintptr_t)s->addr, s->open_flags, s->len);
+            return s->file_index ? to_fixed(r, fd, s->file_index) : fd;
+        }
         case IORING_OP_STATX:
             return sys_statx(s->fd, (const char*)(uintptr_t)s->addr, s->statx_flags, s->len, (void*)(uintptr_t)s->off);
         case IORING_OP_CLOSE:
