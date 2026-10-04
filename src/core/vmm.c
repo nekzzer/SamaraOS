@@ -40,6 +40,24 @@ uint32_t pmm_alloc(void) {
     return frame;
 }
 
+/* n frames in a row (io_uring rings want one flat kernel view of them) */
+uint32_t pmm_alloc_run(uint32_t n) {
+    uint32_t f = irq_save();
+    uint32_t base = 0;
+    for (uint32_t i = 0, run = 0; i < pool_frames; i++) {
+        run = refcnt[i] ? 0 : run + 1;
+        if (run < n) continue;
+        uint32_t s = i + 1 - n;
+        for (uint32_t k = 0; k < n; k++) refcnt[s + k] = 1;
+        pool_free -= n;
+        base = pool_base + (s << 12);
+        break;
+    }
+    irq_restore(f);
+    if (base) memset(P2V(base), 0, n * PAGE_SIZE);
+    return base;
+}
+
 static int frame_idx(uint32_t frame) {
     if (frame < pool_base) return -1;
     uint32_t i = (frame - pool_base) >> 12;
