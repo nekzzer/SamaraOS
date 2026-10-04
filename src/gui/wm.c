@@ -681,6 +681,7 @@ typedef struct { const char* label; const char* hint; int action; } menu_entry_t
 
 static const menu_entry_t menu_entries[] = {
     { "Terminal",     NULL,  0 },
+    { "Files",        NULL, 11 },
     { "Web Browser",  NULL,  1 },
     { "Music Player", NULL,  2 },
     { "Paint",        NULL,  3 },
@@ -780,6 +781,7 @@ static void menu_run(int action) {
         case 8:  ext2_sync_all(); fatfs_sync_all(); while (inb(0x64) & 0x02) {} outb(0x64, 0xFE); break;
         case 9:  ext2_sync_all(); fatfs_sync_all(); outw(0x604, 0x2000); outw(0xB004, 0x2000); break;
         case 10: exit_requested = true; break;
+        case 11: if (shell_launch_detached("/usr/bin/fm") < 0) wm_open_info(W / 2 - 150, H / 2 - 60, 300, 120, "Files", "fm not found"); break;
     }
 }
 
@@ -796,7 +798,7 @@ static void menu_run(int action) {
 #define ICON_TILE 48
 #define GAMES_DIR "/usr/games"
 
-enum { IG_TERM, IG_WEB, IG_MUSIC, IG_PAINT, IG_CLOCK, IG_PY, IG_ELF };
+enum { IG_TERM, IG_WEB, IG_MUSIC, IG_PAINT, IG_CLOCK, IG_PY, IG_ELF, IG_FILES };
 
 typedef struct {
     char label[24];
@@ -862,6 +864,7 @@ static void scan_icons(void) {
     icons_sig = sig;
     n_icons = 0;
     add_icon("Terminal", IG_TERM, 0, NULL);
+    add_icon("Files", IG_FILES, 11, NULL);
     add_icon("Browser", IG_WEB, 1, NULL);
     add_icon("Music", IG_MUSIC, 2, NULL);
     add_icon("Paint", IG_PAINT, 3, NULL);
@@ -1011,6 +1014,12 @@ static void draw_icon_glyph(int g, int x, int y, bool sel) {
         }
         thick_line(cx, cy, cx, cy - 10, 1, fg);
         thick_line(cx, cy, cx + 7, cy + 4, 1, fg);
+        break;
+    case IG_FILES:
+        gfx_rect_fill(x + 10, y + 15, 12, 4, fg);
+        gfx_rect_fill(x + 10, y + 18, S - 20, 17, fg);
+        gfx_rect_fill(x + 11, y + 19, S - 22, 15, bg);
+        gfx_rect_fill(x + 11, y + 23, S - 22, 1, dim);
         break;
     case IG_PY:
         uif_draw_center(x, y, S, S, UIF_BIG, "py", fg);
@@ -1681,6 +1690,21 @@ static void on_press(int mx, int my) {
     }
 }
 
+static void on_rpress(int mx, int my) {
+    if (menu_open) return;
+    if (my >= gfx_h() - TASKBAR_H && !tb_hidden()) return;
+    int wi = hit_window(mx, my);
+    if (wi < 0) return;
+    window_t* w = &windows[wi];
+    set_focus(wi);
+    if (w->type != WIN_APP || !w->on_rclick) return;
+    rect_t cr = client_of(w);
+    if (r_hit(cr, mx, my)) {
+        w->on_rclick(w, mx - cr.x0, my - cr.y0);
+        w->needs_repaint = true;
+    }
+}
+
 static void on_drag(int mx, int my) {
     for (int i = 0; i < WM_MAX_WINDOWS; i++) {
         window_t* w = &windows[i];
@@ -1970,6 +1994,10 @@ void wm_run(void) {
         else if (!button && prev_btn) on_release(mx, my);
         else if (button && moved)     on_drag(mx, my);
         prev_btn = button;
+        bool rbtn = (b & 2) != 0;
+        static bool prev_rbtn;
+        if (rbtn && !prev_rbtn && !button) on_rpress(mx, my);
+        prev_rbtn = rbtn;
 
         while (kbd_has_key() && !exit_requested) on_key(kbd_trygetc(), now);
         if (kbd_f11_take() & 1) {

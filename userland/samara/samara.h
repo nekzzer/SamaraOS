@@ -38,14 +38,25 @@ enum {
 
 /* ---- events ---- */
 enum { SM_EV_NONE, SM_EV_KEY, SM_EV_MOUSE_DOWN, SM_EV_MOUSE_UP, SM_EV_MOUSE_MOVE, SM_EV_CLOSE,
-       SM_EV_WHEEL };
+       SM_EV_WHEEL, SM_EV_RDOWN, SM_EV_RESIZE };
 
 typedef struct { int32_t type, a, b, c; } SmEvent;
 /* SM_EV_KEY:        a = character (CP866; specials below)
    SM_EV_MOUSE_*:    a = x, b = y (window pixels, scale already divided), c = button
    SM_EV_CLOSE:      the user clicked the window's close button
    SM_EV_WHEEL:      a = notches (> 0 = scrolled down / towards the user),
-                     b, c = pointer x, y in window pixels */
+                     b, c = pointer x, y in window pixels
+   SM_EV_KEY also has b = modifiers: SM_MOD_SHIFT | SM_MOD_CTRL | SM_MOD_ALT
+                     (Ctrl+H comes as '\b' with SM_MOD_CTRL, Ctrl+A as 1, ...)
+   SM_EV_RDOWN:      right button pressed, a, b = x, y
+   SM_EV_RESIZE:     (SM_F_RESIZE windows) a, b = new size; call sm_resize() */
+#define SM_MOD_SHIFT 1
+#define SM_MOD_CTRL  2
+#define SM_MOD_ALT   4
+
+/* sm_open_ex flags */
+#define SM_F_RAW    1      /* sm_text goes into the buffer at window resolution (lots of text) */
+#define SM_F_RESIZE 2      /* user can resize the window, scale is always 1 */
 
 /* Characters delivered by SM_EV_KEY (kernel drivers/keyboard.h) */
 #define SM_CH_UP     0x81
@@ -146,6 +157,7 @@ typedef struct {
     int w, h, scale;
     int handle;
     uint32_t *pix;                   /* w*h XRGB, owned by the program */
+    int flags;
 } SmWin;
 
 static inline long sm_call(long op, long a, long b, long c) { return syscall(SYS_SAMARA, op, a, b, c); }
@@ -169,11 +181,11 @@ static inline void sm_sleep_ms(int ms) {
 
 /* Opens a w x h window shown at `scale`x (1..8). NULL outside the desktop
    (start `desktop` first) or when out of window slots. */
-static inline SmWin *sm_open(int w, int h, int scale, const char *title) {
+static inline SmWin *sm_open_ex(int w, int h, int scale, int flags, const char *title) {
     sm_open_t o;
     SmWin *win;
     long r;
-    o.w = w; o.h = h; o.scale = scale; o.flags = 0;
+    o.w = w; o.h = h; o.scale = scale; o.flags = flags;
     o.title = (uint32_t)(uintptr_t)title;
     r = sm_call(SM_OP_OPEN, (long)&o, 0, 0);
     if (r < 0) return 0;
@@ -181,13 +193,30 @@ static inline SmWin *sm_open(int w, int h, int scale, const char *title) {
     if (!win) { sm_call(SM_OP_CLOSE, r, 0, 0); return 0; }
     win->w = w; win->h = h; win->scale = scale < 1 ? 1 : scale > 8 ? 8 : scale;
     win->handle = (int)r;
+    win->flags = flags;
     win->pix = (uint32_t *)calloc((size_t)w * h, 4);
     if (!win->pix) { sm_call(SM_OP_CLOSE, r, 0, 0); free(win); return 0; }
     return win;
 }
 
+static inline SmWin *sm_open(int w, int h, int scale, const char *title) {
+    return sm_open_ex(w, h, scale, 0, title);
+}
+
+/* After SM_EV_RESIZE: new buffer of nw x nh (contents are gone, redraw). 0 on success. */
+static inline int sm_resize(SmWin *w, int nw, int nh) {
+    uint32_t *p = (uint32_t *)calloc((size_t)nw * nh, 4);
+    if (!p) return -1;
+    free(w->pix);
+    w->pix = p; w->w = nw; w->h = nh;
+    return 0;
+}
+
 /* Copies the buffer to the screen. <0 (-EPIPE) once the window is closed. */
-static inline int sm_present(SmWin *w) { return (int)sm_call(SM_OP_PRESENT, w->handle, (long)w->pix, 0); }
+static inline int sm_present(SmWin *w) {
+    long sz = (w->flags & SM_F_RESIZE) ? (((long)w->w << 16) | w->h) : 0;
+    return (int)sm_call(SM_OP_PRESENT, w->handle, (long)w->pix, sz);
+}
 
 /* 1 = event in *e, 0 = timeout, <0 = interrupted. timeout_ms -1 waits. */
 static inline int sm_event(SmWin *w, SmEvent *e, int timeout_ms) {

@@ -10,7 +10,7 @@
 
 enum {
     SM_OP_OPEN = 1,      /* ecx = sm_open_t*                -> handle          */
-    SM_OP_PRESENT,       /* ecx = handle, edx = pixels       -> 0 / -EPIPE      */
+    SM_OP_PRESENT,       /* ecx = handle, edx = pixels, esi = w<<16|h or 0 -> 0 / -EPIPE */
     SM_OP_EVENT,         /* ecx = handle, edx = ev*, esi = timeout ms (-1 = wait) -> 1 / 0 */
     SM_OP_CLOSE,         /* ecx = handle                                        */
     SM_OP_TEXT,          /* ecx = sm_text_t*                -> pen x / width    */
@@ -21,7 +21,11 @@ enum {
 };
 
 enum { SM_EV_NONE, SM_EV_KEY, SM_EV_MOUSE_DOWN, SM_EV_MOUSE_UP, SM_EV_MOUSE_MOVE, SM_EV_CLOSE,
-       SM_EV_WHEEL };
+       SM_EV_WHEEL, SM_EV_RDOWN, SM_EV_RESIZE };
+/* SM_EV_KEY: b = modifiers (1 shift, 2 ctrl, 4 alt). SM_EV_RDOWN: a, b = x, y of a right click.
+   SM_EV_RESIZE: a, b = new client size (SM_F_RESIZE windows) */
+#define SM_F_RAW    1     /* sm_text rasterizes into the buffer, no crisp overlay (lots of text) */
+#define SM_F_RESIZE 2     /* window follows its frame: scale 1, SM_EV_RESIZE; present with size in esi */
 
 typedef struct { int32_t w, h, scale, flags; uint64_t title; } sm_open_t;
 typedef struct { int32_t type, a, b, c; } sm_event_t;
