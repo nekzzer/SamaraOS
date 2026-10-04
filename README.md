@@ -129,7 +129,7 @@ xsamara
 `xsamara` starts Xorg on `/dev/fb0` with `/etc/X11/xorg.conf` (both ship
 with the OS), runs `~/.xinitrc` or twm + xterm, and stops X when that
 ends. Input comes from `/dev/input-kbd` and `/dev/input-mouse`, evdev style
-devices for the Xorg evdev driver. Ctrl+Alt+Q takes the keyboard back if
+devices for the Xorg evdev driver. Ctrl+Alt+Backspace takes the keyboard back if
 something hangs.
 
 What X needed from the kernel: named AF_UNIX sockets with `SCM_RIGHTS`,
@@ -410,7 +410,7 @@ Pass them with `make run APPEND="..."`.
 | desktop | Esc | leave desktop |
 | browser | `/` or `l`, Backspace, PgUp/PgDn, Tab, F5 | address bar, back, scroll, next field, reload |
 | programs | ^C, ^\, ^D | SIGINT, SIGQUIT, end of input |
-| games | Ctrl+Alt+Q | get the keyboard back |
+| games | Ctrl+Alt+Backspace | get the keyboard back |
 
 ## Source layout
 

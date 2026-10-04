@@ -38,6 +38,8 @@ typedef struct {
     uint32_t gdt_blocks, incompat, rocompat, compat;
     uint8_t sb[1024];
     uint8_t* gdt;                         /* ngroups * 32 */
+    uint8_t* mgdt;                        /* the same at mount: where metadata lives, never changes */
+    uint32_t itb;                         /* inode table blocks per group */
     uint8_t* bbm, *ibm;                   /* block / inode bitmaps, one block per group */
     uint8_t* gdirty;
     uint32_t* bhash;                      /* per block: hash of what we last wrote */
@@ -178,12 +180,17 @@ static int fill_data(ev_t* v, const uint8_t* ino, uint32_t size, char* d) {
 
 static uint32_t ph(fs_node_t* n, uint32_t cap) { return (((uint32_t)n >> 4) * 2654435761u) & (cap - 1); }
 
-static void t_rebuild(ev_t* v) {
+/* 0 = no memory. it was unchecked and from the file arena, which apk fills
+   up: a NULL table gave t_find garbage, files got each other's inodes and
+   blocks, and the group descriptors ended up as zeros on the disk */
+static int t_rebuild(ev_t* v) {
     uint32_t cap = 1024;
     while (cap < v->ne * 2 + 64) cap <<= 1;
-    if (cap != v->tcap) {
+    if (cap != v->tcap || !v->tab) {
+        int32_t* t = kmalloc(cap * 4);
+        if (!t) return -1;
         if (v->tab) kfree(v->tab);
-        v->tab = kmalloc_big(cap * 4);
+        v->tab = t;
         v->tcap = cap;
     }
     for (uint32_t i = 0; i < cap; i++) v->tab[i] = -1;
@@ -193,6 +200,7 @@ static void t_rebuild(ev_t* v) {
         while (v->tab[k] != -1) k = (k + 1) & (cap - 1);
         v->tab[k] = (int32_t)i;
     }
+    return 0;
 }
 
 static int t_find(ev_t* v, fs_node_t* n) {
@@ -211,7 +219,7 @@ static void t_del(ev_t* v, fs_node_t* n) {
 static int ent_new(ev_t* v, fs_node_t* n, uint32_t ino, uint8_t type) {
     if (v->ne == v->ecap) {
         uint32_t nc = v->ecap ? v->ecap * 2 : 1024;
-        ent_t* ne = kmalloc_big(nc * sizeof(ent_t));
+        ent_t* ne = kmalloc(nc * sizeof(ent_t));
         if (!ne) return -1;
         if (v->E) { memcpy(ne, v->E, v->ne * sizeof(ent_t)); kfree(v->E); }
         v->E = ne; v->ecap = nc;
@@ -220,7 +228,7 @@ static int ent_new(ev_t* v, fs_node_t* n, uint32_t ino, uint8_t type) {
     ent_t* e = &v->E[i];
     memset(e, 0, sizeof *e);
     e->n = n; e->ino = ino; e->type = type; e->seen = 1;
-    if (v->ne * 2 >= v->tcap) t_rebuild(v);
+    if (v->ne * 2 >= v->tcap) { if (t_rebuild(v) < 0) { v->ne--; return -1; } }
     else {
         uint32_t k = ph(n, v->tcap);
         while (v->tab[k] >= 0) k = (k + 1) & (v->tcap - 1);
@@ -231,12 +239,34 @@ static int ent_new(ev_t* v, fs_node_t* n, uint32_t ino, uint8_t type) {
 
 /* ---------- bitmaps ---------- */
 
+static bool has_super(ev_t* v, uint32_t g) {
+    if (g <= 1 || !(v->rocompat & 1)) return true;        /* sparse_super */
+    for (uint32_t p = 3; p <= g; p *= 3) if (p == g) return true;
+    for (uint32_t p = 5; p <= g; p *= 5) if (p == g) return true;
+    for (uint32_t p = 7; p <= g; p *= 7) if (p == g) return true;
+    return false;
+}
+
+/* superblocks, descriptors, bitmaps, inode tables. file data never goes
+   there whatever else is wrong: the last line of defence for the disk */
+static bool is_meta(ev_t* v, uint32_t b) {
+    if (b <= v->first_data + v->gdt_blocks) return true;
+    uint32_t g = (b - v->first_data) / v->bpg;
+    if (g >= v->ngroups) return true;
+    uint32_t base = v->first_data + g * v->bpg;
+    if (has_super(v, g) && b <= base + v->gdt_blocks) return true;
+    const uint8_t* gd = v->mgdt + g * 32;
+    uint32_t it = rd32(gd + 8);
+    return b == rd32(gd) || b == rd32(gd + 4) || (b >= it && b < it + v->itb);
+}
+
 static bool bb_get(ev_t* v, uint32_t b) {
     uint32_t i = b - v->first_data, k = i % v->bpg;
     return v->bbm[(i / v->bpg) * v->bs + k / 8] & (1 << (k & 7));
 }
 static void bb_set(ev_t* v, uint32_t b, bool on) {
     if (b < v->first_data || b >= v->nblocks) return;
+    if (!on && is_meta(v, b)) { klog("ext2: tried to free a metadata block\r\n"); return; }
     uint32_t i = b - v->first_data, g = i / v->bpg, k = i % v->bpg;
     uint8_t* p = v->bbm + g * v->bs + k / 8;
     if (on) *p |= (uint8_t)(1 << (k & 7)); else *p &= (uint8_t)~(1 << (k & 7));
@@ -248,7 +278,11 @@ static uint32_t balloc(ev_t* v) {
         uint32_t i = (v->acur + t) % span;
         if ((i & 7) == 0 && i + 8 <= span && v->bbm[(i / v->bpg) * v->bs + (i % v->bpg) / 8] == 0xFF) { t += 7; continue; }
         uint32_t b = v->first_data + i;
-        if (!bb_get(v, b)) { bb_set(v, b, true); v->acur = i + 1; v->bhash[b] = 0; return b; }
+        if (!bb_get(v, b)) {
+            bb_set(v, b, true);
+            if (is_meta(v, b)) { klog("ext2: metadata block was free in the bitmap\r\n"); continue; }
+            v->acur = i + 1; v->bhash[b] = 0; return b;
+        }
     }
     return 0;
 }
@@ -434,6 +468,11 @@ static uint32_t meta_for(ev_t* v, uint32_t nb) {
     return 2 + (nb - 12 - per + per - 1) / per;
 }
 
+static int wdata(ev_t* v, uint32_t b, const void* buf) {
+    if (is_meta(v, b)) { klog("ext2: refused a data write over metadata\r\n"); return -1; }
+    return wblk(v, b, buf);
+}
+
 /* content into the ent's blocks, same blocks again if the count fits */
 static int put_blocks(ev_t* v, int ei, const char* data, uint32_t len) {
     uint32_t per = v->bs / 4, nb = (len + v->bs - 1) / v->bs;
@@ -460,7 +499,7 @@ static int put_blocks(ev_t* v, int ei, const char* data, uint32_t len) {
         uint32_t take = len - i * v->bs < v->bs ? len - i * v->bs : v->bs;
         memcpy(blk, data + i * v->bs, take);
         if (take < v->bs) memset(blk + take, 0, v->bs - take);
-        wblk(v, e->bl[i], blk);
+        if (wdata(v, e->bl[i], blk) < 0) return -1;
     }
     memset(e->ib, 0, 60);
     for (uint32_t i = 0; i < nb && i < 12; i++) e->ib[i] = e->bl[i];
@@ -469,7 +508,7 @@ static int put_blocks(ev_t* v, int ei, const char* data, uint32_t len) {
         memset(blk, 0, v->bs);
         for (uint32_t i = 12; i < nb && i < 12 + per; i++) ind[i - 12] = e->bl[i];
         e->ib[12] = e->bl[nb];
-        wblk(v, e->bl[nb], blk);
+        if (wdata(v, e->bl[nb], blk) < 0) return -1;
     }
     if (nm > 1) {
         uint32_t nd = nm - 2;
@@ -481,11 +520,11 @@ static int put_blocks(ev_t* v, int ei, const char* data, uint32_t len) {
                 uint32_t lb = 12 + per + j * per + i;
                 if (lb < nb) ind[i] = e->bl[lb];
             }
-            wblk(v, e->bl[nb + 2 + j], blk);
+            if (wdata(v, e->bl[nb + 2 + j], blk) < 0) return -1;
         }
         memset(blk, 0, v->bs);
         for (uint32_t j = 0; j < nd; j++) ind[j] = e->bl[nb + 2 + j];
-        wblk(v, e->bl[nb + 1], blk);
+        if (wdata(v, e->bl[nb + 1], blk) < 0) return -1;
     }
     return 0;
 }
@@ -539,14 +578,14 @@ static void walk(ev_t* v, fs_node_t* d) {
 
 static int sync_vol(ev_t* v) {
     uint32_t now = fs_now();
-    uint8_t* dib = kmalloc_big(v->ninodes / 8 + 1);          /* inodes to write this time */
-    int32_t* i2e = kmalloc_big((v->ninodes + 1) * 4);
+    uint8_t* dib = kmalloc(v->ninodes / 8 + 1);              /* inodes to write this time */
+    int32_t* i2e = kmalloc((v->ninodes + 1) * 4);
     if (!dib || !i2e) { if (dib) kfree(dib); if (i2e) kfree(i2e); return -1; }
     memset(dib, 0, v->ninodes / 8 + 1);
     for (uint32_t i = 0; i <= v->ninodes; i++) i2e[i] = -1;
 
     for (uint32_t i = 0; i < v->ne; i++) v->E[i].seen = 0;
-    t_rebuild(v);
+    if (t_rebuild(v) < 0) { kfree(dib); kfree(i2e); return -1; }    /* nothing written yet */
     int ri = t_find(v, v->root);
     if (ri < 0) ri = ent_new(v, v->root, 2, FS_DIR);
     v->E[ri].seen = 1;
@@ -565,7 +604,7 @@ static int sync_vol(ev_t* v) {
         w++;
     }
     v->ne = w;
-    t_rebuild(v);
+    if (t_rebuild(v) < 0) { v->ro = true; klog("ext2: no memory, volume read-only now\r\n"); kfree(dib); kfree(i2e); return -1; }
 
     bool ft = v->incompat & 2;
     int err = 0;
@@ -603,7 +642,7 @@ static int sync_vol(ev_t* v) {
             uint32_t h = fnv((uint8_t*)db.buf, db.len);
             e = &v->E[i];
             if (h != e->h) {
-                if (put_blocks(v, (int)i, db.buf, db.len) < 0) err = -1;
+                if (put_blocks(v, (int)i, db.buf, db.len) < 0) { err = -1; kfree(db.buf); continue; }
                 v->E[i].h = h;
             }
             kfree(db.buf);
@@ -623,7 +662,7 @@ static int sync_vol(ev_t* v) {
             if (!same) {
                 uint32_t h = size ? fnv((uint8_t*)n->data, size) : 1;
                 if (h != e->h || (size + v->bs - 1) / v->bs != e->nb) {
-                    if (put_blocks(v, (int)i, n->data, size) < 0) err = -1;
+                    if (put_blocks(v, (int)i, n->data, size) < 0) { err = -1; continue; }   /* inode stays as it was */
                     e = &v->E[i];
                 }
                 e->h = h;
@@ -643,6 +682,15 @@ static int sync_vol(ev_t* v) {
     }
     if (err) klog("ext2: disk full\r\n");
 
+    /* the descriptors must still say what they said at mount, or we'd write
+       bitmaps and inode tables to wherever garbage points */
+    for (uint32_t g = 0; g < v->ngroups; g++)
+        if (memcmp(v->gdt + g * 32, v->mgdt + g * 32, 12)) {
+            klog("ext2: group descriptors changed in memory! volume read-only, nothing more written\r\n");
+            v->ro = true;
+            kfree(dib); kfree(i2e);
+            return -1;
+        }
     /* inodes, read-modify-write so whatever we don't know about stays */
     static uint8_t tb[4096];
     uint32_t cur = 0;
@@ -858,7 +906,7 @@ static void e2syncd(void) {
             ev_t* v = &vols[i];
             if (!v->used || !v->dirty) continue;
             v->dirty = false;
-            if (sync_vol(v) < 0) klog("ext2: sync failed\r\n");
+            if (sync_vol(v) < 0) { klog("ext2: sync failed\r\n"); if (!v->ro) v->dirty = true; }   /* again next time */
         }
         nsyncs++;
         unlock();
@@ -914,9 +962,12 @@ int ext2_mount(int disk, fs_node_t* at) {
     /* write only what we fully understand: filetype and sparse_super, large_file */
     v->ro = (v->incompat & ~2u) || (v->rocompat & ~3u) || (v->compat & 4);
     v->gdt = kmalloc(v->gdt_blocks * v->bs);
-    if (!v->gdt) return -12;
+    v->mgdt = kmalloc(v->gdt_blocks * v->bs);
+    if (!v->gdt || !v->mgdt) return -12;
     for (uint32_t b = 0; b < v->gdt_blocks; b++)
         if (rblk(v, v->first_data + 1 + b, v->gdt + b * v->bs) < 0) return -5;
+    memcpy(v->mgdt, v->gdt, v->gdt_blocks * v->bs);
+    v->itb = (v->ipg * v->isize + v->bs - 1) / v->bs;
     if (!v->ro) {
         v->bbm = kmalloc_big(v->ngroups * v->bs);
         v->ibm = kmalloc_big(v->ngroups * v->bs);
@@ -931,8 +982,8 @@ int ext2_mount(int disk, fs_node_t* at) {
             uint8_t* gd = v->gdt + g * 32;
             if (rblk(v, rd32(gd), v->bbm + g * v->bs) < 0 || rblk(v, rd32(gd + 4), v->ibm + g * v->bs) < 0) v->ro = true;
         }
-        t_rebuild(v);
-        v->E = kmalloc_big(1024 * sizeof(ent_t));
+        if (t_rebuild(v) < 0) v->ro = true;
+        v->E = kmalloc(1024 * sizeof(ent_t));
         v->ecap = v->E ? 1024 : 0;
         if (!v->E) v->ro = true;
     }

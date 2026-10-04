@@ -261,7 +261,7 @@ int userland_install(void) {
     {
         const char* xs =
             "#!/bin/sh\n"
-            "# X on the framebuffer. Ctrl+Alt+Q gets the keyboard back if it hangs\n"
+            "# X on the framebuffer. Ctrl+Alt+Backspace gets the keyboard back if it hangs\n"
             "if ! command -v Xorg >/dev/null; then\n"
             "    echo 'no Xorg here. apk add xorg-server xf86-video-fbdev xf86-input-evdev xterm twm xsetroot font-misc-misc font-cursor-misc mesa-dri-gallium llvm17-libs mesa-demos'\n"
             "    exit 1\n"

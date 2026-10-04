@@ -5,7 +5,7 @@
 /* /dev/input: raw keyboard + mouse events in Linux `struct input_event`
    layout (16 bytes: sec, usec, u16 type, u16 code, s32 value), with Linux
    evdev key codes. While the device is open the keyboard and mouse are
-   "grabbed": the shell and window manager stop seeing them. Ctrl+Alt+Q
+   "grabbed": the shell and window manager stop seeing them. Ctrl+Alt+Backspace
    drops the grab from the kernel side (escape hatch for a stuck program). */
 
 #define IEV_KEY 1

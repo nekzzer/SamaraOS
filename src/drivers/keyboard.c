@@ -119,7 +119,8 @@ static void kbd_isr(struct interrupt_frame* f) {
                 case 0x38: alt = !released; break;
             }
             if (sc == 0x57 && !released) f11_count++;
-            if (sc == 0x10 && !released && ctrl && alt) {      /* Ctrl+Alt+Q: escape hatch */
+            /* Ctrl+Alt+Backspace: escape hatch. was ctrl+alt+q, that one quits qemu (gtk) */
+            if (sc == 0x0E && !released && ctrl && alt) {
                 input_release_grab();
                 fbdev_force_release();
                 pic_send_eoi(1);
