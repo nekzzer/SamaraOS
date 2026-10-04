@@ -74,6 +74,9 @@ int      vmm_copy_to(uint32_t pd, uint32_t va, const void* src, uint32_t len);
 
 uint32_t vmm_count_pages(uint32_t pd);                  /* mapped user pages */
 
+/* device memory (pci bars): a pointer the kernel can poke, NULL if it can't reach it */
+void*    mmio_map(uint64_t pa, size_t len);
+
 /* After editing the live directory. */
 void     vmm_flush(void);
 

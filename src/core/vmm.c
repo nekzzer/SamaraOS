@@ -287,3 +287,9 @@ uint32_t vmm_count_pages(uint32_t pd) {
     }
     return n;
 }
+
+/* the 4 GiB identity map covers every bar below 4G */
+void* mmio_map(uint64_t pa, size_t len) {
+    if (pa + len > 0x100000000ull) return NULL;
+    return (void*)(uintptr_t)pa;
+}
