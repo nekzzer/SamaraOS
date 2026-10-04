@@ -254,7 +254,7 @@ static void req_done(req_t* q, int res) {
     bool fail = opt_fail(q, res);
     bool hard = (q->sqe.flags & IOSQE_IO_HARDLINK) != 0;
     kfree(q);
-    if (lt) { lt->target = NULL; req_done(lt, -ECANCELED); }
+    if (lt) { lt->target = NULL; req_done(lt, lt->bad ? lt->bad : -ECANCELED); }
     if (nx) {
         if (fail && !hard) req_done(nx, -ECANCELED);
         else req_start(nx);
@@ -338,7 +338,8 @@ static req_t* prep(uring_t* r, struct io_uring_sqe* s) {
     if (op == IORING_OP_TIMEOUT || op == IORING_OP_LINK_TIMEOUT) {
         uint32_t ms = 0;
         int e = 0;
-        if (s->timeout_flags & ~0xAFu) e = -EINVAL;            // abs, update, boottime, realtime, immediate
+        if (s->ioprio) e = -EINVAL;
+        else if (s->timeout_flags & ~0xAFu) e = -EINVAL;            // abs, update, boottime, realtime, immediate
         else if (s->timeout_flags & 0x80) ms = (uint32_t)((s->addr + 999999) / 1000000);    // immediate arg: ns in addr
         else e = ts_ms(s->addr, &ms);
         if (e < 0) q->bad = e;
@@ -689,7 +690,8 @@ static int sq_submit(uring_t* r, uint32_t n) {
         *pp = q;
         irq_restore(fl);
         bool lnk = (s.flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK)) != 0;
-        if (s.opcode == IORING_OP_LINK_TIMEOUT && open && tl && !tl->lt && !q->bad) {
+        if (s.opcode == IORING_OP_LINK_TIMEOUT && open && tl && !tl->lt) {
+            if (q->bad && !tl->bad) tl->bad = -ECANCELED;     // broken lto kills what it hangs on
             tl->lt = q;
             q->target = tl;
             open = lnk;
