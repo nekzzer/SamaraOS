@@ -87,7 +87,8 @@ static bool uok(const void* p, uint32_t len) {
     uint32_t pd = proc_current()->pd;
     for (uint32_t pg = a & ~(PAGE_SIZE - 1); pg < a + len; pg += PAGE_SIZE) {
         if (pg >= USER_STACK_TOP - USER_STACK_MAX) break;
-        if (!(vmm_pte(pd, pg) & PTE_P)) return false;
+        uint32_t pte = vmm_pte(pd, pg);
+        if (!(pte & PTE_P) && !((pte & PTE_LAZY) && (pte & PTE_US))) return false;   /* lazy: the fault fills it */
     }
     return true;
 }
@@ -925,6 +926,16 @@ static int32_t do_mmap(uint32_t addr, uint32_t len, int prot, int flags, int fd,
         if (!fb || off >= size) return -EINVAL;
         for (uint32_t k = 0; k < len / PAGE_SIZE && off + k * PAGE_SIZE < size; k++)
             vmm_map_frame(p->pd, addr + k * PAGE_SIZE, fb + off + k * PAGE_SIZE, (prot & PROT_WRITE) != 0);
+        vmm_flush();
+        return (int32_t)addr;
+    }
+    if (!f || f->type == F_ZERO) {
+        /* private anon (and /dev/zero): frames on first touch */
+        if (vmm_lazy_range(p->pd, addr, len, (prot & PROT_WRITE) != 0, prot != 0) < 0) {
+            vmm_free_range(p->pd, addr, len);
+            vmm_flush();
+            return -ENOMEM;
+        }
         vmm_flush();
         return (int32_t)addr;
     }

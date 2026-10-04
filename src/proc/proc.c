@@ -717,6 +717,13 @@ bool proc_interrupted(void) {
 bool proc_handle_fault(uint32_t addr, uint32_t err) {
     proc_t* p = proc_current();
     if (!p || (err & 1)) return false;                   /* protection faults are real */
+    /* lazy anon page: frame now. PROT_NONE (no US) and writes to read-only
+       ones stay faults, java counts on those SIGSEGVs */
+    uint32_t pte = vmm_pte(p->pd, addr & ~(PAGE_SIZE - 1));
+    if (pte & PTE_LAZY) {
+        if (!(pte & PTE_US) || ((err & 2) && !(pte & PTE_RW))) return false;
+        return vmm_fault_in(p->pd, addr);
+    }
     if (addr < USER_STACK_TOP - USER_STACK_MAX || addr >= USER_STACK_TOP) return false;
     return vmm_alloc_range(p->pd, addr & ~(PAGE_SIZE - 1), PAGE_SIZE, true) == 0;
 }

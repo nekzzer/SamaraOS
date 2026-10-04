@@ -42,6 +42,7 @@ static inline bool dma_ok(const void* v) {
 #define PTE_RW 0x002u
 #define PTE_US 0x004u
 #define PTE_SHARED 0x200u          /* avl bit: MAP_SHARED / shmat page, fork shares it */
+#define PTE_LAZY   0x400u          /* avl bit, P=0: anon mmap page that gets a frame on first touch */
 
 void     pmm_init(uint32_t pool_start, uint32_t pool_end);
 uint32_t pmm_alloc(void);             /* zeroed frame, 0 when exhausted */
@@ -64,6 +65,9 @@ uint32_t vmm_pte(uint32_t pd, uint32_t va);            /* 0 = not mapped */
 void     vmm_set_writable(uint32_t pd, uint32_t va, uint32_t len, bool writable);
 void     vmm_set_user(uint32_t pd, uint32_t va, uint32_t len, bool user);
 int      vmm_map_frame(uint32_t pd, uint32_t va, uint32_t fr, bool rw);    /* takes a ref on fr */
+/* anon memory without frames yet: they come on first touch (vmm_fault_in) */
+int      vmm_lazy_range(uint32_t pd, uint32_t va, uint32_t len, bool rw, bool user);
+bool     vmm_fault_in(uint32_t pd, uint32_t va);   /* a lazy page gets its frame; false = not lazy / oom */
 
 /* Copy into / zero another space through the identity map (no CR3 switch). */
 int      vmm_copy_to(uint32_t pd, uint32_t va, const void* src, uint32_t len);

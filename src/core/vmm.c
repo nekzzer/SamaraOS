@@ -119,7 +119,7 @@ void vmm_set_writable(uint32_t pd, uint32_t va, uint32_t len, bool writable) {
     uint32_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     for (uint32_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
         uint32_t* p = pte_slot(pd, a, false);
-        if (!p || !(*p & PTE_P)) continue;
+        if (!p || !(*p & (PTE_P | PTE_LAZY))) continue;
         if (writable) *p |= PTE_RW; else *p &= ~PTE_RW;
     }
 }
@@ -133,12 +133,36 @@ int vmm_map_frame(uint32_t pd, uint32_t va, uint32_t fr, bool rw) {
     return 0;
 }
 
+/* java reserves hundreds of MB (heap, metaspace, thread stacks, code cache)
+   and touches a fraction. every byte of it used to be a real frame up
+   front: minecraft ran the box out of memory while making the world */
+int vmm_lazy_range(uint32_t pd, uint32_t va, uint32_t len, bool rw, bool user) {
+    uint32_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    for (uint32_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
+        if (a < USER_BASE || a >= USER_TOP) return -1;
+        uint32_t* p = pte_slot(pd, a, true);
+        if (!p) return -1;
+        if (*p & PTE_P) pmm_unref(*p & ~0xFFFu);
+        *p = PTE_LAZY | (rw ? PTE_RW : 0) | (user ? PTE_US : 0);
+    }
+    return 0;
+}
+
+bool vmm_fault_in(uint32_t pd, uint32_t va) {
+    uint32_t* p = pte_slot(pd, va & ~(PAGE_SIZE - 1), false);
+    if (!p || (*p & PTE_P) || !(*p & PTE_LAZY)) return false;
+    uint32_t fr = pmm_alloc();                     /* zeroed */
+    if (!fr) return false;
+    *p = fr | PTE_P | (*p & (PTE_RW | PTE_US));
+    return true;
+}
+
 // PROT_NONE = present but supervisor only, so user access faults
 void vmm_set_user(uint32_t pd, uint32_t va, uint32_t len, bool user) {
     uint32_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     for (uint32_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
         uint32_t* p = pte_slot(pd, a, false);
-        if (!p || !(*p & PTE_P)) continue;
+        if (!p || !(*p & (PTE_P | PTE_LAZY))) continue;
         if (user) *p |= PTE_US; else *p &= ~PTE_US;
     }
 }
@@ -148,8 +172,8 @@ void vmm_free_range(uint32_t pd, uint32_t va, uint32_t len) {
     for (uint32_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
         if (a < USER_BASE || a >= USER_TOP) continue;
         uint32_t* p = pte_slot(pd, a, false);
-        if (!p || !(*p & PTE_P)) continue;
-        pmm_unref(*p & ~0xFFFu);
+        if (!p || !(*p & (PTE_P | PTE_LAZY))) continue;
+        if (*p & PTE_P) pmm_unref(*p & ~0xFFFu);
         *p = 0;
     }
 }
@@ -158,7 +182,7 @@ bool vmm_range_unmapped(uint32_t pd, uint32_t va, uint32_t len) {
     uint32_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     for (uint32_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
         uint32_t* p = pte_slot(pd, a, false);
-        if (p && (*p & PTE_P)) return false;
+        if (p && (*p & (PTE_P | PTE_LAZY))) return false;
     }
     return true;
 }
@@ -177,7 +201,7 @@ uint32_t vmm_find_free(uint32_t pd, uint32_t from, uint32_t limit, uint32_t len)
             continue;
         }
         uint32_t* p = pte_slot(pd, a, false);
-        if (p && (*p & PTE_P)) { run = 0; continue; }
+        if (p && (*p & (PTE_P | PTE_LAZY))) { run = 0; continue; }
         if (run == 0) start = a;
         run += PAGE_SIZE;
         if (run >= len) return start;
@@ -207,7 +231,13 @@ uint32_t vmm_clone_space(uint32_t pd) {
         if (!(d[i] & PTE_P)) continue;
         uint32_t* pt = (uint32_t*)P2V(d[i] & ~0xFFFu);
         for (int j = 0; j < 1024; j++) {
-            if (!(pt[j] & PTE_P)) continue;
+            if (!(pt[j] & PTE_P)) {
+                if (!(pt[j] & PTE_LAZY)) continue;
+                uint32_t* lp = pte_slot(npd, (i << 22) | ((uint32_t)j << 12), true);   /* untouched: stays lazy */
+                if (!lp) { vmm_destroy_space(npd); return 0; }
+                *lp = pt[j];
+                continue;
+            }
             uint32_t va = (i << 22) | ((uint32_t)j << 12);
             uint32_t* np = pte_slot(npd, va, true);
             if (!np) { vmm_destroy_space(npd); return 0; }
@@ -232,7 +262,10 @@ int vmm_copy_to(uint32_t pd, uint32_t va, const void* src, uint32_t len) {
     const uint8_t* s = (const uint8_t*)src;
     while (len) {
         uint32_t pte = vmm_pte(pd, va);
-        if (!(pte & PTE_P)) return -1;
+        if (!(pte & PTE_P)) {
+            if (!vmm_fault_in(pd, va)) return -1;
+            pte = vmm_pte(pd, va);
+        }
         uint32_t off = va & 0xFFF;
         uint32_t n = PAGE_SIZE - off;
         if (n > len) n = len;
