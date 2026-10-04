@@ -114,6 +114,7 @@ KERN_SRC := \
     src/fs/ext2.c \
     src/drivers/usb.c \
     src/net/net.c \
+    src/net/ipv6.c \
     src/net/sock.c \
     src/apps/snake.c \
     src/apps/browser.c \
