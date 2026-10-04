@@ -5,6 +5,7 @@
 #include "core/string.h"
 #include "core/task.h"
 #include "core/vmm.h"
+#include "drivers/vga.h"
 
 /* virtio over the legacy PCI interface (BAR0 = I/O ports), which QEMU's
    virtio-*-pci devices still offer. Polled, no interrupts: we kick the
@@ -285,3 +286,117 @@ int vnet_recv(int i, void* buf, int max) {
     rx_post(i, slot);
     return n > 0 ? n : 0;
 }
+
+/* ---------- modern transport ---------- */
+
+#define VM_COMMON 1
+#define VM_NOTIFY 2
+#define VM_ISR    3
+#define VM_DEVCFG 4
+
+/* seabios likes to put 64 bit bars above 4G where we can't reach them.
+   move it into the low hole, somewhere nobody else sits (guessing, but
+   works on qemu i440fx/q35) */
+static uint32_t bar_lo(const pci_dev_t* d, int bar) {
+    static uint32_t next = 0xC8000000;
+    pci_dev_t all[32];
+    int n = pci_scan(all, 32);
+    for (;;) {
+        bool bad = false;
+        for (int i = 0; i < n; i++)
+            for (int b = 0; b < 6; b++) {
+                uint32_t x = all[i].bar[b];
+                if ((x & 1) || !x) continue;
+                if ((x & ~0xFu) >= next && (x & ~0xFu) < next + 0x4000000) bad = true;
+            }
+        if (!bad) break;
+        next += 0x4000000;
+    }
+    uint32_t a = next;
+    next += 0x100000;
+    pci_cfg_write32(d->bus, d->dev, d->fn, 0x10 + bar * 4, a | (d->bar[bar] & 0xF));
+    pci_cfg_write32(d->bus, d->dev, d->fn, 0x14 + bar * 4, 0);
+    return a;
+}
+
+int vm_probe(const pci_dev_t* d, vm_t* v) {
+    memset(v, 0, sizeof(*v));
+    uint16_t st = pci_cfg_read16(d->bus, d->dev, d->fn, 0x06);
+    if (!(st & 0x10)) return -1;                      /* no cap list */
+    uint8_t c = pci_cfg_read8(d->bus, d->dev, d->fn, 0x34) & ~3;
+    int hops = 0;
+    while (c && hops++ < 48) {
+        uint8_t id = pci_cfg_read8(d->bus, d->dev, d->fn, c);
+        uint8_t next = pci_cfg_read8(d->bus, d->dev, d->fn, c + 1);
+        if (id == 9) {
+            uint8_t type = pci_cfg_read8(d->bus, d->dev, d->fn, c + 3);
+            uint8_t bar = pci_cfg_read8(d->bus, d->dev, d->fn, c + 4);
+            uint32_t off = pci_cfg_read32(d->bus, d->dev, d->fn, c + 8);
+            uint32_t len = pci_cfg_read32(d->bus, d->dev, d->fn, c + 12);
+            if (type >= 1 && type <= 4 && bar < 6 && !(d->bar[bar] & 1)) {
+                uint64_t base = d->bar[bar] & ~0xFu;
+                if ((d->bar[bar] & 6) == 4 && bar < 5) base |= (uint64_t)d->bar[bar + 1] << 32;
+                if (base >= 0x100000000ull) base = bar_lo(d, bar);
+                volatile uint8_t* p = mmio_map(base + off, len);
+                if (!p) { vga_printf("virtio: bar%d above 4G\n", bar); return -1; }
+                if (type == VM_COMMON) v->common = p;
+                else if (type == VM_NOTIFY) { v->notify = p; v->mult = pci_cfg_read32(d->bus, d->dev, d->fn, c + 16); }
+                else if (type == VM_ISR) v->isr = p;
+                else if (type == VM_DEVCFG) v->dev = p;
+            }
+        }
+        c = next & ~3;
+    }
+    if (!v->common || !v->notify || !v->isr) return -1;
+    uint16_t cmd = pci_cfg_read16(d->bus, d->dev, d->fn, 0x04);
+    pci_cfg_write16(d->bus, d->dev, d->fn, 0x04, cmd | 6);      /* mem + bus master */
+    return 0;
+}
+
+#define MC32(o) (*(volatile uint32_t*)(v->common + (o)))
+#define MC16(o) (*(volatile uint16_t*)(v->common + (o)))
+#define MC8(o)  (*(volatile uint8_t*)(v->common + (o)))
+
+int vm_start(vm_t* v, uint32_t want, uint32_t* got) {
+    MC8(0x14) = 0;
+    while (MC8(0x14)) {}
+    MC8(0x14) = ST_ACK;
+    MC8(0x14) = ST_ACK | ST_DRIVER;
+    MC32(0x00) = 0;
+    uint32_t lo = MC32(0x04) & want;
+    MC32(0x00) = 1;
+    if (!(MC32(0x04) & 1)) return -1;                 /* not a 1.0 device */
+    MC32(0x08) = 0; MC32(0x0C) = lo;
+    MC32(0x08) = 1; MC32(0x0C) = 1;                   /* VERSION_1 */
+    MC8(0x14) = ST_ACK | ST_DRIVER | 8;               /* FEATURES_OK */
+    if (!(MC8(0x14) & 8)) return -1;
+    if (got) *got = lo;
+    return 0;
+}
+
+int vm_queue(vm_t* v, vmq_t* q, int idx) {
+    MC16(0x16) = (uint16_t)idx;
+    int n = MC16(0x18);
+    if (n <= 0) return -1;
+    if (n > 256) { n = 256; MC16(0x18) = 256; }
+    uint8_t* m = kmalloc(4096 * 4);
+    if (!m) return -1;
+    m = (uint8_t*)(((uintptr_t)m + 4095) & ~(uintptr_t)4095);   // leaks 4k, who cares, queues live forever
+    memset(m, 0, 4096 * 3);
+    q->n = n;
+    q->desc = (vq_desc_t*)m;
+    q->avail = (uint16_t*)(m + 4096);
+    q->used = (uint16_t*)(m + 8192);
+    q->last_used = 0;
+    uint64_t d = V2P(q->desc), a = V2P(q->avail), u = V2P(q->used);
+    MC32(0x20) = (uint32_t)d; MC32(0x24) = (uint32_t)(d >> 32);
+    MC32(0x28) = (uint32_t)a; MC32(0x2C) = (uint32_t)(a >> 32);
+    MC32(0x30) = (uint32_t)u; MC32(0x34) = (uint32_t)(u >> 32);
+    q->kick = (volatile uint16_t*)(v->notify + MC16(0x1E) * v->mult);
+    MC16(0x1C) = 1;
+    return n;
+}
+
+void vm_ready(vm_t* v) { MC8(0x14) = ST_ACK | ST_DRIVER | 8 | ST_OK; }
+
+void vmq_kick(vmq_t* q, int idx) { *q->kick = (uint16_t)idx; }

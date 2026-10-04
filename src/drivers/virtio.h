@@ -23,6 +23,26 @@ int  vq_pop(vq_t* q, uint32_t* len);
 int  virtio_start(uint16_t io, uint32_t want, uint32_t* got);
 void virtio_ready(uint16_t io);
 
+/* modern (virtio 1.0) pci transport: caps point into mmio bars, split queues.
+   only the gpu uses it so far, blk/net stay on the legacy io bar */
+#include "drivers/pci.h"
+typedef struct {
+    volatile uint8_t *common, *isr, *dev, *notify;
+    uint32_t mult;
+} vm_t;
+typedef struct {
+    int n;
+    vq_desc_t* desc;
+    uint16_t *avail, *used;
+    uint16_t last_used;
+    volatile uint16_t* kick;
+} vmq_t;
+int  vm_probe(const pci_dev_t* d, vm_t* v);
+int  vm_start(vm_t* v, uint32_t want, uint32_t* got);     /* want/got: feature bits 0..31, VERSION_1 is always taken */
+int  vm_queue(vm_t* v, vmq_t* q, int idx);
+void vm_ready(vm_t* v);
+void vmq_kick(vmq_t* q, int idx);
+
 #define VBLK_MAX 4
 int      vblk_init(void);                  /* number of disks: /dev/vda.. */
 bool     vblk_present(int i);
