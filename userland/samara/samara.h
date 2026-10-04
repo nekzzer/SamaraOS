@@ -150,8 +150,8 @@ typedef struct { int32_t type, a, b, c; } SmEvent;
 #define SM_MAGENTA SM_RGB(0xB0, 0x5E, 0xC8)
 
 /* ---- kernel ABI structs ---- */
-typedef struct { int32_t w, h, scale, flags; uint32_t title; } sm_open_t;
-typedef struct { uint32_t buf; int32_t bw, bh, x, y, font; uint32_t color, str; } sm_text_t;
+typedef struct { int32_t w, h, scale, flags; uint64_t title; } sm_open_t;
+typedef struct { uint64_t buf; int32_t bw, bh, x, y, font; uint32_t color; uint64_t str; } sm_text_t;
 
 typedef struct {
     int w, h, scale;
@@ -186,7 +186,7 @@ static inline SmWin *sm_open_ex(int w, int h, int scale, int flags, const char *
     SmWin *win;
     long r;
     o.w = w; o.h = h; o.scale = scale; o.flags = flags;
-    o.title = (uint32_t)(uintptr_t)title;
+    o.title = (uint64_t)(uintptr_t)title;
     r = sm_call(SM_OP_OPEN, (long)&o, 0, 0);
     if (r < 0) return 0;
     win = (SmWin *)malloc(sizeof(SmWin));
@@ -325,9 +325,9 @@ static inline void sm_disc(SmWin *w, int cx, int cy, int r, uint32_t c) {
    UTF-8 Cyrillic is accepted. Returns the pen x after the text. */
 static inline int sm_text(SmWin *w, int x, int y, const char *s, uint32_t color, int font) {
     sm_text_t t;
-    t.buf = (uint32_t)(uintptr_t)w->pix; t.bw = w->w; t.bh = w->h;
+    t.buf = (uint64_t)(uintptr_t)w->pix; t.bw = w->w; t.bh = w->h;
     t.x = x; t.y = y; t.font = font; t.color = color;
-    t.str = (uint32_t)(uintptr_t)s;
+    t.str = (uint64_t)(uintptr_t)s;
     return (int)sm_call(SM_OP_TEXT, (long)&t, 0, 0);
 }
 
@@ -335,7 +335,7 @@ static inline int sm_text_w(const char *s, int font) {
     sm_text_t t;
     memset(&t, 0, sizeof t);
     t.font = font;
-    t.str = (uint32_t)(uintptr_t)s;
+    t.str = (uint64_t)(uintptr_t)s;
     return (int)sm_call(SM_OP_TEXT, (long)&t, 0, 0);
 }
 
