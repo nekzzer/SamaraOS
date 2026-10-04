@@ -817,9 +817,8 @@ static int ext2_lazy(fs_node_t* n) {
     /* the reclaim in kmalloc_big only tries the lock and the sync holds it a
        lot when memory is tight: exec failed with ENOMEM. here we may wait */
     for (int t = 0; !d && t < 3; t++) {
-        lock();
-        rc_do(sz + 1);
-        unlock();
+        if (t) fs_need_room(sz + 1);            /* dirty stuff from apk: sync first, then it can go */
+        else { lock(); rc_do(sz + 1); unlock(); }
         d = kmalloc_big(sz + 1);
     }
     if (!d) { klog("ext2: no memory for a lazy file\r\n"); return -1; }

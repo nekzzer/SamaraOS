@@ -2440,6 +2440,17 @@ void fs_sync_end(void) { fs_syncing = false; }
 
 /* a write ran out of file memory. step out of the writers (the file isn't
    touched yet), let a sync run and drop clean files, step back in */
+/* same for anybody (a lazy read in exec, a trigger script during apk add):
+   sync so the dirty files become droppable, then drop. steps out of the
+   writers if it was one */
+void fs_need_room(uint32_t need) {
+    proc_t* p = proc_current();
+    bool was = p && p->in_fs;
+    if (was) p->in_fs = false;
+    ext2_make_room(need);
+    if (was) fs_write_begin();
+}
+
 void fs_wait_room(uint32_t need) {
     proc_t* p = proc_current();
     if (!p || !p->in_fs) return;

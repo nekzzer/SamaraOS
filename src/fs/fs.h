@@ -51,7 +51,8 @@ void        fs_write_begin(void);             /* a syscall that changes files/tr
 void        fs_write_end(void);
 void        fs_sync_begin(void);              /* a volume sync: waits writers out */
 void        fs_sync_end(void);
-void        fs_wait_room(uint32_t need);     /* writer out of file memory: wait for a sync */
+void        fs_wait_room(uint32_t need);
+void        fs_need_room(uint32_t need);     /* sync + drop clean files, from anywhere that may sleep */     /* writer out of file memory: wait for a sync */
 fs_node_t*  fs_symlink(fs_node_t* dir, const char* name, const char* target);
 fs_node_t*  fs_create(fs_node_t* cwd, const char* path, fs_type_t type);
 int         fs_unlink(fs_node_t* cwd, const char* path);
