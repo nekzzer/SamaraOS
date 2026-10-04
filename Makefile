@@ -4,12 +4,12 @@
 # Run target: system qemu-system-i386.
 
 MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-CROSS    ?= $(MAKEFILE_DIR)toolchain/cross/bin/i686-elf-
+CROSS    ?=
 CC       := $(CROSS)gcc
 LD       := $(CROSS)ld
 OBJCOPY  := $(CROSS)objcopy
 
-QEMU     ?= qemu-system-i386
+QEMU     ?= qemu-system-x86_64
 # Hardware virtualization when the host has it (/dev/kvm), else QEMU falls
 # back to TCG emulation - ~10-20x slower for drawing and compiling.
 # lost_tick_policy=discard: kvm replays pit ticks lost while we boot with irqs
@@ -27,25 +27,24 @@ QDISPLAY ?= -display gtk,zoom-to-fit=off
 USB      ?= -usb -device usb-mouse
 AUDIO    ?= -audiodev pa,id=snd0 -machine pcspk-audiodev=snd0 -device sb16,audiodev=snd0
 
-KCFLAGS  := -m32 -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
-            -nostdlib -mno-red-zone \
-            -mgeneral-regs-only -mno-mmx -mno-sse -mno-sse2 \
+KCFLAGS  := -m64 -mcmodel=kernel -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
+            -nostdlib -mno-red-zone -fno-asynchronous-unwind-tables \
+            -mgeneral-regs-only \
             -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -MMD -MP \
             -std=gnu11 -Isrc
 
 # DOOM compile flags. Permissive so id Software's 1993 K&R C compiles.
 # x87 FP allowed (a few % format strings use it); SSE/MMX off.
-DCFLAGS  := -m32 -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
-            -nostdlib -mno-red-zone \
-            -mno-mmx -mno-sse -mno-sse2 \
+DCFLAGS  := -m64 -mcmodel=kernel -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
+            -nostdlib -mno-red-zone -mno-mmx -fno-asynchronous-unwind-tables \
             -O2 -std=gnu11 -fcommon \
             -DNORMALUNIX -D_DEFAULT_SOURCE \
             -isystem src/libc/include -Isrc \
             -Idoomgeneric-master/doomgeneric \
             -w
 
-LDFLAGS  := -m elf_i386 -nostdlib -T linker.ld
-LIBGCC   := $(shell $(CC) -m32 -print-libgcc-file-name)
+LDFLAGS  := -m elf_x86_64 -nostdlib -z max-page-size=4096 -T linker.ld
+LIBGCC   :=
 
 # ---------- Kernel sources ----------
 # Organized by subsystem: core/ (heap, task, string, kernel entry), boot/
@@ -120,7 +119,6 @@ KERN_SRC := \
     $(SHELL_CMD_SRC) \
     src/shell/shell.c \
     src/shell/complete.c \
-    src/boot/libgcc_div.c \
     src/core/kernel.c
 
 # ---------- libc-shim sources ----------
@@ -175,6 +173,7 @@ DGEN_SRC := \
     $(DGEN_DIR)/i_input.c $(DGEN_DIR)/i_video.c $(DGEN_DIR)/doomgeneric.c
 
 KERN_OBJ  := $(KERN_SRC:.c=.o)
+BOOT_OBJ  := src/boot/boot.o src/boot/entry.o
 
 # Embedded WAVs (objcopy -I binary). Variables only here — rules live below
 # the default target so 'make' without arguments still builds the kernel.
@@ -193,7 +192,7 @@ USERLAND_OBJS := $(addsuffix .bin.o,$(USERLAND_BINS))
 # terminal font atlas (tools/mktermfont.py), linked in like the userland blobs
 TERMFONT_OBJ  := src/gfx/termfont.bin.o
 
-ALL_OBJ := $(KERN_OBJ) $(LIBC_OBJ) $(DGEN_LOC_OBJ) $(DGEN_OBJ) $(EMBED_OBJS) $(USERLAND_OBJS) $(TERMFONT_OBJ)
+ALL_OBJ := $(KERN_OBJ) $(BOOT_OBJ) $(LIBC_OBJ) $(DGEN_LOC_OBJ) $(DGEN_OBJ) $(EMBED_OBJS) $(USERLAND_OBJS) $(TERMFONT_OBJ)
 
 KERNEL := build/samara.elf
 
@@ -211,14 +210,14 @@ src/apps/embed_list.h: $(EMBED_WAVS) Makefile
 
 # objcopy: turn raw .wav into a relocatable ELF blob with _binary_*_start/end
 embed/%.wav.o: embed/%.wav
-	$(OBJCOPY) -I binary -O elf32-i386 -B i386 $< $@
+	$(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 $< $@
 
 # Symbols come out as _binary_userland_busybox_start etc.
 src/gfx/termfont.bin.o: src/gfx/termfont.bin
-	$(OBJCOPY) -I binary -O elf32-i386 -B i386 --rename-section .data=.rodata,alloc,load,readonly,data,contents $< $@
+	$(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 --rename-section .data=.rodata,alloc,load,readonly,data,contents $< $@
 
 userland/%.bin.o: userland/%
-	$(OBJCOPY) -I binary -O elf32-i386 -B i386 --rename-section .data=.rodata,alloc,load,readonly,data,contents $< $@
+	$(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 --rename-section .data=.rodata,alloc,load,readonly,data,contents $< $@
 
 # Font atlases baked by tools/mkfont.py (committed, regenerate on demand)
 src/gfx/uifont.o: src/gfx/uifont_data.h src/gfx/uifont.h
@@ -235,15 +234,18 @@ $(KERN_OBJ): %.o: %.c | build
 
 # libc-shim files: x87 FP allowed (sqrt/atof use it). Kernel includes needed.
 src/libc/%.o: src/libc/%.c | build
-	$(CC) -m32 -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
-	    -nostdlib -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
+	$(CC) -m64 -mcmodel=kernel -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
+	    -nostdlib -mno-red-zone -mno-mmx -fno-asynchronous-unwind-tables \
 	    -O2 -std=gnu11 -fcommon \
 	    -isystem src/libc/include -Isrc \
 	    -Wno-builtin-declaration-mismatch -w \
 	    -c $< -o $@
 
+src/boot/%.o: src/boot/%.S | build
+	$(CC) -m64 -c $< -o $@
+
 src/libc/%.o: src/libc/%.S | build
-	$(CC) -m32 -c $< -o $@
+	$(CC) -m64 -c $< -o $@
 
 # Local DOOM platform layer: permissive, sees DOOM headers
 src/doomgeneric/%.o: src/doomgeneric/%.c | build
@@ -253,8 +255,11 @@ src/doomgeneric/%.o: src/doomgeneric/%.c | build
 $(DGEN_DIR)/%.o: $(DGEN_DIR)/%.c | build
 	$(CC) $(DCFLAGS) -c $< -o $@
 
+# qemu -kernel wants an elf32 multiboot image: the 64 bit one gets its
+# addresses cut down to the low ones (LMA) by objcopy
 $(KERNEL): $(ALL_OBJ) linker.ld | build
-	$(LD) $(LDFLAGS) -o $@ $(ALL_OBJ) $(LIBGCC)
+	$(LD) $(LDFLAGS) -o build/samara64.elf $(ALL_OBJ) $(LIBGCC)
+	$(OBJCOPY) -O elf32-i386 build/samara64.elf $@
 
 # Music directory served as a read-only virtual FAT16 disk on secondary IDE.
 # Drop .wav files in music/ and use `playfat <name>` inside SamaraOS.

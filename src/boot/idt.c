@@ -8,89 +8,83 @@
 struct idt_entry {
     uint16_t off_lo;
     uint16_t selector;
-    uint8_t  zero;
+    uint8_t  ist;
     uint8_t  flags;
-    uint16_t off_hi;
+    uint16_t off_mid;
+    uint32_t off_hi;
+    uint32_t zero;
 } __attribute__((packed));
 
 struct idt_ptr {
     uint16_t limit;
-    uint32_t base;
+    uint64_t base;
 } __attribute__((packed));
 
 static struct idt_entry idt[256];
 static struct idt_ptr   idtp;
+static void (*handlers[256])(regs_t*);
+static regs_t* (*sched_h[256])(regs_t*);
 
-void idt_set_gate(int n, void* handler, uint16_t selector, uint8_t flags) {
-    uint32_t addr = (uint32_t)handler;
-    idt[n].off_lo   = addr & 0xFFFF;
-    idt[n].off_hi   = (addr >> 16) & 0xFFFF;
-    idt[n].selector = selector;
-    idt[n].zero     = 0;
-    idt[n].flags    = flags;
+extern uint8_t isr_stubs[];
+
+static void set_gate(int n, uint64_t addr, uint8_t flags, uint8_t ist) {
+    idt[n].off_lo  = addr & 0xFFFF;
+    idt[n].off_mid = (addr >> 16) & 0xFFFF;
+    idt[n].off_hi  = addr >> 32;
+    idt[n].selector = 0x08;
+    idt[n].ist = ist;
+    idt[n].flags = flags;
+    idt[n].zero = 0;
 }
 
-/* ---- defaults, so no vector is ever left without a gate ----
-   Real hardware can raise IRQs QEMU never does (and a missing gate turns
-   into #GP with an IDT-flagged error code). */
+void idt_set_handler(int vec, void (*fn)(regs_t*)) { handlers[vec] = fn; }
+void idt_set_sched(int vec, regs_t* (*fn)(regs_t*)) { sched_h[vec] = fn; }
+void idt_set_dpl(int vec, int dpl) { idt[vec].flags = 0x8E | (dpl << 5); }
 
+/* IRQs nobody handles: real hardware raises stuff qemu never does */
 static void irq_default(int irq) {
     if (irq == 7 || irq == 15) {                   /* spurious unless in service */
         if (!(pic_isr() & (1u << irq))) {
-            if (irq == 15) outb(PIC1_CMD, PIC_EOI); /* master saw the cascade */
+            if (irq == 15) outb(PIC1_CMD, PIC_EOI);
             return;
         }
     }
-    pic_set_mask((uint8_t)irq);                    /* nobody handles it: silence */
+    pic_set_mask((uint8_t)irq);
     pic_send_eoi((uint8_t)irq);
 }
 
-#define IRQ_STUB(n) \
-    __attribute__((interrupt)) static void irq_stub_##n(struct interrupt_frame* f) { (void)f; irq_default(n); }
-IRQ_STUB(0)  IRQ_STUB(1)  IRQ_STUB(2)  IRQ_STUB(3)  IRQ_STUB(4)  IRQ_STUB(5)  IRQ_STUB(6)  IRQ_STUB(7)
-IRQ_STUB(8)  IRQ_STUB(9)  IRQ_STUB(10) IRQ_STUB(11) IRQ_STUB(12) IRQ_STUB(13) IRQ_STUB(14) IRQ_STUB(15)
-
 static void com_str(const char* s) { while (*s) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, *s++); } }
 
-static void exc_default(int vec, uint32_t err, struct interrupt_frame* f) {
-    if ((f->cs & 3) == 3) proc_fault_kill("CPU exception", 11, f->eip, (uint32_t)vec);
-    char b[16];
+static void exc_default(regs_t* f) {
+    if ((f->cs & 3) == 3) proc_fault_kill("CPU exception", 11, f->rip, f->vec);
+    char b[24];
     com_str("\r\n[EXC] vector ");
-    itoa(vec, b, 10); com_str(b);
-    com_str(" err="); utoa(err, b, 16); com_str(b);
-    com_str(" eip="); utoa(f->eip, b, 16); com_str(b);
+    itoa((int)f->vec, b, 10); com_str(b);
+    com_str(" err="); utoa(f->err, b, 16); com_str(b);
+    com_str(" rip="); utoa(f->rip, b, 16); com_str(b);
     com_str("\r\n");
-    vga_printf("\n[EXC %d] err=0x%x eip=0x%x -- halted\n", vec, err, f->eip);
+    vga_printf("\n[EXC %d] err=0x%lx rip=0x%lx -- halted\n", (int)f->vec, f->err, f->rip);
     __asm__ volatile ("cli");
     for (;;) __asm__ volatile ("hlt");
 }
 
-#define EXC_STUB(n) \
-    __attribute__((interrupt)) static void exc_stub_##n(struct interrupt_frame* f) { exc_default(n, 0, f); }
-#define EXC_STUB_ERR(n) \
-    __attribute__((interrupt)) static void exc_stub_##n(struct interrupt_frame* f, uint32_t e) { exc_default(n, e, f); }
-EXC_STUB(0) EXC_STUB(1) EXC_STUB(2) EXC_STUB(3) EXC_STUB(4) EXC_STUB(5) EXC_STUB(6) EXC_STUB(7)
-EXC_STUB_ERR(8) EXC_STUB(9) EXC_STUB_ERR(10) EXC_STUB_ERR(11) EXC_STUB_ERR(12) EXC_STUB_ERR(13)
-EXC_STUB_ERR(14) EXC_STUB(15) EXC_STUB(16) EXC_STUB_ERR(17) EXC_STUB(18) EXC_STUB(19) EXC_STUB(20)
-EXC_STUB_ERR(21) EXC_STUB(22) EXC_STUB(23) EXC_STUB(24) EXC_STUB(25) EXC_STUB(26) EXC_STUB(27)
-EXC_STUB(28) EXC_STUB_ERR(29) EXC_STUB_ERR(30) EXC_STUB(31)
+int last_vec;
+regs_t* isr_dispatch(regs_t* r) {
+    int v = (int)r->vec;
+    if (v != 14) last_vec = v;
+    if (sched_h[v]) return sched_h[v](r);
+    if (handlers[v]) handlers[v](r);
+    else if (v >= 0x20 && v < 0x30) irq_default(v - 0x20);
+    else if (v < 32) exc_default(r);
+    return r;
+}
 
 void idt_init(void) {
     memset(idt, 0, sizeof(idt));
+    for (int i = 0; i < 256; i++) set_gate(i, (uint64_t)isr_stubs + i * 16, 0x8E, 0);
+    idt[8].ist = 1;                                /* #DF */
+    idt[2].ist = 2;                                /* NMI */
     idtp.limit = sizeof(idt) - 1;
-    idtp.base  = (uint32_t)&idt;
-
-    void* exc[32] = {
-        exc_stub_0, exc_stub_1, exc_stub_2, exc_stub_3, exc_stub_4, exc_stub_5, exc_stub_6, exc_stub_7,
-        exc_stub_8, exc_stub_9, exc_stub_10, exc_stub_11, exc_stub_12, exc_stub_13, exc_stub_14, exc_stub_15,
-        exc_stub_16, exc_stub_17, exc_stub_18, exc_stub_19, exc_stub_20, exc_stub_21, exc_stub_22, exc_stub_23,
-        exc_stub_24, exc_stub_25, exc_stub_26, exc_stub_27, exc_stub_28, exc_stub_29, exc_stub_30, exc_stub_31,
-    };
-    void* irq[16] = {
-        irq_stub_0, irq_stub_1, irq_stub_2, irq_stub_3, irq_stub_4, irq_stub_5, irq_stub_6, irq_stub_7,
-        irq_stub_8, irq_stub_9, irq_stub_10, irq_stub_11, irq_stub_12, irq_stub_13, irq_stub_14, irq_stub_15,
-    };
-    for (int i = 0; i < 32; i++) idt_set_gate(i, exc[i], 0x08, 0x8E);
-    for (int i = 0; i < 16; i++) idt_set_gate(0x20 + i, irq[i], 0x08, 0x8E);
+    idtp.base  = (uint64_t)&idt;
     __asm__ volatile ("lidt (%0)" : : "r"(&idtp));
 }

@@ -7,17 +7,12 @@
 #include "proc/proc.h"
 #include "core/task.h"
 
-/* Single page directory, 4 MiB PSE pages, identity map of the full 4 GiB.
-   Forced into .data (not .bss) via an explicit non-zero initializer so it
-   lands far below the boot stack. A stack overflow would have to scribble
-   over megabytes of .bss + .data first before it could corrupt this. */
-__attribute__((aligned(4096)))
-static uint32_t pdir[1024] = { 0xDEADBEEFu, /* rest zero-init */ };
+/* boot.S built these: identity + direct map + kernel image over the first 4 GiB */
+extern uint64_t boot_pml4[], boot_pdpt_a[], boot_pd[];
 
-/* PDE flags for a 4 MiB page: Present | RW | PageSize. */
-#define PDE_P   0x001u
-#define PDE_RW  0x002u
-#define PDE_PS  0x080u
+/* page directories for RAM above 4 GiB, 2 MiB pages (up to 64 GiB) */
+#define HI_PDS 60
+__attribute__((aligned(4096))) static uint64_t hi_pd[HI_PDS][512];
 
 /* ---------- COM1 direct (no libc dependency, safe in IRQ ctx) ---------- */
 static void com_putc(char c) {
@@ -25,24 +20,23 @@ static void com_putc(char c) {
     outb(0x3F8, c);
 }
 static void com_str(const char* s) { while (*s) com_putc(*s++); }
-static void com_hex(uint32_t v) {
+static void com_hex(uint64_t v) {
     com_str("0x");
     const char* h = "0123456789abcdef";
-    for (int i = 7; i >= 0; i--) com_putc(h[(v >> (i*4)) & 0xF]);
+    for (int i = 15; i >= 0; i--) com_putc(h[(v >> (i*4)) & 0xF]);
 }
 
-/* Format a hex value into a small buffer (8 chars, no 0x prefix) */
-static void hex8(char* out, uint32_t v) {
+static void hex16(char* out, uint64_t v) {
     const char* h = "0123456789abcdef";
-    for (int i = 7; i >= 0; i--) out[7-i] = h[(v >> (i*4)) & 0xF];
-    out[8] = 0;
+    for (int i = 15; i >= 0; i--) out[15-i] = h[(v >> (i*4)) & 0xF];
+    out[16] = 0;
 }
 
 /* Draw a panic banner on the framebuffer so the user sees the dump even when
    serial is not being watched. Safe from interrupt context: writes go to the
    front buffer directly, no allocation, no libc. */
-static void fb_panic_banner(const char* exc, uint32_t err, uint32_t eip,
-                            uint32_t cs, uint32_t cr2) {
+static void fb_panic_banner(const char* exc, uint64_t err, uint64_t eip,
+                            uint64_t cs, uint64_t cr2) {
     if (!gfx_ready()) return;
     gfx_target_front();
     int W = gfx_w();
@@ -57,31 +51,31 @@ static void fb_panic_banner(const char* exc, uint32_t err, uint32_t eip,
     buf[p] = 0;
     gfx_string(10, 10, buf, RGB(0xFF,0xFF,0xFF), RGB(0x80,0x10,0x10), true);
 
-    char hex[9];
-    hex8(hex, eip);
-    char line[64];
+    char hex[17];
+    hex16(hex, eip);
+    char line[80];
     int q = 0;
-    const char* l1 = "EIP=0x";
+    const char* l1 = "RIP=0x";
     while (l1[q]) { line[q] = l1[q]; q++; }
-    for (int i = 0; i < 8; i++) line[q++] = hex[i];
+    for (int i = 0; i < 16; i++) line[q++] = hex[i];
     line[q++] = ' ';
     const char* l2 = "CS=0x";
     int k = 0; while (l2[k]) line[q++] = l2[k++];
-    hex8(hex, cs);
-    for (int i = 4; i < 8; i++) line[q++] = hex[i];  /* CS is 16-bit, show last 4 */
+    hex16(hex, cs);
+    for (int i = 12; i < 16; i++) line[q++] = hex[i];
     line[q++] = ' ';
     const char* l3 = "ERR=0x";
     k = 0; while (l3[k]) line[q++] = l3[k++];
-    hex8(hex, err);
-    for (int i = 0; i < 8; i++) line[q++] = hex[i];
+    hex16(hex, err);
+    for (int i = 8; i < 16; i++) line[q++] = hex[i];
     line[q] = 0;
     gfx_string(10, 36, line, RGB(0xFF,0xFF,0xFF), RGB(0x80,0x10,0x10), true);
 
     q = 0;
     const char* l4 = "CR2=0x";
     while (l4[q]) { line[q] = l4[q]; q++; }
-    hex8(hex, cr2);
-    for (int i = 0; i < 8; i++) line[q++] = hex[i];
+    hex16(hex, cr2);
+    for (int i = 0; i < 16; i++) line[q++] = hex[i];
     line[q] = 0;
     gfx_string(10, 62, line, RGB(0xFF,0xFF,0xFF), RGB(0x80,0x10,0x10), true);
 
@@ -89,41 +83,24 @@ static void fb_panic_banner(const char* exc, uint32_t err, uint32_t eip,
                RGB(0xFF,0xC0,0xC0), RGB(0x80,0x10,0x10), true);
 }
 
-static void dump(const char* tag, uint32_t err, uint32_t eip,
-                 uint32_t cs, uint32_t cr2) {
+static void dump(const char* tag, uint64_t err, uint64_t rip,
+                 uint64_t cs, uint64_t cr2) {
     com_str("\r\n[#"); com_str(tag); com_str("] ");
-    com_str("eip="); com_hex(eip);
+    com_str("rip="); com_hex(rip);
     com_str(" cs=");  com_hex(cs);
     com_str(" err="); com_hex(err);
     com_str(" cr2="); com_hex(cr2);
     com_str("\r\n");
 
-    /* Also try the text-mode VGA in case we ever run there. Harmless in gfx. */
-    vga_printf("\n[#%s] eip=0x%x err=0x%x cr2=0x%x\n", tag, eip, err, cr2);
+    vga_printf("\n[#%s] rip=0x%lx err=0x%lx cr2=0x%lx\n", tag, rip, err, cr2);
 
-    fb_panic_banner(tag, err, eip, cs, cr2);
+    fb_panic_banner(tag, err, rip, cs, cr2);
 }
 
-/* #PF #GP #UD #DE come in through stubs that save every register (regs_t),
-   so a ring 3 fault can become a signal with a full context the handler may
-   edit - java needs that. the error code is popped into fault_errcode first,
-   so the frame looks like the int 0x80 one */
-uint32_t fault_errcode;
-void fault_c(regs_t* r, uint32_t vec);
-
-#define FAULT_BODY(vec)                                                 \
-        "pusha\n push %ds\n push %es\n push %fs\n push %gs\n"         \
-        "mov $0x10, %ax\n mov %ax, %ds\n mov %ax, %es\n"               \
-        "mov %esp, %eax\n push $" #vec "\n push %eax\n"               \
-        "call fault_c\n add $8, %esp\n"                                \
-        "pop %gs\n pop %fs\n pop %es\n pop %ds\n popa\n iret\n"
-#define FAULT_STUB_ERR(name, vec) __attribute__((naked)) static void name(void) { __asm__ volatile ( \
-        "push %eax\n mov 4(%esp), %eax\n mov %eax, fault_errcode\n pop %eax\n add $4, %esp\n" FAULT_BODY(vec)); }
-#define FAULT_STUB(name, vec) __attribute__((naked)) static void name(void) { __asm__ volatile ( \
-        "movl $0, fault_errcode\n" FAULT_BODY(vec)); }
-
-void fault_c(regs_t* r, uint32_t vec) {
-    uint32_t err = fault_errcode, cr2 = 0;
+/* #PF #GP #UD #DE #DF come here with a full frame, so a ring 3 fault can
+   become a signal with a context the handler may edit - java needs that */
+static void fault_c(regs_t* r) {
+    uint64_t vec = r->vec, err = r->err, cr2 = 0;
     if (vec == 14) {
         __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
         /* Lazily grown user stack (also hit by the kernel copying into it). */
@@ -134,57 +111,41 @@ void fault_c(regs_t* r, uint32_t vec) {
         if (proc_fault_signal(r, sig, vec, err, cr2)) return;      /* the handler runs on iret */
         const char* what = vec == 14 ? "Segmentation fault" : vec == 13 ? "General protection fault"
                          : vec == 6 ? "Illegal instruction" : "Floating point exception";
-        if (vec == 14) proc_fault_stack(r->useresp);
-        proc_fault_kill(what, sig, r->eip, vec == 14 ? cr2 : err);
+        if (vec == 14) proc_fault_stack(r->rsp);
+        proc_fault_kill(what, sig, r->rip, vec == 14 ? cr2 : err);
     }
     /* kernel tripped over a bad pointer from a syscall: kill the process,
        not the whole box. TODO proper copy_from_user + EFAULT */
     if (vec == 14 && cr2 >= USER_BASE && cr2 < USER_TOP && proc_current())
-        proc_fault_kill("bad user ptr", 11, r->eip, cr2);
-    dump(vec == 14 ? "PF" : vec == 13 ? "GP" : vec == 6 ? "UD" : "DE", err, r->eip, r->cs, cr2);
-    __asm__ volatile ("cli");
-    for (;;) __asm__ volatile ("hlt");
-}
-
-__attribute__((interrupt))
-static void df_isr(struct interrupt_frame* f, uint32_t err) {
-    dump("DF", err, f->eip, f->cs, 0);
-    __asm__ volatile ("cli");
-    for (;;) __asm__ volatile ("hlt");
-}
-
-FAULT_STUB_ERR(pf_stub, 14)
-FAULT_STUB_ERR(gp_stub, 13)
-FAULT_STUB(ud_stub, 6)
-FAULT_STUB(de_stub, 0)
-
-void paging_init(void) {
-    for (uint32_t i = 0; i < 1024; i++) {
-        uint32_t phys = i << 22;                 /* 4 MiB stride */
-        pdir[i] = phys | PDE_P | PDE_RW | PDE_PS;
+        proc_fault_kill("bad user ptr", 11, r->rip, cr2);
+    {   // poor man's backtrace
+        uint64_t* sp = (uint64_t*)r->rsp;
+        extern int last_vec; com_str("last="); com_hex(last_vec); com_str("rsp="); com_hex(r->rsp); com_str(" stk:");
+        for (int i = -60; i < 400; i++) if (sp[i] >= 0xffffffff80100000ul && sp[i] < 0xffffffff801b5000ul) { com_str(" "); com_hex(i); com_str(":"); com_hex(sp[i]); }
+        com_str("\r\n");
     }
-    /* Direct map of physical RAM at DMAP_BASE (see core/vmm.h). */
-    for (uint32_t i = 0; i < (DMAP_SIZE >> 22); i++)
-        pdir[(DMAP_BASE >> 22) + i] = (i << 22) | PDE_P | PDE_RW | PDE_PS;
-
-    idt_set_gate(0,  de_stub, 0x08, 0x8E);       /* #DE Divide Error */
-    idt_set_gate(6,  ud_stub, 0x08, 0x8E);       /* #UD Invalid Opcode */
-    idt_set_gate(8,  df_isr, 0x08, 0x8E);        /* #DF Double Fault */
-    idt_set_gate(13, gp_stub, 0x08, 0x8E);       /* #GP General Protection */
-    idt_set_gate(14, pf_stub, 0x08, 0x8E);       /* #PF Page Fault */
-
-    __asm__ volatile (
-        "mov %0, %%cr3\n\t"
-        "mov %%cr4, %%eax\n\t"
-        "or  $0x00000010, %%eax\n\t"             /* CR4.PSE */
-        "mov %%eax, %%cr4\n\t"
-        "mov %%cr0, %%eax\n\t"
-        "or  $0x80010000, %%eax\n\t"             /* CR0.PG | CR0.WP */
-        "mov %%eax, %%cr0\n\t"
-        : : "r"(pdir) : "eax", "memory"
-    );
+    dump(vec == 14 ? "PF" : vec == 13 ? "GP" : vec == 6 ? "UD" : vec == 8 ? "DF" : "DE", err, r->rip, r->cs, cr2);
+    __asm__ volatile ("cli");
+    for (;;) __asm__ volatile ("hlt");
 }
 
-uint32_t paging_cr0(void) { uint32_t r; __asm__ volatile ("mov %%cr0, %0":"=r"(r)); return r; }
-uint32_t paging_cr3(void) { uint32_t r; __asm__ volatile ("mov %%cr3, %0":"=r"(r)); return r; }
-uint32_t paging_cr4(void) { uint32_t r; __asm__ volatile ("mov %%cr4, %0":"=r"(r)); return r; }
+void paging_init(uint64_t ram_top) {
+    /* the boot tables stay the kernel's. drop the identity map, and map RAM past 4 GiB too */
+    boot_pml4[0] = 0;
+    uint64_t top = ram_top > 0x1000000000ull ? 0x1000000000ull : ram_top;
+    for (uint64_t g = 4; g * 0x40000000ull < top && g - 4 < HI_PDS; g++) {
+        for (int i = 0; i < 512; i++) hi_pd[g - 4][i] = (g << 30) | ((uint64_t)i << 21) | 0x83;
+        boot_pdpt_a[g] = V2P(hi_pd[g - 4]) | 3;
+    }
+    __asm__ volatile ("mov %0, %%cr3" : : "r"(V2P(boot_pml4)) : "memory");
+
+    idt_set_handler(0, fault_c);
+    idt_set_handler(6, fault_c);
+    idt_set_handler(8, fault_c);
+    idt_set_handler(13, fault_c);
+    idt_set_handler(14, fault_c);
+}
+
+uint64_t paging_cr0(void) { uint64_t r; __asm__ volatile ("mov %%cr0, %0":"=r"(r)); return r; }
+uint64_t paging_cr3(void) { uint64_t r; __asm__ volatile ("mov %%cr3, %0":"=r"(r)); return r; }
+uint64_t paging_cr4(void) { uint64_t r; __asm__ volatile ("mov %%cr4, %0":"=r"(r)); return r; }

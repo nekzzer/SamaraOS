@@ -4,18 +4,21 @@
 
 void gdt_init(void);
 
-/* Update the ring0 stack pointer that the CPU will load on a ring3->ring0
-   transition. Call when the active kernel stack changes (e.g. task switch). */
-void tss_set_esp0(uint32_t esp0);
+/* ring0 stack for the next ring3 -> ring0 transition (tss.rsp0 and the
+   per-cpu slot syscall_entry loads) */
+void tss_set_rsp0(uint64_t rsp0);
 
 #define GDT_KCODE 0x08
 #define GDT_KDATA 0x10
-#define GDT_UCODE 0x1B          /* index 3, RPL 3 */
-#define GDT_UDATA 0x23          /* index 4, RPL 3 */
-#define GDT_TLS_INDEX 6
-#define GDT_UTLS  0x33          /* index 6, RPL 3 */
+#define GDT_UDATA 0x23
+#define GDT_UCODE 0x2B
 
-/* Rewrite the user TLS descriptor (base of %gs for the running process). */
-void gdt_set_tls(uint32_t base);
+/* per-cpu block, GS base in kernel mode. syscall_entry knows the offsets */
+struct cpu {
+    uint64_t kstack;       /* 0 */
+    uint64_t user_rsp;     /* 8 */
+    int      id;
+};
+extern struct cpu cpu0;
 
 #endif

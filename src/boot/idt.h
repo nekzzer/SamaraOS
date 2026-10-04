@@ -1,12 +1,14 @@
 #ifndef SAMARA_IDT_H
 #define SAMARA_IDT_H
 #include "core/types.h"
-
-struct interrupt_frame {
-    uint32_t eip, cs, eflags, esp, ss;
-};
+#include "core/task.h"
 
 void idt_init(void);
-void idt_set_gate(int n, void* handler, uint16_t selector, uint8_t flags);
+/* plain handler: runs with the frame, returns to the interrupted code */
+void idt_set_handler(int vec, void (*fn)(regs_t*));
+/* handler that may switch tasks: returns the frame to resume */
+void idt_set_sched(int vec, regs_t* (*fn)(regs_t*));
+/* dpl 3 lets ring 3 use `int n` */
+void idt_set_dpl(int vec, int dpl);
 
 #endif

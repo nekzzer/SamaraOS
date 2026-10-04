@@ -12,13 +12,13 @@ static void com_putc_local(char c) {
     outb(0x3F8, c);
 }
 static void com_str_local(const char* s) { while (*s) com_putc_local(*s++); }
-static void com_hex_local(uint32_t v) {
+static void com_hex_local(uint64_t v) {
     com_str_local("0x");
     const char* h = "0123456789abcdef";
-    for (int i = 7; i >= 0; i--) com_putc_local(h[(v >> (i*4)) & 0xF]);
+    for (int i = 15; i >= 0; i--) com_putc_local(h[(v >> (i*4)) & 0xF]);
 }
 
-void pit_check_stack_guard(uint32_t cur_esp) {
+void pit_check_stack_guard(uint64_t cur_esp) {
     if (!boot_stack_sentinel) return;
     if (*boot_stack_sentinel == BOOT_STACK_GUARD) return;
     /* Sentinel clobbered — stack overflow has happened or is about to. */

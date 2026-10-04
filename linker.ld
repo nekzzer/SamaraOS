@@ -1,41 +1,55 @@
 ENTRY(_start)
 
+KOFF = 0xffffffff80000000;
+
 SECTIONS
 {
     . = 1M;
 
-    .multiboot ALIGN(4) :
+    /* 32 bit boot stub: linked at its physical address */
+    .boot :
     {
         KEEP(*(.multiboot))
+        *(.boot.text)
+        *(.boot.data)
     }
 
-    .text ALIGN(4K) :
+    . = ALIGN(4K) + KOFF;
+
+    .text : AT(ADDR(.text) - KOFF)
     {
         *(.text.start)
         *(.text*)
     }
 
-    .rodata ALIGN(4K) :
+    . = ALIGN(4K);
+    .rodata : AT(ADDR(.rodata) - KOFF)
     {
         *(.rodata*)
     }
 
-    .data ALIGN(4K) :
+    . = ALIGN(4K);
+    .data : AT(ADDR(.data) - KOFF)
     {
         *(.data*)
     }
 
-    .bss ALIGN(4K) :
+    . = ALIGN(4K);
+    .bss : AT(ADDR(.bss) - KOFF)
     {
         *(COMMON)
         *(.bss*)
     }
 
-    /* Heap base = first 4 MiB boundary past the end of .bss. The kernel image
-       grew when boot_stack was bumped to 4 MiB; previously the heap was a
-       hard-coded 0x400000 which now collides with boot_stack. */
+    /* kernel heap starts at the first 4 MiB boundary past .bss */
     . = ALIGN(4M);
     _heap_start = .;
+
+    boot_pml4_phys = boot_pml4 - KOFF;
+    boot_pdpt_a_phys = boot_pdpt_a - KOFF;
+    boot_pdpt_k_phys = boot_pdpt_k - KOFF;
+    boot_pd_phys = boot_pd - KOFF;
+    boot_stack_phys = boot_stack - KOFF;
 
     /DISCARD/ :
     {

@@ -2,13 +2,13 @@
 #define SAMARA_PAGING_H
 #include "core/types.h"
 
-/* Identity-maps the whole 4 GiB address space with 4 MiB PSE pages and
-   turns paging on. Must be called after IDT is in place so #PF can fire. */
-void paging_init(void);
+/* Boot tables (boot.S) already map the first 4 GiB; this drops the identity
+   map, extends the direct map over RAM above 4 GiB and installs the fault
+   handlers. Needs the IDT. */
+void paging_init(uint64_t ram_top);
 
-/* Diagnostics. */
-uint32_t paging_cr0(void);
-uint32_t paging_cr3(void);
-uint32_t paging_cr4(void);
+uint64_t paging_cr0(void);
+uint64_t paging_cr3(void);
+uint64_t paging_cr4(void);
 
 #endif
