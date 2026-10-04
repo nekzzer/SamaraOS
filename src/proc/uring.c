@@ -513,6 +513,10 @@ static int req_exec(req_t* q) {
                 r->files[i] = NULL;
                 return 0;
             }
+            {
+                file_t* cf = sys_getf(s->fd);
+                if (cf && cf->type == F_URING && cf->ur == r) return -EBADF;      // closing our own ring would wait for us forever
+            }
             return sys_close(s->fd);
         case IORING_OP_ASYNC_CANCEL: return do_cancel(q, s->addr, s->cancel_flags, s->fd);
         case IORING_OP_POLL_REMOVE: {
