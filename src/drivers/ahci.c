@@ -167,11 +167,12 @@ static int issue(ahci_disk_t* d, uint8_t cmd, uint64_t lba, uint16_t count,
 
     px_w(p, PX_IS, 0xFFFFFFFFu);
     px_w(p, PX_CI, 1);
-    for (uint32_t i = 0; i < 20000000; i++) {
+    /* no give-up count: slot 0 still in flight + the next command rewriting
+       its table = data at the wrong lba (same bug as virtio-blk had) */
+    for (;;) {
         if (!(px_r(p, PX_CI) & 1)) break;
         if (px_r(p, PX_IS) & IS_TFES) return -1;
     }
-    if (px_r(p, PX_CI) & 1) return -1;
     if ((px_r(p, PX_IS) & IS_TFES) || (px_r(p, PX_TFD) & TFD_ERR)) return -1;
     return 0;
 }

@@ -175,12 +175,16 @@ static int vblk_rw(int i, uint32_t lba, int count, void* buf, bool wr) {
         q->desc[d1].next = (uint16_t)d2;
         vq_set(q, d2, (void*)&vb[i].st, 1, true, false);
         vq_push(q, h);
+        /* wait as long as it takes. there was a 50M spin limit: under load
+           (gtk qemu, 512k reads) a request outlived it, we called it an error,
+           leaked its descriptors and reused the shared header for the next
+           one - the device then put the old request's data at the new
+           request's sector. that's what kept smashing the root disk */
         int got;
-        for (int spin = 0; (got = vq_pop(q, NULL)) < 0; spin++)
-            if (spin > 50000000) break;
-        if (got >= 0) vq_free(q, got);
+        while ((got = vq_pop(q, NULL)) < 0) __asm__ volatile ("pause");
+        vq_free(q, got);
         irq_restore(f);
-        if (got < 0 || vb[i].st != 0) return -1;
+        if (vb[i].st != 0) return -1;
         p += chunk * 512; lba += (uint32_t)chunk; count -= chunk;
     }
     return 0;
