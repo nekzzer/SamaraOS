@@ -415,9 +415,11 @@ static int do_sock(req_t* q, int call) {
 static int to_fixed(uring_t* r, int fd, uint32_t idx) {
     if (fd < 0) return fd;
     if (!r->files) { sys_close(fd); return -EBADF; }
+    int ret = 0;
     if (idx == ~0u) {
         idx = 0;
         while (idx < r->nfiles && r->files[idx]) idx++;
+        ret = idx;
     } else idx--;
     if (idx >= r->nfiles) { sys_close(fd); return -EBADF; }
     file_t* f = sys_getf(fd);
@@ -425,7 +427,7 @@ static int to_fixed(uring_t* r, int fd, uint32_t idx) {
     sys_close(fd);
     file_close(r->files[idx]);
     r->files[idx] = f;
-    return 0;
+    return ret;
 }
 
 static req_t* find_ud(uring_t* r, uint64_t ud, int op_only) {
@@ -500,6 +502,7 @@ static int req_exec(req_t* q) {
             return do_sock(q, 18);
         case IORING_OP_CONNECT: return do_sock(q, 3);
         case IORING_OP_OPENAT: {
+            if (s->file_index && (s->open_flags & 02000000)) return -EINVAL;     // cloexec makes no sense for a direct descriptor
             int fd = sys_openat(s->fd, (const char*)(uintptr_t)s->addr, s->open_flags, s->len);
             return s->file_index ? to_fixed(r, fd, s->file_index) : fd;
         }
@@ -508,7 +511,10 @@ static int req_exec(req_t* q) {
         case IORING_OP_CLOSE:
             if (s->file_index) {
                 uint32_t i = s->file_index - 1;
-                if (i >= r->nfiles || !r->files[i]) return -EBADF;
+                if (s->fd) return -EINVAL;
+                if (!r->files) return -ENXIO;
+                if (i >= r->nfiles) return -EINVAL;
+                if (!r->files[i]) return -EBADF;
                 file_close(r->files[i]);
                 r->files[i] = NULL;
                 return 0;
@@ -618,6 +624,14 @@ static void run(req_t* q) {
         if (old != p) { t->proc = p; task_set_cr3(p->pd); }
         res = req_exec(q);
         if (old != p) { t->proc = old; task_set_cr3(old ? old->pd : 0); }
+    }
+    if (!q->pre && q->sqe.opcode == IORING_OP_ACCEPT && (q->sqe.ioprio & 1) && res >= 0) {
+        uint32_t fl = irq_save();               // multishot accept: report it and wait for the next one
+        cq_post(r, q->sqe.user_data, res, IORING_CQE_F_MORE);
+        q->st = R_WAIT;
+        irq_restore(fl);
+        r->running--;
+        return;
     }
     req_done(q, res);
     r->running--;
