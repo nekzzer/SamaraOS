@@ -31,11 +31,11 @@
 #define TCP_PSH 0x08
 #define TCP_ACK 0x10
 
-#define MAX_SOCKS  64
+#define MAX_SOCKS  256
 #define RX_CAP     (64u * 1024u)
 #define TX_CAP     (64u * 1024u)
 #define MSS        1400
-#define ACCEPT_MAX 16
+#define ACCEPT_MAX 64
 #define UDP_QMAX   32
 
 enum { S_CLOSED, S_LISTEN, S_SYN_SENT, S_SYN_RCVD, S_ESTABLISHED, S_FIN_WAIT1,

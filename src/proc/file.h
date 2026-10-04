@@ -11,7 +11,8 @@ typedef enum { F_NODE = 1, F_TTY, F_PIPE_R, F_PIPE_W, F_NULL, F_ZERO, F_RANDOM, 
                F_NETLINK,                          /* AF_NETLINK, the answer waits in pipe */
                F_USOCK, F_ULISTEN,                 /* AF_UNIX not connected yet / listening (ux) */
                F_EPOLL,
-               F_EVENTFD, F_TIMERFD, F_DRM } ftype_t;
+               F_EVENTFD, F_TIMERFD, F_DRM,
+               F_URING } ftype_t;
 
 #define PIPE_SZ 65536           /* was 8k, x11 images through a socketpair crawled */
 
@@ -21,6 +22,7 @@ typedef struct pipe {
     int  readers, writers;
     struct file* fds[8];    /* SCM_RIGHTS in flight (unix sockets) */
     int  nfds;
+    uint32_t wgen;          /* bumped on every write, io_uring multishot poll looks at it */
 } pipe_t;
 
 typedef struct file {
@@ -38,11 +40,13 @@ typedef struct file {
     int        pty;         /* F_PTM / F_PTS: pair index */
     struct ux* ux;          /* F_USOCK / F_ULISTEN */
     struct ep* ep;          /* F_EPOLL */
+    struct uring* ur;       /* F_URING */
     uint64_t   cnt;         /* F_EVENTFD counter */
     uint32_t   t_next, t_int;   /* F_TIMERFD: uptime ms of the next expiry (0 = off), interval */
 } file_t;
 
 file_t* file_new(ftype_t type, int flags);
+uint32_t file_gen(file_t* f);
 file_t* file_open_node(fs_node_t* n, int flags);   /* handles device nodes */
 void    file_ref(file_t* f);
 void    file_close(file_t* f);

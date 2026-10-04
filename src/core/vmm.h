@@ -40,6 +40,7 @@ static inline bool dma_ok(const void* v) {
 void     pmm_init(uint64_t top);
 void     pmm_add(uint64_t start, uint64_t end);
 uint64_t pmm_alloc(void);             /* zeroed frame, 0 when exhausted */
+uint64_t pmm_alloc_run(uint64_t n);   /* contiguous, zeroed, 0 when there is no such run */
 void     pmm_ref(uint64_t frame);
 void     pmm_unref(uint64_t frame);
 uint64_t pmm_free_frames(void);

@@ -25,6 +25,7 @@
 #include "fs/ext2.h"
 #include "net/net.h"
 #include "drivers/drm.h"
+#include "proc/uring.h"
 
 #define EPERM 1
 #define ENOENT 2
@@ -884,7 +885,7 @@ static int64_t do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd,
     if (!(flags & MAP_ANON)) {
         f = getf(fd);
         if (!f) return -EBADF;
-        if (f->type != F_NODE && f->type != F_ZERO && f->type != F_FB && f->type != F_DRM) return -EACCES;
+        if (f->type != F_NODE && f->type != F_ZERO && f->type != F_FB && f->type != F_DRM && f->type != F_URING) return -EACCES;
     }
     uint64_t lo = USER_MMAP_BASE, hi = USER_STACK_TOP - USER_STACK_MAX;
     if (flags & MAP_FIXED) {
@@ -897,6 +898,12 @@ static int64_t do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd,
     } else {
         addr = vmm_find_free(p->pd, lo, hi, len);
         if (!addr) return -ENOMEM;
+    }
+    if (f && f->type == F_URING) {
+        int ur = uring_mmap(f->ur, p->pd, addr, len, off);
+        if (ur < 0) return ur;
+        vmm_flush();
+        return (int64_t)addr;
     }
     if (f && f->type == F_NODE && (flags & MAP_SHARED) && is_shm(f->node)) {
         uint64_t first = off / PAGE_SIZE, np = len / PAGE_SIZE;
@@ -2538,6 +2545,9 @@ static int64_t dispatch(regs_t* r) {
         case 48:  return sys_socket_call(13, a, b, 0, 0, 0, 0);       /* shutdown */
         case 40:  return -EINVAL;                                    /* sendfile: use read/write */
         case 101: case 103: return -EPERM;
+        case 425: return uring_setup(a, (void*)b);
+        case 426: return uring_enter((int)a, b, c, d, (const void*)e, f6);
+        case 427: return uring_register((int)a, b, (void*)c, d);
     }
     klog("[sys] pid ");
     klog_num(p->pid);
@@ -2545,6 +2555,61 @@ static int64_t dispatch(regs_t* r) {
     klog_num((int64_t)r->rax);
     klog("\r\n");
     return -ENOSYS;
+}
+
+/* for uring.c: the same things the syscalls do, for the current (maybe borrowed) process */
+file_t* sys_getf(int fd) { return getf(fd); }
+bool sys_uok(const void* p, uint32_t len) { return uok(p, len); }
+int sys_openat(int dirfd, const char* path, int flags, int mode) { return do_open(dirfd, path, flags, mode); }
+int sys_sock(int call, int fd, size_t b, size_t c, size_t d, size_t e, size_t f) {
+    return sys_socket_call(call, (uint32_t)fd, b, c, d, e, f);
+}
+int16_t sys_revents(file_t* f, int16_t want) { return fd_revents(f, want); }
+
+int sys_close(int fd) {
+    file_t* fl = getf(fd);
+    if (!fl) return -EBADF;
+    me()->sh->fds[fd] = NULL;
+    file_close(fl);
+    return 0;
+}
+
+// for fixed files and sockets: the socket code wants an fd number
+int sys_tmpfd(file_t* f) {
+    file_ref(f);
+    int fd = install_fd(f, 0, false);
+    return fd;
+}
+
+void sys_untmpfd(int fd) { sys_close(fd); }
+
+int sys_statx(int dirfd, const char* path, int flags, uint32_t mask, void* out) {
+    kstat64_t st;
+    if (!uok(path, 1) || !uok(out, 256)) return -EFAULT;
+    if (!path[0] && (flags & 0x1000)) {
+        file_t* fl = getf(dirfd);
+        if (!fl) return -EBADF;
+        fill_stat_file(&st, fl);
+    } else {
+        int err;
+        fs_node_t* n = lookup_peek(dirfd, path, &err, !(flags & 0x100));
+        if (!n) return err;
+        fill_stat_node(&st, n);
+    }
+    uint8_t* o = out;
+    memset(o, 0, 256);
+    uint32_t* w = (uint32_t*)o;
+    w[0] = 0x7FF;                                    /* basic stats */
+    w[1] = st.st_blksize;
+    w[4] = st.st_nlink; w[5] = st.st_uid; w[6] = st.st_gid;
+    *(uint16_t*)(o + 28) = (uint16_t)st.st_mode;
+    memcpy(o + 32, &st.st_ino, 8);
+    memcpy(o + 40, &st.st_size, 8);
+    memcpy(o + 48, &st.st_blocks, 8);
+    w[16] = st.st_atime; w[24] = st.st_ctime; w[28] = st.st_mtime;
+    w[32] = (uint32_t)(st.st_rdev >> 8) & 0xFFF; w[33] = (uint32_t)st.st_rdev & 0xFF;
+    w[34] = (uint32_t)(st.st_dev >> 8) & 0xFFF; w[35] = (uint32_t)st.st_dev & 0xFF;
+    return 0;
 }
 
 /* ext2 sync vs syscalls that change files. the sync walks the tree and

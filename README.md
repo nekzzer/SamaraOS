@@ -25,7 +25,7 @@ xsamara        # X11 + Mesa, once the X packages are in (see "X11")
 * graphical desktop with a compositing window manager at 60 FPS
 * ~210 Linux system calls: `fork`, `execve`, `clone` threads, `futex`,
   signals, pipes, unix and inet sockets (with fd passing), ptys, netlink,
-  `epoll`, `eventfd`, `timerfd`, `memfd`, SysV shm
+  `epoll`, `io_uring`, `eventfd`, `timerfd`, `memfd`, SysV shm
 * dynamic linking (`ld-musl`), PIE and static PIE binaries
 * own TCP/IP stack with DHCP, several network cards (RTL8139, Intel e1000,
   virtio-net), SSH and telnet servers

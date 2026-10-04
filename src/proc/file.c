@@ -1,6 +1,7 @@
 #include "proc/file.h"
 #include "proc/pty.h"
 #include "proc/proc.h"
+#include "proc/uring.h"
 #include "proc/tty.h"
 #include "proc/proc.h"
 #include "core/heap.h"
@@ -109,6 +110,7 @@ void file_close(file_t* f) {
     if (f->type == F_PTS) pty_slave_close(f->pty);
     if (f->type == F_USOCK || f->type == F_ULISTEN) ux_release(f);
     if (f->type == F_EPOLL && f->ep) kfree(f->ep);
+    if (f->type == F_URING && f->ur) uring_release(f->ur);
     if (f->type == F_SPAIR) {
         spair_shutdown(f, 2);
         if (f->pipe->readers <= 0 && f->pipe->writers <= 0) kfree(f->pipe);
@@ -267,6 +269,7 @@ bool file_readable(file_t* f) {
         case F_SOCKET: return sock_readable(f->sock);
         case F_ULISTEN: return ux_pending(f);
         case F_EVENTFD: return f->cnt > 0;
+        case F_URING:  return uring_readable(f->ur);
         case F_TIMERFD: return f->t_next && (int32_t)(pit_uptime_ms() - f->t_next) >= 0;
         case F_USOCK:  return false;
         case F_INPUT:  return input_pending(f->disk);
@@ -327,12 +330,20 @@ static int pipe_write(file_t* f, pipe_t* p, const char* buf, uint32_t n) {
         put += k;
         p->head = (p->head + (int)k) % PIPE_SZ;
         p->count += (int)k;
+        p->wgen++;
     }
     return (int)put;
 }
 
+uint32_t file_gen(file_t* f) {
+    if (f->type == F_PIPE_R || f->type == F_PIPE_W) return f->pipe->wgen;
+    if (f->type == F_SPAIR) return f->pipe->wgen + f->pipe2->wgen;
+    return 0;
+}
+
 int file_read(file_t* f, char* buf, uint32_t n) {
     switch (f->type) {
+        case F_URING: return -22;
         case F_NULL: case F_NETLINK: case F_USOCK: case F_ULISTEN: case F_EPOLL: return 0;   // netlink goes through recv
         case F_EVENTFD: case F_TIMERFD: {               /* both hand out a u64 */
             if (n < 8) return -22;
@@ -405,7 +416,7 @@ int file_write(file_t* f, const char* buf, uint32_t n) {
         }
         case F_TIMERFD: return -22;
         case F_USOCK: case F_ULISTEN: return -107;   /* ENOTCONN */
-        case F_EPOLL: return -22;
+        case F_EPOLL: case F_URING: return -22;
         case F_TTY:  return tty_write(buf, (int)n);
         case F_PTM: case F_PTS:
             return pty_write(f->pty, f->type == F_PTM, buf, (int)n, (f->flags & O_NONBLOCK) != 0);
