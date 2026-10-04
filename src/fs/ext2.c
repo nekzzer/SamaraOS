@@ -476,12 +476,12 @@ static int wdata(ev_t* v, uint32_t b, const void* buf) {
 /* content into the ent's blocks, same blocks again if the count fits */
 static int put_blocks(ev_t* v, int ei, const char* data, uint32_t len) {
     uint32_t per = v->bs / 4, nb = (len + v->bs - 1) / v->bs;
-    if (nb > 12 + per + per * per) return -1;
+    if (nb > 12 + per + per * per) { klog("ext2: file over 4 GB\r\n"); return -1; }
     uint32_t nm = meta_for(v, nb);
     ent_t* e = &v->E[ei];
     if (nb != e->nb || nm != e->nm) {
         uint32_t* nl = kmalloc((nb + nm) * 4 + 4);
-        if (!nl) return -1;
+        if (!nl) { klog("ext2: no memory for a block list\r\n"); return -1; }
         uint32_t k = 0, old = e->nb + e->nm;
         for (uint32_t i = 0; i < old; i++) {
             if (!e->bl[i]) continue;
@@ -493,7 +493,7 @@ static int put_blocks(ev_t* v, int ei, const char* data, uint32_t len) {
         e->bl = nl; e->nb = nb; e->nm = nm;
     }
     for (uint32_t i = 0; i < nb + nm; i++)
-        if (!e->bl[i] && !(e->bl[i] = balloc(v))) return -1;  /* holes too */
+        if (!e->bl[i] && !(e->bl[i] = balloc(v))) { klog("ext2: out of blocks\r\n"); return -1; }   /* holes too */
     static uint8_t blk[4096];
     for (uint32_t i = 0; i < nb; i++) {
         uint32_t take = len - i * v->bs < v->bs ? len - i * v->bs : v->bs;
@@ -608,7 +608,7 @@ static int sync_vol(ev_t* v) {
 
     bool ft = v->incompat & 2;
     int err = 0;
-    for (uint32_t i = 0; i < v->ne && !err; i++) {
+    for (uint32_t i = 0; i < v->ne; i++) {      /* one bad file used to stop the whole sync, forever */
         ent_t* e = &v->E[i];
         fs_node_t* n = e->n;
         uint32_t links = 1, size = (uint32_t)n->size;
@@ -642,7 +642,7 @@ static int sync_vol(ev_t* v) {
             uint32_t h = fnv((uint8_t*)db.buf, db.len);
             e = &v->E[i];
             if (h != e->h) {
-                if (put_blocks(v, (int)i, db.buf, db.len) < 0) { err = -1; kfree(db.buf); continue; }
+                if (put_blocks(v, (int)i, db.buf, db.len) < 0) { err = -1; kfree(db.buf); klog("ext2: dir not written: "); klog(n->name); klog("\r\n"); continue; }
                 v->E[i].h = h;
             }
             kfree(db.buf);
@@ -662,7 +662,12 @@ static int sync_vol(ev_t* v) {
             if (!same) {
                 uint32_t h = size ? fnv((uint8_t*)n->data, size) : 1;
                 if (h != e->h || (size + v->bs - 1) / v->bs != e->nb) {
-                    if (put_blocks(v, (int)i, n->data, size) < 0) { err = -1; continue; }   /* inode stays as it was */
+                    if (put_blocks(v, (int)i, n->data, size) < 0) {   /* inode stays as it was */
+                        char b[16]; utoa(size, b, 10);
+                        klog("ext2: not written: "); klog(n->name); klog(" size "); klog(b); klog("\r\n");
+                        err = -1;
+                        continue;
+                    }
                     e = &v->E[i];
                 }
                 e->h = h;
@@ -680,7 +685,7 @@ static int sync_vol(ev_t* v) {
             i2e[e->ino] = (int32_t)i;
         }
     }
-    if (err) klog("ext2: disk full\r\n");
+    // if (err) klog("ext2: disk full\r\n");   said disk full for any failure, misleading
 
     /* the descriptors must still say what they said at mount, or we'd write
        bitmaps and inode tables to wherever garbage points */
