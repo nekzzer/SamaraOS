@@ -11,7 +11,8 @@ typedef enum { F_NODE = 1, F_TTY, F_PIPE_R, F_PIPE_W, F_NULL, F_ZERO, F_RANDOM, 
                F_NETLINK,                          /* AF_NETLINK, the answer waits in pipe */
                F_USOCK, F_ULISTEN,                 /* AF_UNIX not connected yet / listening (ux) */
                F_EPOLL,
-               F_EVENTFD, F_TIMERFD } ftype_t;
+               F_EVENTFD, F_TIMERFD,
+               F_URING } ftype_t;
 
 #define PIPE_SZ 65536           /* was 8k, x11 images through a socketpair crawled */
 
@@ -37,6 +38,7 @@ typedef struct file {
     int        pty;         /* F_PTM / F_PTS: pair index */
     struct ux* ux;          /* F_USOCK / F_ULISTEN */
     struct ep* ep;          /* F_EPOLL */
+    struct uring* ur;       /* F_URING */
     uint64_t   cnt;         /* F_EVENTFD counter */
     uint32_t   t_next, t_int;   /* F_TIMERFD: uptime ms of the next expiry (0 = off), interval */
 } file_t;

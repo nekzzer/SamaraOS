@@ -13,6 +13,7 @@
 #include "drivers/usb.h"
 #include "core/heap.h"
 #include "core/task.h"
+#include "proc/uring.h"
 #include "fs/fs.h"
 #include "shell/shell.h"
 #include "boot/multiboot.h"
@@ -314,6 +315,7 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
     }
     BOOT_OK("syscalls", (proc_init(), syscall_init()));
     BOOT_OK("sockets", sock_init());
+    BOOT_OK("io_uring", uring_init());
     boot_step("busybox");
     {
         int n = userland_install();

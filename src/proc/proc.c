@@ -1,5 +1,6 @@
 #include "gui/uwin.h"
 #include "proc/proc.h"
+#include "proc/uring.h"
 #include "proc/file.h"
 #include "proc/tty.h"
 #include "core/heap.h"
@@ -532,6 +533,7 @@ void futex_wake_addr(uint32_t pd, uint32_t addr, int n) {
 /* One thread (not the leader) goes away. It is either not running or it is
    the current one right before it switches away for good. */
 static void thread_kill(proc_t* q) {
+    uring_exit(q);
     if (q->clear_child_tid && q->pd) {
         uint32_t z = 0;
         vmm_copy_to(q->pd, q->clear_child_tid, &z, 4);
@@ -552,6 +554,7 @@ static void thread_kill(proc_t* q) {
    the group down with it. */
 static void teardown(proc_t* p, int status) {
     p = leader_of(p);
+    uring_exit(p);
     proc_t* cur = proc_current();
     bool cur_in = cur && cur->sh == p->sh;
     for (int i = 0; i < MAX_PROCS; i++) {

@@ -82,6 +82,7 @@ KERN_SRC := \
     src/proc/procfs.c \
     src/proc/signal.c \
     src/proc/pty.c \
+    src/proc/uring.c \
     src/fs/fs.c \
     src/gfx/font.c \
     src/gfx/gfx.c \
