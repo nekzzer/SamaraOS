@@ -68,6 +68,7 @@ typedef struct uring {
     ovf_t *ovf, *ovf_last;
     uint32_t seq, ncq;
     int running, ndrain;
+    uint32_t ntmo;                      /* timeouts that expired, they cut a wait short */
     bool dead;
     struct file** files;
     uint32_t nfiles;
@@ -242,7 +243,7 @@ static void req_done(req_t* q, int res) {
     for (req_t** pp = &reqs; *pp; pp = &(*pp)->next)
         if (*pp == q) { *pp = q->next; break; }
     cq_post(r, q->sqe.user_data, res, 0);
-    if (q->sqe.opcode == IORING_OP_TIMEOUT && res == -ETIME) r->ncq--;      // expiries do not count for other timeouts
+    if (q->sqe.opcode == IORING_OP_TIMEOUT && (res == -ETIME || res == 0)) { r->ncq--; r->ntmo++; }      // expiries do not count for other timeouts
     req_t* lt = q->lt;
     req_t* nx = q->link;
     if (q->target) q->target->lt = NULL;
@@ -765,18 +766,19 @@ int uring_enter(int fd, uint32_t to_submit, uint32_t min_complete, uint32_t flag
     uint32_t start = pit_uptime_ms();
     proc_t* me = proc_current();
     int err = 0;
+    uint32_t tm0 = r->ntmo;
     for (;;) {
         uint32_t fl = irq_save();
         cq_flush(r);
         irq_restore(fl);
         if (*r->cq_tail - *r->cq_head >= min_complete) break;
         run_all(me);
-        if (*r->cq_tail - *r->cq_head >= min_complete) break;
+        if (*r->cq_tail - *r->cq_head >= min_complete || r->ntmo != tm0) break;
         uint32_t el = pit_uptime_ms() - start;
         if (has_tmo && el >= tmo) { err = -ETIME; break; }
         if (proc_interrupted() || proc_signal_deliverable(me)) { err = -EINTR; break; }
         fl = irq_save();
-        if (*r->cq_tail - *r->cq_head < min_complete) {
+        if (*r->cq_tail - *r->cq_head < min_complete && r->ntmo == tm0) {
             task_t* t = task_current();
             uint32_t w = has_tmo && tmo - el < 20 ? tmo - el : 20;
             r->waiter = t->id;
@@ -787,6 +789,7 @@ int uring_enter(int fd, uint32_t to_submit, uint32_t min_complete, uint32_t flag
         }
         irq_restore(fl);
     }
+    if (err && *r->cq_tail != *r->cq_head) err = 0;       // linux does that: a timeout with something to read is fine
     return sub ? sub : err;
 }
 
