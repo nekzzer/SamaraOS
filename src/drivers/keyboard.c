@@ -242,6 +242,8 @@ void     kbd_set_ru(bool ru)     { if (ru != ru_layout) { ru_layout = ru; ru_epo
 uint32_t kbd_layout_epoch(void)  { return ru_epoch; }
 
 bool kbd_ctrl_held(void) { return ctrl; }
+bool kbd_shift_held(void) { return shift; }
+bool kbd_alt_held(void) { return alt; }
 
 int kbd_f11_take(void) {
     static uint32_t seen;
