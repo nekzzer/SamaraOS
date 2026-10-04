@@ -30,10 +30,7 @@
 #define VQ_WRITE 2
 
 /* the big heap lives in the direct map above 1 GB: the device wants physical */
-static uint32_t pa(void* p) {
-    uint32_t a = (uint32_t)p;
-    return a >= DMAP_BASE ? a - DMAP_BASE : a;
-}
+static uint32_t pa(void* p) { return (uint32_t)V2P(p); }
 
 /* the device's register block and one queue set up */
 int vq_setup(vq_t* q, uint16_t io, int idx) {
@@ -46,7 +43,7 @@ int vq_setup(vq_t* q, uint16_t io, int idx) {
     uint32_t sz = a + (uint32_t)(6 + 8 * n);
     uint8_t* raw = kmalloc(sz + 4096);
     if (!raw) return -1;
-    uint8_t* m = (uint8_t*)(((uint32_t)raw + 4095) & ~4095u);
+    uint8_t* m = (uint8_t*)(((uintptr_t)raw + 4095) & ~4095ul);
     memset(m, 0, sz);
     q->io = io; q->idx = idx; q->n = n;
     q->desc = (vq_desc_t*)m;

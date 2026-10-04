@@ -178,7 +178,7 @@ static int fill_data(ev_t* v, const uint8_t* ino, uint32_t size, char* d) {
 
 /* ---------- node -> ent table ---------- */
 
-static uint32_t ph(fs_node_t* n, uint32_t cap) { return (((uint32_t)n >> 4) * 2654435761u) & (cap - 1); }
+static uint32_t ph(fs_node_t* n, uint32_t cap) { return (((uintptr_t)n >> 4) * 2654435761u) & (cap - 1); }
 
 /* 0 = no memory. it was unchecked and from the file arena, which apk fills
    up: a NULL table gave t_find garbage, files got each other's inodes and

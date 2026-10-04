@@ -1,3 +1,4 @@
+#include "core/vmm.h"
 #include "drivers/rtl8139.h"
 #include "drivers/pci.h"
 #include "core/io.h"
@@ -97,7 +98,7 @@ int rtl8139_init(void) {
     }
 
     /* RBSTART = physical addr (1:1 paging) */
-    outl(g_io + RTL_RBSTART, (uint32_t)g_rx_buf);
+    outl(g_io + RTL_RBSTART, (uint32_t)V2P(g_rx_buf));
 
     /* mask all IRQs (we poll) */
     outw(g_io + RTL_IMR, 0);
@@ -152,7 +153,7 @@ int rtl8139_send(const void* data, int len) {
     int padded = len < 60 ? 60 : len;
     if (padded > len) memset(g_tx_buf[idx] + len, 0, padded - len);
 
-    outl(g_io + RTL_TSAD0 + idx * 4, (uint32_t)g_tx_buf[idx]);
+    outl(g_io + RTL_TSAD0 + idx * 4, (uint32_t)V2P(g_tx_buf[idx]));
     /* writing TSD with size and OWN=0 starts transmit */
     outl(g_io + RTL_TSD0 + idx * 4, (uint32_t)padded);
 

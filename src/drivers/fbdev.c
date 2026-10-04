@@ -1,3 +1,4 @@
+#include "core/vmm.h"
 #include "drivers/fbdev.h"
 #include "gfx/gfx.h"
 #include "core/heap.h"
@@ -78,7 +79,7 @@ void fbdev_fscreeninfo(uint32_t* o) {
     uint8_t* fb = gfx_front_fb(&pitch, &bpp);
     memcpy(o, "samarafb", 9);                          /* id */
     o[8] = 2;                                          /* visual TRUECOLOR: xorg took 0 as mono and depth 32 */
-    o[4] = (uint32_t)fb;                               /* smem_start */
+    o[4] = (uint32_t)V2P(fb);                               /* smem_start */
     o[5] = (uint32_t)pitch * (uint32_t)gfx_h();        /* smem_len */
     o[11] = (uint32_t)pitch;                           /* line_length */
 }

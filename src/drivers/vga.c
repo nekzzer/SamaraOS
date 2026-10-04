@@ -5,7 +5,7 @@
 #include "gfx/termfont.h"
 #include <stdarg.h>
 
-static volatile uint16_t* const VRAM = (uint16_t*)0xB8000;
+static volatile uint16_t* const VRAM = (uint16_t*)(0xffff800000000000ul + 0xB8000);
 static int cur_x = 0, cur_y = 0;
 static uint8_t cur_color = (VGA_BLACK << 4) | VGA_LGREY;
 
@@ -224,10 +224,15 @@ void vga_printf(const char* fmt, ...) {
     for (; *fmt; fmt++) {
         if (*fmt != '%') { vga_putc(*fmt); continue; }
         fmt++;
+        int lng = 0;
+        while (*fmt == 'l') { lng = 1; fmt++; }
         switch (*fmt) {
-            case 'd': itoa(va_arg(ap, int), buf, 10); vga_puts(buf); break;
-            case 'u': utoa(va_arg(ap, uint32_t), buf, 10); vga_puts(buf); break;
-            case 'x': utoa(va_arg(ap, uint32_t), buf, 16); vga_puts(buf); break;
+            case 'd': if (lng) { int64_t v = va_arg(ap, long); if (v < 0) { vga_putc('-'); v = -v; } utoa(v, buf, 10); }
+                      else itoa(va_arg(ap, int), buf, 10);
+                      vga_puts(buf); break;
+            case 'u': utoa(lng ? va_arg(ap, unsigned long) : va_arg(ap, uint32_t), buf, 10); vga_puts(buf); break;
+            case 'x': utoa(lng ? va_arg(ap, unsigned long) : va_arg(ap, uint32_t), buf, 16); vga_puts(buf); break;
+            case 'p': vga_puts("0x"); utoa((uintptr_t)va_arg(ap, void*), buf, 16); vga_puts(buf); break;
             case 's': vga_puts(va_arg(ap, const char*)); break;
             case 'c': vga_putc((char)va_arg(ap, int)); break;
             case '%': vga_putc('%'); break;

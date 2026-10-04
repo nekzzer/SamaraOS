@@ -75,7 +75,7 @@ static uint8_t mouse_get_id(void) {
 }
 
 int mouse_wheel_take(void) {
-    uint32_t f;
+    uint64_t f;
     __asm__ volatile ("pushf; pop %0; cli" : "=r"(f) :: "memory");
     int v = wheel_acc;
     wheel_acc = 0;
@@ -122,7 +122,7 @@ void mouse_draw_cursor(void) {
 /* dy: up is positive (ps/2 way). dz: > 0 = wheel towards the user. Called from
    the irq12 handler and from the usb poll task. */
 void mouse_feed(int dx, int dy, int dz, uint8_t newbtn) {
-    uint32_t fl;
+    uint64_t fl;
     __asm__ volatile ("pushf; pop %0; cli" : "=r"(fl) :: "memory");
     if (input_grabbed()) {
         if (dx) input_push(IEV_REL, IEV_REL_X, dx);
@@ -149,8 +149,7 @@ void mouse_feed(int dx, int dy, int dz, uint8_t newbtn) {
     if (fl & 0x200) __asm__ volatile ("sti" ::: "memory");
 }
 
-__attribute__((interrupt))
-static void mouse_isr(struct interrupt_frame* f) {
+static void mouse_isr(regs_t* f) {
     (void)f;
     if (!(inb(0x64) & 1)) { pic_send_eoi(12); return; }
     uint8_t v = inb(0x60);
@@ -197,7 +196,7 @@ void mouse_init(void) {
     mouse_cmd_arg(0xF3, 100);
     mouse_cmd(0xF4);
 
-    idt_set_gate(0x2C, mouse_isr, 0x08, 0x8E);
+    idt_set_handler(0x2C, mouse_isr);
     pic_clear_mask(2);   /* unmask cascade */
     pic_clear_mask(12);
 }

@@ -1,3 +1,4 @@
+#include "core/vmm.h"
 #include "drivers/usb.h"
 #include "drivers/pci.h"
 #include "drivers/mouse.h"
@@ -56,14 +57,14 @@ static int ctl(int addr, int ls, int mps, uint8_t rt, uint8_t rq, uint16_t val, 
     setup[6] = len; setup[7] = len >> 8;
     tds[n].st = st;
     tds[n].tok = 0x2D | (addr << 8) | (7 << 21);
-    tds[n].buf = (uint32_t)setup;
+    tds[n].buf = (uint32_t)V2P(setup);
     n++;
     int tog = 1;
     if (in) for (int off = 0; off < len; off += mps) {
         int c = len - off < mps ? len - off : mps;
         tds[n].st = st;
         tds[n].tok = 0x69 | (addr << 8) | (tog << 19) | ((c - 1) << 21);
-        tds[n].buf = (uint32_t)dbuf + off;
+        tds[n].buf = (uint32_t)V2P(dbuf) + off;
         tog ^= 1;
         n++;
     }
@@ -71,8 +72,8 @@ static int ctl(int addr, int ls, int mps, uint8_t rt, uint8_t rq, uint16_t val, 
     tds[n].tok = (in ? 0xE1 : 0x69) | (addr << 8) | (1 << 19) | (0x7FF << 21);
     tds[n].buf = 0;
     n++;
-    for (int i = 0; i < n; i++) tds[i].link = i == n - 1 ? 1 : ((uint32_t)&tds[i + 1] | 4);
-    qh_c.elem = (uint32_t)&tds[0];
+    for (int i = 0; i < n; i++) tds[i].link = i == n - 1 ? 1 : ((uint32_t)V2P(&tds[i + 1]) | 4);
+    qh_c.elem = (uint32_t)V2P(&tds[0]);
 
     int ret = -1;
     uint32_t end = pit_uptime_ms() + 500;
@@ -92,8 +93,8 @@ static void arm(void) {
     itd->link = 1;
     itd->st = (3 << 27) | (m_ls << 26) | (1 << 23);
     itd->tok = 0x69 | (m_addr << 8) | ((m_ep & 15) << 15) | (m_tog << 19) | ((m_len - 1) << 21);
-    itd->buf = (uint32_t)rep;
-    qh_i.elem = (uint32_t)itd;
+    itd->buf = (uint32_t)V2P(rep);
+    qh_i.elem = (uint32_t)V2P(itd);
 }
 
 static int enum_port(int p) {
@@ -150,12 +151,12 @@ static void uhci_up(pci_dev_t* d) {
     outw(base + USBCMD, 2);
     for (int i = 0; i < 100 && (inw(base + USBCMD) & 2); i++) task_sleep_ms(1);
     outw(base + USBINTR, 0);
-    for (int i = 0; i < 1024; i++) fl[i] = (uint32_t)&qh_i | 2;
-    qh_i.link = (uint32_t)&qh_c | 2;
+    for (int i = 0; i < 1024; i++) fl[i] = (uint32_t)V2P(&qh_i) | 2;
+    qh_i.link = (uint32_t)V2P(&qh_c) | 2;
     qh_c.link = 1;
     qh_i.elem = qh_c.elem = 1;
     outw(base + FRNUM, 0);
-    outl(base + FLBASE, (uint32_t)fl);
+    outl(base + FLBASE, (uint32_t)V2P(fl));
     outb(base + SOFMOD, 0x40);
     outw(base + USBSTS, 0xFFFF);
     outw(base + USBCMD, 1 | 0x40 | 0x80);

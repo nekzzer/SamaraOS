@@ -5,6 +5,7 @@
    not cross a 64 KiB boundary, so we allocate a 64 KiB-aligned bounce buffer
    in .bss and memcpy caller PCM into it before kicking DMA. */
 
+#include "core/vmm.h"
 #include "drivers/sb16.h"
 #include "core/io.h"
 #include "core/string.h"
@@ -149,7 +150,7 @@ int sb16_play_pcm_u8_mono(const uint8_t* pcm, uint32_t len, uint32_t hz) {
     /* Copy caller's PCM into the DMA-safe bounce buffer */
     memcpy(sb_buf, pcm, len);
 
-    uint32_t phys = (uint32_t)sb_buf;
+    uint32_t phys = (uint32_t)V2P(sb_buf);
     dma1_setup_ch1(phys, (uint16_t)len);
 
     /* DSP: speaker on, set sample rate */

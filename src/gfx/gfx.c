@@ -1,3 +1,4 @@
+#include "core/vmm.h"
 #include "gfx/gfx.h"
 #include "drivers/fbdev.h"
 #include "gfx/uifont.h"
@@ -77,7 +78,7 @@ bool gfx_init(multiboot_info_t* mbi) {
     if (!(mbi->flags & MBI_FLAG_FRAMEBUFFER)) return false;
     if (mbi->framebuffer_type != 1) return false;
     if (mbi->framebuffer_bpp != 32 && mbi->framebuffer_bpp != 24) return false;
-    real_fb  = (uint8_t*)(uint32_t)mbi->framebuffer_addr;
+    real_fb  = (uint8_t*)P2V(mbi->framebuffer_addr);
     fb       = real_fb;
     back_buf = NULL;
     fb_w     = (int)mbi->framebuffer_width;
@@ -157,7 +158,7 @@ bool gfx_init_vbe(int w, int h, int bpp) {
     uint32_t lfb = pci_find_vga_lfb();
     if (!lfb) return false;
 
-    real_fb  = (uint8_t*)lfb;
+    real_fb  = (uint8_t*)P2V(lfb);
     fb       = real_fb;
     back_buf = NULL;
     fb_w     = w;
@@ -217,7 +218,7 @@ bool gfx_init_mode13h(void) {
         uint8_t b =  pal16[i]        & 0xFF;
         set_palette((uint8_t)i, r, g, b);
     }
-    real_fb  = (uint8_t*)0xA0000;
+    real_fb  = (uint8_t*)P2V(0xA0000);
     fb       = real_fb;
     back_buf = NULL;
     fb_w     = 320;

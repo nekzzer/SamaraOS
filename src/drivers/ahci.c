@@ -100,7 +100,7 @@ static inline void px_w(int p, uint32_t off, uint32_t v) { hba_w(0x100 + (uint32
 static void* alloc_aligned(uint32_t size, uint32_t align) {
     uint8_t* raw = (uint8_t*)kmalloc(size + align);
     if (!raw) return NULL;
-    uint8_t* p = (uint8_t*)(((uint32_t)raw + align - 1) & ~(align - 1));
+    uint8_t* p = (uint8_t*)(((uintptr_t)raw + align - 1) & ~(uintptr_t)(align - 1));
     memset(p, 0, size);
     return p;                                   /* never freed: lives with the port */
 }
@@ -197,11 +197,11 @@ static bool port_init(int p, ahci_disk_t* d) {
     d->fis = (uint8_t*)alloc_aligned(256, 256);
     d->tbl = (cmd_table_t*)alloc_aligned(sizeof(cmd_table_t), 128);
     if (!d->clb || !d->fis || !d->tbl) return false;
-    d->clb[0].ctba = (uint32_t)d->tbl;
+    d->clb[0].ctba = (uint32_t)V2P(d->tbl);
     d->clb[0].ctbau = 0;
-    px_w(p, PX_CLB, (uint32_t)d->clb);
+    px_w(p, PX_CLB, (uint32_t)V2P(d->clb));
     px_w(p, PX_CLBU, 0);
-    px_w(p, PX_FB, (uint32_t)d->fis);
+    px_w(p, PX_FB, (uint32_t)V2P(d->fis));
     px_w(p, PX_FBU, 0);
     px_w(p, PX_SERR, 0xFFFFFFFFu);
     px_w(p, PX_IS, 0xFFFFFFFFu);
@@ -247,7 +247,7 @@ int ahci_init(void) {
     if (!hba) { strcpy(status_msg, "no AHCI controller"); return 0; }
 
     pci_enable_io_busmaster(hba);
-    abar = (volatile uint8_t*)(hba->bar[5] & ~0xFu);
+    abar = (volatile uint8_t*)P2V(hba->bar[5] & ~0xFu);
     if (!abar) { strcpy(status_msg, "AHCI BAR5 unset"); return 0; }
 
     hba_w(HBA_GHC, hba_r(HBA_GHC) | GHC_AE);
@@ -294,7 +294,7 @@ static int xfer(int i, uint32_t lba, int count, void* buf, bool write) {
     if (lba + (uint32_t)count > d->sectors || lba + (uint32_t)count < lba) return -1;
     uint8_t* p = (uint8_t*)buf;
     uint8_t* bounce = NULL;
-    if (((uint32_t)p & 1) || !dma_ok(p)) {
+    if (((uintptr_t)p & 1) || !dma_ok(p)) {
         bounce = (uint8_t*)kmalloc(MAX_SECTORS_PER_CMD * 512);   /* 8-byte aligned */
         if (!bounce) return -1;
     }

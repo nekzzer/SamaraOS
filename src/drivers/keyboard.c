@@ -85,8 +85,7 @@ static int buf_pop(char* out) {
     return 1;
 }
 
-__attribute__((interrupt))
-static void kbd_isr(struct interrupt_frame* f) {
+static void kbd_isr(regs_t* f) {
     (void)f;
     /* Only take the byte if it is keyboard data: with the AUX bit set it is
        the mouse's (touchpads / BIOS USB emulation), and IRQ 12 reads it. */
@@ -218,7 +217,7 @@ static void kbd_isr(struct interrupt_frame* f) {
 
 void kbd_init(void) {
     head = tail = 0;
-    idt_set_gate(0x21, kbd_isr, 0x08, 0x8E);
+    idt_set_handler(0x21, kbd_isr);
     pic_clear_mask(1);
 }
 

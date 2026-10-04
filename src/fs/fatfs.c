@@ -308,7 +308,7 @@ typedef struct {
     int      err;
 } layout_t;
 
-static uint32_t hash_ptr(const void* p, uint32_t cap) { return (((uint32_t)p >> 3) * 2654435761u) & (cap - 1); }
+static uint32_t hash_ptr(const void* p, uint32_t cap) { return (((uintptr_t)p >> 3) * 2654435761u) & (cap - 1); }
 
 static place_t* find_place(layout_t* L, fs_node_t* n) {
     for (uint32_t h = hash_ptr(n, L->mapcap);; h = (h + 1) & (L->mapcap - 1)) {

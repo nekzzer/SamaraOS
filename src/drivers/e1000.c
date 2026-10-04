@@ -1,3 +1,4 @@
+#include "core/vmm.h"
 #include "drivers/e1000.h"
 #include "drivers/pci.h"
 #include "core/heap.h"
@@ -49,8 +50,8 @@ static uint16_t eeprom(int a) {
 
 /* descriptor rings must be 16 aligned, kmalloc doesnt promise that */
 static void* amalloc(int n) {
-    uint32_t p = (uint32_t)kmalloc(n + 16);
-    return (void*)((p + 15) & ~15u);
+    uintptr_t p = (uintptr_t)kmalloc(n + 16);
+    return (void*)((p + 15) & ~15ul);
 }
 
 const uint8_t* e1000_mac(void) { return mac; }
@@ -66,7 +67,7 @@ int e1000_init(void) {
             if (devs[i].vendor == 0x8086 && devs[i].device == ids[j]) { d = devs[i]; ok = 1; break; }
     if (!ok) return -1;
     pci_enable_io_busmaster(&d);
-    mmio = (volatile uint8_t*)(d.bar[0] & ~0xFu);
+    mmio = (volatile uint8_t*)P2V(d.bar[0] & ~0xFu);
 
     wr(0xD8, 0xFFFFFFFF);          /* IMC: no irqs */
     wr(0x0000, rd(0x0000) | (1u << 26));   /* reset */
@@ -91,9 +92,9 @@ int e1000_init(void) {
     memset(rx, 0, sizeof(rxd_t) * NRX);
     for (int i = 0; i < NRX; i++) {
         rxbuf[i] = kmalloc(2048);
-        rx[i].addr = (uint32_t)rxbuf[i];
+        rx[i].addr = V2P(rxbuf[i]);
     }
-    wr(0x2800, (uint32_t)rx);
+    wr(0x2800, (uint32_t)V2P(rx));
     wr(0x2804, 0);
     wr(0x2808, sizeof(rxd_t) * NRX);
     wr(0x2810, 0);
@@ -108,7 +109,7 @@ int e1000_init(void) {
         txbuf[i] = kmalloc(2048);
         tx[i].status = 1;          /* DD, free */
     }
-    wr(0x3800, (uint32_t)tx);
+    wr(0x3800, (uint32_t)V2P(tx));
     wr(0x3804, 0);
     wr(0x3808, sizeof(txd_t) * NTX);
     wr(0x3810, 0);
@@ -129,7 +130,7 @@ int e1000_send(const void* data, int len) {
     for (int i = 0; !(t->status & 1); i++)
         if (i > 1000000) return -3;   // ring stuck
     memcpy(txbuf[tx_cur], data, len);
-    t->addr = (uint32_t)txbuf[tx_cur];
+    t->addr = V2P(txbuf[tx_cur]);
     t->addr_hi = 0;
     t->len = len < 60 ? 60 : len;   // card pads anyway but whatever
     t->cmd = 1 | 2 | 8;            /* EOP IFCS RS */

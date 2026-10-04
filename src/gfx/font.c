@@ -1,3 +1,4 @@
+#include "core/vmm.h"
 #include "gfx/font.h"
 #include "core/io.h"
 #include "core/string.h"
@@ -42,7 +43,7 @@ void font_init(void) {
     wgc (5, 0x00);          /* read mode 0 */
     wgc (6, 0x04);          /* graphics mode, A0000-AFFFF, no oe */
 
-    volatile const uint8_t* vram = (const uint8_t*)0xA0000;
+    volatile const uint8_t* vram = (const uint8_t*)P2V(0xA0000);
     for (int ch = 0; ch < 256; ch++)
         for (int r = 0; r < 16; r++)
             font_data[ch * 16 + r] = vram[ch * 32 + r];
@@ -76,7 +77,7 @@ void font_restore(void) {
     wgc (5, 0x00);
     wgc (6, 0x04);
 
-    volatile uint8_t* vram = (uint8_t*)0xA0000;
+    volatile uint8_t* vram = (uint8_t*)P2V(0xA0000);
     for (int ch = 0; ch < 256; ch++)
         for (int r = 0; r < 16; r++)
             vram[ch * 32 + r] = font_data[ch * 16 + r];

@@ -13,9 +13,9 @@
 #define FBIO_BLIT8          0x4680
 
 typedef struct {
-    uint32_t pixels;     /* user pointer, w*h bytes */
+    uint64_t pixels;     /* user pointer, w*h bytes */
     uint32_t w, h;
-    uint32_t palette;    /* user pointer, 256 x 0x00RRGGBB */
+    uint64_t palette;    /* user pointer, 256 x 0x00RRGGBB */
 } fb_blit8_t;
 
 bool fbdev_open(void);
