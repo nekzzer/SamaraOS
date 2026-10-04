@@ -70,13 +70,13 @@ static volatile bool wm_up;
 #define EINTR   4
 #define EAGAIN 11
 
-static bool uok(uint32_t a, uint32_t len) {
+static bool uok(uint64_t a, uint64_t len) {
     return a >= USER_BASE && a < USER_TOP && len <= USER_TOP - a;
 }
 
 /* NUL-terminated user string into a kernel buffer; UTF-8 Cyrillic is
    folded to CP866 (the font's encoding), raw CP866 bytes pass through. */
-static bool ustr(uint32_t p, char* out, int cap) {
+static bool ustr(uint64_t p, char* out, int cap) {
     if (!uok(p, 1)) return false;
     const uint8_t* s = (const uint8_t*)p;
     int n = 0;
@@ -191,7 +191,7 @@ static void u_paint(window_t* w) {
 
 /* SM_OP_TEXT aimed at a window's own pixel buffer (the one it presents):
    record it instead of rasterizing at window resolution. */
-static uwin_t* text_target(uint32_t buf, int bw, int bh) {
+static uwin_t* text_target(uint64_t buf, int bw, int bh) {
     proc_t* p = proc_current();
     if (!p || !buf) return NULL;
     for (int i = 0; i < UWIN_MAX; i++) {
@@ -325,7 +325,7 @@ void uwin_proc_exit(int pid) {
 
 /* ---------------- syscalls (process task, IRQs off) ---------------- */
 
-static int32_t op_open(uint32_t a) {
+static int32_t op_open(uint64_t a) {
     if (!uok(a, sizeof(sm_open_t))) return -EFAULT;
     if (!wm_up) return -ENODEV;
     proc_t* p = proc_current();
@@ -361,7 +361,7 @@ static int32_t op_open(uint32_t a) {
     return slot;
 }
 
-static int32_t op_event(uwin_t* u, uint32_t ev, int32_t timeout) {
+static int32_t op_event(uwin_t* u, uint64_t ev, int32_t timeout) {
     if (!uok(ev, sizeof(sm_event_t))) return -EFAULT;
     uint32_t t0 = pit_uptime_ms();
     while (u->qh == u->qt) {
@@ -374,7 +374,7 @@ static int32_t op_event(uwin_t* u, uint32_t ev, int32_t timeout) {
     return 1;
 }
 
-int32_t uwin_syscall(uint32_t op, uint32_t a, uint32_t b, uint32_t c) {
+int32_t uwin_syscall(uint32_t op, uint64_t a, uint64_t b, uint64_t c) {
     if (op == SM_OP_OPEN) return op_open(a);
     if (op == SM_OP_FONT_H) return uif_height_any((int)a);
     if (op == SM_OP_TEXT) {

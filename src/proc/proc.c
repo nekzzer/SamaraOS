@@ -29,13 +29,13 @@ static int    next_pid = 1;
 
 static void com_putc(char c) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, c); }
 static void klog(const char* s) { while (*s) com_putc(*s++); }
-static void klog_num(uint32_t v, int base) { char b[16]; utoa(v, b, base); klog(b); }
+static void klog_num(uint64_t v, int base) { char b[16]; utoa(v, b, base); klog(b); }
 
 /* ---------------- lookup ---------------- */
 
 proc_t* proc_current(void) { return task_current()->proc; }
 int     proc_pid(proc_t* p) { return p ? p->pid : 0; }
-uint32_t proc_tls_base(proc_t* p) { return p->tls_base; }
+uint64_t proc_tls_base(proc_t* p) { return p->tls_base; }
 int     proc_count(void) { return MAX_PROCS; }
 proc_t* proc_at(int i) { return (i >= 0 && i < MAX_PROCS && procs[i].state != P_FREE) ? &procs[i] : NULL; }
 
@@ -90,7 +90,7 @@ static void kargs_free(kargs_t* a) { if (a->mem) kfree(a->mem); a->mem = NULL; }
 static int kargs_build(kargs_t* a, const char* const* pre, int npre,
                        char* const argv[], int skip, char* const envp[]) {
     int argc = 0, envc = 0;
-    uint32_t bytes = 0;
+    uint64_t bytes = 0;
     for (int i = 0; i < npre; i++) bytes += strlen(pre[i]) + 1;
     if (argv) for (; argv[argc]; argc++) {
         if (argc >= skip) bytes += strlen(argv[argc]) + 1;
@@ -101,7 +101,7 @@ static int kargs_build(kargs_t* a, const char* const* pre, int npre,
         if (bytes > ARGS_MAX) return -E2BIG;
     }
     int nargs = npre + (argc > skip ? argc - skip : 0);
-    uint32_t ptrs = (uint32_t)(nargs + 1 + envc + 1) * sizeof(char*);
+    uint64_t ptrs = (uint64_t)(nargs + 1 + envc + 1) * sizeof(char*);
     char* mem = (char*)kmalloc(ptrs + bytes + 1);
     if (!mem) return -ENOMEM;
     char** pv = (char**)mem;
@@ -126,12 +126,15 @@ static int kargs_build(kargs_t* a, const char* const* pre, int npre,
 typedef struct {
     uint8_t  ident[16];
     uint16_t type, machine;
-    uint32_t version, entry, phoff, shoff, flags;
+    uint32_t version;
+    uint64_t entry, phoff, shoff;
+    uint32_t flags;
     uint16_t ehsize, phentsize, phnum, shentsize, shnum, shstrndx;
 } __attribute__((packed)) elf_ehdr_t;
 
 typedef struct {
-    uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
+    uint32_t type, flags;
+    uint64_t offset, vaddr, paddr, filesz, memsz, align;
 } __attribute__((packed)) elf_phdr_t;
 
 #define PT_LOAD 1
@@ -144,8 +147,8 @@ static bool elf_ok(const fs_node_t* n) {
     if (n->size < sizeof(elf_ehdr_t)) return false;
     const elf_ehdr_t* h = (const elf_ehdr_t*)n->data;
     if (!(h->ident[0] == 0x7F && h->ident[1] == 'E' && h->ident[2] == 'L' && h->ident[3] == 'F' &&
-          h->ident[4] == 1 /*32-bit*/ && h->machine == 3 /*i386*/ &&
-          h->phoff + (uint32_t)h->phnum * sizeof(elf_phdr_t) <= n->size)) return false;
+          h->ident[4] == 2 /*64-bit*/ && h->machine == 62 /*x86_64*/ &&
+          h->phoff + (uint64_t)h->phnum * sizeof(elf_phdr_t) <= n->size)) return false;
     /* ET_EXEC or ET_DYN. dynamic ones get their PT_INTERP loaded too */
     return h->type == 2 || h->type == 3;
 }
@@ -161,24 +164,24 @@ static const char* elf_interp(const fs_node_t* n) {
 }
 
 /* Where static-pie images (e.g. binutils from musl.cc) are put. */
-#define PIE_BASE 0x08048000u
+#define PIE_BASE 0x555555554000ul
 
 typedef struct {
-    uint32_t entry, brk, phdr, phnum;
-    uint32_t base, start;    // interp base + where to actually jump
+    uint64_t entry, brk, phdr, phnum;
+    uint64_t base, start;    // interp base + where to actually jump
 } image_t;
 
-static int load_elf(uint32_t pd, const fs_node_t* n, image_t* img, uint32_t bias) {
+static int load_elf(uint64_t pd, const fs_node_t* n, image_t* img, uint64_t bias) {
     const elf_ehdr_t* h = (const elf_ehdr_t*)n->data;
     const elf_phdr_t* ph = (const elf_phdr_t*)(n->data + h->phoff);
-    uint32_t top = 0;
+    uint64_t top = 0;
     // ld.so sits up in the mmap area, the program below it
-    uint32_t lim = bias >= USER_MMAP_BASE ? USER_STACK_TOP - USER_STACK_MAX : USER_MMAP_BASE;
+    uint64_t lim = bias >= USER_MMAP_BASE ? USER_STACK_TOP - USER_STACK_MAX : USER_MMAP_BASE;
     if (h->type != 3) bias = 0;
     img->phdr = 0;
     for (int i = 0; i < h->phnum; i++) {
         const elf_phdr_t* p = &ph[i];
-        uint32_t va = p->vaddr + bias;
+        uint64_t va = p->vaddr + bias;
         if (p->type == PT_PHDR) img->phdr = va;
         if (p->type != PT_LOAD || p->memsz == 0) continue;
         if (va < USER_BASE || va + p->memsz > lim ||
@@ -197,8 +200,8 @@ static int load_elf(uint32_t pd, const fs_node_t* n, image_t* img, uint32_t bias
     bool textrel = false;
     for (int i = 0; i < h->phnum; i++) {
         if (ph[i].type != PT_DYNAMIC || ph[i].offset + ph[i].filesz > n->size) continue;
-        const uint32_t* d = (const uint32_t*)(n->data + ph[i].offset);
-        for (uint32_t k = 0; k + 1 < ph[i].filesz / 4 && d[k]; k += 2)
+        const uint64_t* d = (const uint64_t*)(n->data + ph[i].offset);
+        for (uint64_t k = 0; k + 1 < ph[i].filesz / 8 && d[k]; k += 2)
             if (d[k] == 22 || (d[k] == 30 && (d[k + 1] & 4))) textrel = true;
     }
     for (int i = 0; i < h->phnum && !textrel; i++)
@@ -240,42 +243,42 @@ static uint32_t rnd32(void) {
 }
 
 /* Lay out argc/argv/envp/auxv + strings at the top of the new stack. */
-static int build_stack(uint32_t pd, const kargs_t* a, const image_t* img, uint32_t* sp_out) {
-    uint32_t strbytes = 0;
+static int build_stack(uint64_t pd, const kargs_t* a, const image_t* img, uint64_t* sp_out) {
+    uint64_t strbytes = 0;
     for (int i = 0; i < a->argc; i++) strbytes += strlen(a->argv[i]) + 1;
     for (int i = 0; i < a->envc; i++) strbytes += strlen(a->envp[i]) + 1;
-    strbytes += 5 + 16;                                   /* "i686" + AT_RANDOM bytes */
+    strbytes += 7 + 16;                                   /* "x86_64" + AT_RANDOM bytes */
     int naux = 17;
-    uint32_t words = 1 + (uint32_t)a->argc + 1 + (uint32_t)a->envc + 1 + (uint32_t)naux * 2;
-    uint32_t total = ((strbytes + 15) & ~15u) + words * 4 + 16;
-    total = (total + 15) & ~15u;
+    uint64_t words = 1 + (uint64_t)a->argc + 1 + (uint64_t)a->envc + 1 + (uint64_t)naux * 2;
+    uint64_t total = ((strbytes + 15) & ~15ul) + words * 8 + 16;
+    total = (total + 15) & ~15ul;
     if (total > 192u * 1024u) return -E2BIG;
 
-    uint32_t map = (total + 64u * 1024u + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    uint64_t map = (total + 64u * 1024u + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     if (vmm_alloc_range(pd, USER_STACK_TOP - map, map, true) < 0) return -ENOMEM;
 
     uint8_t* buf = (uint8_t*)kmalloc(total);
     if (!buf) return -ENOMEM;
     memset(buf, 0, total);
-    uint32_t base = USER_STACK_TOP - total;               /* user address of buf[0] */
-    uint32_t* w = (uint32_t*)buf;
-    uint32_t spos = total - ((strbytes + 15) & ~15u);     /* strings start (offset) */
+    uint64_t base = USER_STACK_TOP - total;               /* user address of buf[0] */
+    uint64_t* w = (uint64_t*)buf;
+    uint64_t spos = total - ((strbytes + 15) & ~15ul);    /* strings start (offset) */
 
-#define PUTSTR(s) ({ uint32_t _ua = base + spos; uint32_t _l = strlen(s) + 1; \
+#define PUTSTR(s) ({ uint64_t _ua = base + spos; uint64_t _l = strlen(s) + 1; \
                      memcpy(buf + spos, (s), _l); spos += _l; _ua; })
     int k = 0;
-    w[k++] = (uint32_t)a->argc;
+    w[k++] = (uint64_t)a->argc;
     for (int i = 0; i < a->argc; i++) w[k++] = PUTSTR(a->argv[i]);
     w[k++] = 0;
     for (int i = 0; i < a->envc; i++) w[k++] = PUTSTR(a->envp[i]);
     w[k++] = 0;
-    uint32_t plat = PUTSTR("i686");
-    uint32_t rnd = base + spos;
+    uint64_t plat = PUTSTR("x86_64");
+    uint64_t rnd = base + spos;
     for (int i = 0; i < 16; i += 4) { uint32_t r = rnd32(); memcpy(buf + spos + i, &r, 4); }
     spos += 16;
 #undef PUTSTR
-    uint32_t execfn = a->argc ? w[1] : 0;
-    const uint32_t aux[][2] = {
+    uint64_t execfn = a->argc ? w[1] : 0;
+    const uint64_t aux[][2] = {
         { AT_PHDR, img->phdr }, { AT_PHENT, sizeof(elf_phdr_t) }, { AT_PHNUM, img->phnum },
         { AT_PAGESZ, PAGE_SIZE }, { AT_BASE, img->base }, { AT_ENTRY, img->entry }, { AT_UID, 0 }, { AT_EUID, 0 },
         { AT_GID, 0 }, { AT_EGID, 0 }, { AT_HWCAP, 0 }, { AT_CLKTCK, 100 }, { AT_SECURE, 0 },
@@ -290,14 +293,13 @@ static int build_stack(uint32_t pd, const kargs_t* a, const image_t* img, uint32
     return 0;
 }
 
-static void init_user_frame(regs_t* r, uint32_t entry, uint32_t sp) {
+static void init_user_frame(regs_t* r, uint64_t entry, uint64_t sp) {
     memset(r, 0, sizeof(*r));
-    r->gs = r->fs = r->es = r->ds = GDT_UDATA;
     r->cs = GDT_UCODE;
     r->ss = GDT_UDATA;
-    r->eip = entry;
-    r->useresp = sp;
-    r->eflags = 0x202;
+    r->rip = entry;
+    r->rsp = sp;
+    r->rflags = 0x202;
 }
 
 /* Resolve `path`, follow up to two "#!" levels, load the ELF into a fresh
@@ -319,7 +321,7 @@ static void save_cmdline(proc_t* p, const kargs_t* a) {
 }
 
 static int load_program(fs_node_t* cwd, const char* path, kargs_t* a,
-                        uint32_t* pd_out, regs_t* frame, uint32_t* brk_out,
+                        uint64_t* pd_out, regs_t* frame, uint64_t* brk_out,
                         char* name_out, char* exe_out) {
     char cur[256];
     strncpy(cur, path, sizeof(cur) - 1);
@@ -363,7 +365,7 @@ static int load_program(fs_node_t* cwd, const char* path, kargs_t* a,
     if (!elf_ok(n)) return -ENOEXEC;
     fs_path(n, exe_out, 128);
 
-    uint32_t pd = vmm_new_space();
+    uint64_t pd = vmm_new_space();
     if (!pd) return -ENOMEM;
     image_t img;
     int r = load_elf(pd, n, &img, PIE_BASE);
@@ -382,18 +384,18 @@ static int load_program(fs_node_t* cwd, const char* path, kargs_t* a,
         else {
             const elf_ehdr_t* h = (const elf_ehdr_t*)in->data;
             const elf_phdr_t* ph = (const elf_phdr_t*)(in->data + h->phoff);
-            uint32_t span = 0;
+            uint64_t span = 0;
             for (int i = 0; i < h->phnum; i++)
                 if (ph[i].type == PT_LOAD && ph[i].vaddr + ph[i].memsz > span) span = ph[i].vaddr + ph[i].memsz;
             span = (span + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-            uint32_t b = vmm_find_free(pd, USER_MMAP_BASE, USER_STACK_TOP - USER_STACK_MAX, span);
+            uint64_t b = vmm_find_free(pd, USER_MMAP_BASE, USER_STACK_TOP - USER_STACK_MAX, span);
             if (!b) r = -ENOMEM;
             else r = load_elf(pd, in, &ii, b);
             if (r == 0) { img.base = b; img.start = ii.entry; }
         }
         // kprintf("interp %s at %x\n", ipath, img.base);
     }
-    uint32_t sp = 0;
+    uint64_t sp = 0;
     if (r == 0) r = build_stack(pd, a, &img, &sp);
     if (r < 0) { vmm_destroy_space(pd); return r; }
     init_user_frame(frame, img.start, sp);
@@ -412,7 +414,7 @@ static int start_task(proc_t* p, const regs_t* frame) {
     if (!ks) return -ENOMEM;
     regs_t* r = (regs_t*)(ks + KSTACK_SZ - sizeof(regs_t));
     *r = *frame;
-    int t = task_spawn_frame(p->name, ks, KSTACK_SZ, (uint32_t)r, p->pd, p);
+    int t = task_spawn_frame(p->name, ks, KSTACK_SZ, (uint64_t)r, p->pd, p);
     if (t < 0) { kfree(ks); return -EAGAIN; }
     p->task = t;
     return 0;
@@ -506,7 +508,7 @@ static proc_t* leader_of(proc_t* p) {
 }
 
 /* Futex waiters: at most one per proc (a proc sleeps in one syscall). */
-static struct { bool active, woken; uint32_t pd, addr; } fwq[MAX_PROCS];
+static struct { bool active, woken; uint64_t pd, addr; } fwq[MAX_PROCS];
 
 void futex_forget(proc_t* p) {
     fwq[p - procs].active = false;
@@ -518,7 +520,7 @@ static void ready_task_of(proc_t* p) {
     if (t && t->proc == p && t->state == T_BLOCKED) { t->wake_ms = 0; t->state = T_READY; }
 }
 
-void futex_wake_addr(uint32_t pd, uint32_t addr, int n) {
+void futex_wake_addr(uint64_t pd, uint64_t addr, int n) {
     uint32_t f = irq_save();
     for (int i = 0; i < MAX_PROCS && n > 0; i++) {
         if (!fwq[i].active || fwq[i].woken || fwq[i].pd != pd || fwq[i].addr != addr) continue;
@@ -668,7 +670,7 @@ static int send_sig(proc_t* p, int sig, bool exact) {
     if (sig == 0) return 0;
     if (sig < 0 || sig >= NSIG_MAX) return -EINVAL;
     if (sig != 9) {
-        uint32_t h = p->sh->sa[sig].handler;
+        uint64_t h = p->sh->sa[sig].handler;
         if (h == 1) return 0;                               /* SIG_IGN */
         if (h > 1) {                                        /* caught: delivered on return to ring 3 */
             proc_t* d = p->is_thread || exact ? p : pick_thread(p, sig);
@@ -714,12 +716,12 @@ bool proc_interrupted(void) {
 
 /* ---------------- faults ---------------- */
 
-bool proc_handle_fault(uint32_t addr, uint32_t err) {
+bool proc_handle_fault(uint64_t addr, uint64_t err) {
     proc_t* p = proc_current();
     if (!p || (err & 1)) return false;                   /* protection faults are real */
     /* lazy anon page: frame now. PROT_NONE (no US) and writes to read-only
        ones stay faults, java counts on those SIGSEGVs */
-    uint32_t pte = vmm_pte(p->pd, addr & ~(PAGE_SIZE - 1));
+    uint64_t pte = vmm_pte(p->pd, addr & ~(PAGE_SIZE - 1));
     if (pte & PTE_LAZY) {
         if (!(pte & PTE_US) || ((err & 2) && !(pte & PTE_RW))) return false;
         return vmm_fault_in(p->pd, addr);
@@ -730,24 +732,24 @@ bool proc_handle_fault(uint32_t addr, uint32_t err) {
 
 // top of the user stack on a segfault, addr2line the return addresses by hand.
 // no gdb in here, this is how yutani got debugged
-void proc_fault_stack(uint32_t esp) {
+void proc_fault_stack(uint64_t esp) {
     proc_t* p = proc_current();
     if (!p) return;
     klog("[proc] stack @"); klog_num(esp, 16); klog(":");
-    for (int i = 0; i < 256; i++) {
-        uint32_t a = esp + i * 4;
+    for (int i = 0; i < 128; i++) {
+        uint64_t a = esp + i * 8;
         if (!(vmm_pte(p->pd, a) & PTE_P)) break;
-        klog(i % 8 ? " " : "\r\n  "); klog_num(*(uint32_t*)a, 16);
+        klog(i % 4 ? " " : "\r\n  "); klog_num(*(uint64_t*)a, 16);
     }
     klog("\r\n");
 }
 
-void proc_fault_kill(const char* what, int sig, uint32_t eip, uint32_t addr) {
+void proc_fault_kill(const char* what, int sig, uint64_t eip, uint64_t addr) {
     proc_t* p = proc_current();
     klog("[proc] pid ");
     klog_num(p ? (uint32_t)p->pid : 0, 10);
     klog(" ("); klog(p ? p->name : "?"); klog("): "); klog(what);
-    klog(" eip=0x"); klog_num(eip, 16);
+    klog(" rip=0x"); klog_num(eip, 16);
     klog(" addr=0x"); klog_num(addr, 16);
     klog("\r\n");
     if (!p) { cli(); for (;;) hlt(); }
@@ -786,7 +788,7 @@ static int do_fork(regs_t* r, bool share) {
         file_ref(c->sh->fds[i]);
     }
     regs_t child = *r;
-    child.eax = 0;
+    child.rax = 0;
     int e = start_task(c, &child);
     if (e < 0) {
         for (int i = 0; i < MAX_FDS; i++) { file_close(c->sh->fds[i]); c->sh->fds[i] = NULL; }
@@ -814,22 +816,23 @@ int proc_vfork(regs_t* r) { return do_fork(r, true); }
 #define CLONE_CHILD_CLEARTID 0x200000
 #define CLONE_CHILD_SETTID   0x1000000
 
-static bool uword_ok(uint32_t a) { return a >= USER_BASE && a < USER_TOP - 4 && !(a & 3); }
+static bool uword_ok(uint64_t a) { return a >= USER_BASE && a < USER_TOP - 4 && !(a & 3); }
 
 /* tid pointers from clone: only writable mapped pages, no raw stores */
-static void put_tid(uint32_t pd, uint32_t a, int v) {
+static void put_tid(uint64_t pd, uint64_t a, int v) {
     if (uword_ok(a) && (vmm_pte(pd, a) & PTE_RW)) vmm_copy_to(pd, a, &v, 4);
 }
 
 int proc_clone(regs_t* r) {
-    uint32_t fl = r->ebx, stk = r->ecx, ptid = r->edx, tls = r->esi, ctid = r->edi;
+    /* x86_64 order: flags, stack, ptid, ctid, tls */
+    uint64_t fl = r->rdi, stk = r->rsi, ptid = r->rdx, ctid = r->r10, tls = r->r8;
     proc_t* parent = proc_current();
     if (!(fl & CLONE_THREAD)) {
         int pid = proc_fork(r);
         if (pid <= 0) return pid;
         proc_t* ch = proc_by_pid(pid);
         task_t* t = ch ? task_at(ch->task) : NULL;
-        if (t && stk) ((regs_t*)t->esp)->useresp = stk;
+        if (t && stk) ((regs_t*)t->rsp)->rsp = stk;
         if (fl & CLONE_PARENT_SETTID) put_tid(parent->pd, ptid, pid);
         if ((fl & CLONE_CHILD_SETTID) && ch) put_tid(ch->pd, ctid, pid);
         return pid;
@@ -854,16 +857,14 @@ int proc_clone(regs_t* r) {
     memcpy(c->cmdline, parent->cmdline, sizeof(c->cmdline));
     c->cmdline_len = parent->cmdline_len;
     if (fl & CLONE_SETTLS) {
-        if (tls < USER_BASE || tls + 16 > USER_TOP) { c->state = P_FREE; return -EFAULT; }
-        if (!(vmm_pte(c->pd, tls + 4) & PTE_P)) { c->state = P_FREE; return -EFAULT; }
-        c->tls_base = ((uint32_t*)tls)[1];
+        c->tls_base = tls;                  /* x86_64: the value itself, not a user_desc */
     }
     if (fl & CLONE_PARENT_SETTID) put_tid(c->pd, ptid, c->pid);
     if (fl & CLONE_CHILD_SETTID) put_tid(c->pd, ctid, c->pid);
     if ((fl & CLONE_CHILD_CLEARTID) && uword_ok(ctid)) c->clear_child_tid = ctid;
     regs_t child = *r;
-    child.eax = 0;
-    if (stk) child.useresp = stk;
+    child.rax = 0;
+    if (stk) child.rsp = stk;
     int e = start_task(c, &child);
     if (e < 0) { c->state = P_FREE; return e; }
     return c->pid;
@@ -874,7 +875,7 @@ int proc_clone(regs_t* r) {
 #define ETIMEDOUT 110
 
 /* tmo: ms to wait, 0xFFFFFFFF = forever. cmd is op without PRIVATE/CLOCK bits. */
-int futex_op(uint32_t uaddr, int op, uint32_t val, uint32_t tmo, uint32_t uaddr2, uint32_t val3) {
+int futex_op(uint64_t uaddr, int op, uint32_t val, uint64_t tmo, uint64_t uaddr2, uint32_t val3) {
     proc_t* p = proc_current();
     int cmd = op & 127;
     if (!uword_ok(uaddr)) return -EFAULT;
@@ -943,21 +944,21 @@ int proc_execve(regs_t* r, const char* path, char* const argv[], char* const env
     if (e < 0) return e;
     char cmdline[sizeof(p->cmdline)];               /* not a whole proc_t: kernel stack */
     uint16_t cmdline_len = cmdline_of(cmdline, sizeof(cmdline), &a);
-    uint32_t pd, brk;
+    uint64_t pd, brk;
     regs_t frame;
     char name[32], exe[128];
     e = load_program(p->sh->cwd, kpath, &a, &pd, &frame, &brk, name, exe);
     kargs_free(&a);
     if (e < 0) return e;
 
-    uint32_t old = p->pd;
+    uint64_t old = p->pd;
     p->pd = pd;
     task_set_cr3(pd);
     if (p->vfork_shared) p->vfork_shared = false;     /* old space is the parent's */
     else vmm_destroy_space(old);
     p->sh->brk_start = p->sh->brk = brk;
     p->tls_base = 0;
-    gdt_set_tls(0);
+    wrmsr_fs(0);
     memcpy(p->name, name, sizeof(p->name));
     memcpy(p->exe, exe, sizeof(p->exe));
     memcpy(p->cmdline, cmdline, sizeof(p->cmdline));

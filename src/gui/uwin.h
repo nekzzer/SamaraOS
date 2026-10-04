@@ -23,14 +23,14 @@ enum {
 enum { SM_EV_NONE, SM_EV_KEY, SM_EV_MOUSE_DOWN, SM_EV_MOUSE_UP, SM_EV_MOUSE_MOVE, SM_EV_CLOSE,
        SM_EV_WHEEL };
 
-typedef struct { int32_t w, h, scale, flags; uint32_t title; } sm_open_t;
+typedef struct { int32_t w, h, scale, flags; uint64_t title; } sm_open_t;
 typedef struct { int32_t type, a, b, c; } sm_event_t;
 typedef struct {
-    uint32_t buf; int32_t bw, bh, x, y, font; uint32_t color, str;
+    uint64_t buf; int32_t bw, bh, x, y, font; uint32_t color; uint64_t str;
 } sm_text_t;              /* buf == 0: measure only */
 
 /* Kernel side */
-int32_t uwin_syscall(uint32_t op, uint32_t a, uint32_t b, uint32_t c);
+int32_t uwin_syscall(uint32_t op, uint64_t a, uint64_t b, uint64_t c);
 void    uwin_proc_exit(int pid);       /* from process teardown */
 void    uwin_wm_frame(void);           /* once per WM frame: create/close windows */
 void    uwin_wm_exit(void);            /* WM shutting down: all windows closed */

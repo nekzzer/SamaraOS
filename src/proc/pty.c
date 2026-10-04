@@ -46,7 +46,7 @@ static pty_t ptys[NPTY];
 #define L_ECHOCTL 0x0200
 #define L_IEXTEN 0x8000
 
-static bool uptr(uint32_t a, uint32_t len) {
+static bool uptr(uint64_t a, uint64_t len) {
     return a >= USER_BASE && a < USER_TOP && len <= USER_TOP - a;
 }
 
@@ -344,7 +344,7 @@ void pty_set_size(int i, int rows, int cols) {
 
 /* ---------------- ioctl ---------------- */
 
-int pty_ioctl(int i, bool master, uint32_t req, uint32_t arg) {
+int pty_ioctl(int i, bool master, uint32_t req, uint64_t arg) {
     pty_t* p = get(i);
     if (!p) return -EIO;
     proc_t* me = proc_current();

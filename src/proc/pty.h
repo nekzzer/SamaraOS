@@ -18,7 +18,7 @@ int  pty_read(int i, bool master, char* buf, int n, bool nonblock);
 int  pty_write(int i, bool master, const char* buf, int n, bool nonblock);
 bool pty_readable(int i, bool master);
 bool pty_writable(int i, bool master);
-int  pty_ioctl(int i, bool master, uint32_t req, uint32_t arg);
+int  pty_ioctl(int i, bool master, uint32_t req, uint64_t arg);
 int  pty_pending(int i, bool master);          /* FIONREAD */
 void pty_unlock(int i);
 void pty_set_size(int i, int rows, int cols);
