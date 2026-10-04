@@ -55,6 +55,7 @@ struct window {
     int  fs_x, fs_y, fs_w, fs_h;                             /* before fullscreen */
     void (*on_resize)(window_t*);                             /* client size changed; NULL ok */
     void (*on_scroll)(window_t*, int dz);                     /* mouse wheel, dz > 0 = down; NULL ok */
+    void (*on_rclick)(window_t*, int rel_x, int rel_y);       /* right button press in client area; NULL ok */
     int  group;                      /* same non-zero group = one taskbar button */
 };
 
