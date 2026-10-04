@@ -607,9 +607,12 @@ static int do_pipe(int* fds, int flags) {
     return 0;
 }
 
+static int sock_ioctl(uint32_t req, uint32_t arg);
+
 static int do_ioctl(int fd, uint32_t req, uint32_t arg) {
     file_t* f = getf(fd);
     if (!f) return -EBADF;
+    if (req >= 0x8900 && req < 0x8950 && (f->type == F_SOCKET || f->type == F_NETLINK || f->type == F_USOCK)) return sock_ioctl(req, arg);
     if (req == 0x5421) {                                      /* FIONBIO */
         UCHK((void*)arg, 4);
         if (*(int*)arg) f->flags |= O_NONBLOCK; else f->flags &= ~O_NONBLOCK;
@@ -1364,6 +1367,62 @@ static int write_addr(uint32_t uaddr, uint32_t ulen, int af, const uint8_t* ip, 
     return 0;
 }
 
+/* SIOCGIF*: busybox ifconfig, ip and if_nametoindex() want them. -1 = lo, 0.. = ethN */
+static int sock_ioctl(uint32_t req, uint32_t arg) {
+    static const uint8_t z6[6];
+    const char* name; const uint8_t* mac; uint32_t ip, mask, gw, rx, tx;
+    int n = net_ifcount();
+    if (req == 0x8912) {                                      /* SIOCGIFCONF */
+        UCHK((void*)arg, 8);
+        int* len = (int*)arg;
+        uint8_t* out = (uint8_t*)((uint32_t*)arg)[1];
+        int k = 0;
+        for (int i = -1; i < n && (k + 1) * 32 <= *len; i++, k++) {
+            if (i < 0) { name = "lo"; ip = 0x7F000001; } else net_ifinfo(i, &name, &mac, &ip, &mask, &gw, &rx, &tx);
+            UCHK(out + k * 32, 32);
+            memset(out + k * 32, 0, 32);
+            strcpy((char*)out + k * 32, name);
+            sockaddr_in_t* sa = (sockaddr_in_t*)(out + k * 32 + 16);
+            sa->family = AF_INET; sa->addr = nbo32(ip);
+        }
+        *len = k * 32;
+        return 0;
+    }
+    UCHK((void*)arg, 32);
+    uint8_t* ifr = (uint8_t*)arg;
+    int i = -2;
+    if (req == 0x8910) {                                      /* SIOCGIFNAME */
+        i = *(int*)(ifr + 16) - 2;
+        if (i < -1 || i >= n) return -19;
+        if (i < 0) name = "lo"; else net_ifinfo(i, &name, &mac, &ip, &mask, &gw, &rx, &tx);
+        memset(ifr, 0, 16); strcpy((char*)ifr, name);
+        return 0;
+    }
+    if (!strcmp((char*)ifr, "lo")) i = -1;
+    else for (int k = 0; k < n; k++) { net_ifinfo(k, &name, &mac, &ip, &mask, &gw, &rx, &tx); if (!strcmp((char*)ifr, name)) i = k; }
+    if (i == -2) return -19;                                  /* ENODEV */
+    mac = z6; ip = 0x7F000001; mask = 0xFF000000;
+    if (i >= 0) net_ifinfo(i, &name, &mac, &ip, &mask, &gw, &rx, &tx);
+    sockaddr_in_t* sa = (sockaddr_in_t*)(ifr + 16);
+    switch (req) {
+        case 0x8933: *(int*)(ifr + 16) = i + 2; return 0;      /* SIOCGIFINDEX */
+        case 0x8913: *(uint16_t*)(ifr + 16) = i < 0 ? 0x49 : 0x1043; return 0;
+        case 0x8915: case 0x891b: case 0x8919:                /* ADDR, NETMASK, BRDADDR */
+            memset(ifr + 16, 0, 16);
+            sa->family = AF_INET;
+            sa->addr = nbo32(req == 0x8915 ? ip : req == 0x891b ? mask : (ip | ~mask));
+            return 0;
+        case 0x8927:                                          /* SIOCGIFHWADDR */
+            memset(ifr + 16, 0, 16);
+            *(uint16_t*)(ifr + 16) = i < 0 ? 772 : 1;
+            memcpy(ifr + 18, mac, 6);
+            return 0;
+        case 0x8921: *(int*)(ifr + 16) = i < 0 ? 65536 : 1500; return 0;   /* MTU */
+        case 0x8942: *(int*)(ifr + 16) = i < 0 ? 0 : 1000; return 0;       /* TXQLEN */
+    }
+    return -ENOTTY;
+}
+
 static int do_socketpair(uint32_t domain, uint32_t type, uint32_t proto, int* sv) {
     if (domain != 1) return -97;                                      /* AF_UNIX only */
     if ((type & 0xF) != 1) return -93;                                /* SOCK_STREAM only */
@@ -1665,9 +1724,76 @@ static void nl_attr(pipe_t* q, uint8_t* m, uint16_t type, const void* d, int n) 
     *(uint32_t*)m += al;
 }
 
+static void nl_dump6(pipe_t* q, uint32_t seq) {
+    uint8_t a[A6_MAX][16], pl[A6_MAX], sc[A6_MAX];
+    for (int i = -1; i < net_ifcount(); i++) {
+        int n = ip6_addrs(i, a, pl, sc, A6_MAX);
+        for (int k = 0; k < n; k++) {
+            uint8_t* m = nl_msg(q, 20, seq, 8);
+            if (!m) return;
+            m[16] = 10;
+            m[17] = pl[k];
+            m[18] = 0x80;                             /* IFA_F_PERMANENT */
+            m[19] = sc[k] == 0x20 ? 253 : sc[k] == 0x10 ? 254 : 0;
+            *(uint32_t*)(m + 20) = i + 2;
+            nl_attr(q, m, 1, a[k], 16);
+            uint32_t ci[4] = { 0xFFFFFFFF, 0xFFFFFFFF, 0, 0 };
+            nl_attr(q, m, 6, ci, 16);
+        }
+    }
+}
+
+static void nl_routes(pipe_t* q, uint32_t seq, int af) {
+    if (af == 0 || af == 2) {
+        for (int i = 0; i < net_ifcount(); i++) {
+            const char* name; const uint8_t* mac; uint32_t ip, mask, gw, rx, tx;
+            net_ifinfo(i, &name, &mac, &ip, &mask, &gw, &rx, &tx);
+            for (int k = 0; k < 2; k++) {
+                uint8_t* m = nl_msg(q, 24, seq, 12);
+                if (!m) return;
+                int pl = 0;
+                for (uint32_t x = mask; x; x <<= 1) pl++;
+                m[16] = 2;
+                m[17] = k ? 0 : pl;
+                m[20] = 254;                          /* main */
+                m[21] = k ? 16 : 2;                   /* dhcp / kernel */
+                m[22] = k ? 0 : 253;                  /* universe / link */
+                m[23] = 1;
+                uint32_t be = nbo32(k ? gw : ip & mask), pf = nbo32(ip), oif = i + 2, tb = 254;
+                if (k) nl_attr(q, m, 5, &be, 4);
+                else { nl_attr(q, m, 1, &be, 4); nl_attr(q, m, 7, &pf, 4); }
+                nl_attr(q, m, 4, &oif, 4);
+                nl_attr(q, m, 15, &tb, 4);
+            }
+        }
+    }
+    if (af == 0 || af == 10) {
+        ip6_route_t r[16];
+        int n = ip6_routes(r, 16);
+        for (int k = 0; k < n; k++) {
+            uint8_t* m = nl_msg(q, 24, seq, 12);
+            if (!m) return;
+            bool gwr = (r[k].flags & 2) != 0;
+            m[16] = 10;
+            m[17] = (uint8_t)r[k].dlen;
+            m[20] = 254;
+            m[21] = gwr ? 9 : 2;                      /* ra / kernel */
+            m[23] = 1;
+            uint32_t oif = r[k].ifi + 2, tb = 254, pr = r[k].metric;
+            if (r[k].dlen) nl_attr(q, m, 1, r[k].dst, 16);
+            nl_attr(q, m, 4, &oif, 4);
+            if (gwr) nl_attr(q, m, 5, r[k].gw, 16);
+            nl_attr(q, m, 6, &pr, 4);
+            nl_attr(q, m, 15, &tb, 4);
+        }
+    }
+}
+
 static void nl_dump(pipe_t* q, int type, uint32_t seq, int af) {
     static const uint8_t zero[6], ff[6] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };
-    int n = af == 10 ? -1 : net_ifcount();            /* no ipv6 here */
+    int n = (af == 10 || type == 26) ? -1 : net_ifcount();
+    if (type == 26) nl_routes(q, seq, af);
+    if (type == 22 && (af == 0 || af == 10)) nl_dump6(q, seq);
     for (int i = -1; i < n; i++) {                    /* -1 = lo */
         const char* name = "lo";
         const uint8_t* mac = zero;
@@ -1686,7 +1812,7 @@ static void nl_dump(pipe_t* q, int type, uint32_t seq, int af) {
             nl_attr(q, m, 4, &mtu, 4);
             uint32_t st[23] = { rx, tx };            /* rtnl_link_stats, packets only */
             nl_attr(q, m, 7, st, sizeof(st));
-        } else if (type == 22) {                      /* RTM_GETADDR -> NEWADDR */
+        } else if (type == 22 && af != 10) {          /* RTM_GETADDR -> NEWADDR */
             uint8_t* m = nl_msg(q, 20, seq, 8);
             if (!m) break;
             int pl = 0;
@@ -1706,6 +1832,27 @@ static void nl_dump(pipe_t* q, int type, uint32_t seq, int af) {
     if (d) *(uint16_t*)(d + 6) = 0;
 }
 
+/* RTM_NEWADDR / DELADDR, only v6 for `ip -6 addr add` */
+static void nl_addr(pipe_t* q, const uint8_t* h, uint32_t len) {
+    int type = *(const uint16_t*)(h + 4);
+    int err = 0;
+    if (len >= 24 && h[16] == 10) {
+        uint8_t a[16];
+        bool got = false;
+        for (uint32_t o = 24; o + 4 <= len; ) {
+            int al = *(const uint16_t*)(h + o), at = *(const uint16_t*)(h + o + 2) & 0x3FFF;
+            if (al < 4 || o + al > len) break;
+            if ((at == 1 || at == 2) && al >= 20) { memcpy(a, h + o + 4, 16); got = true; }
+            o += (al + 3) & ~3;
+        }
+        int ifi = *(const int32_t*)(h + 20) - 2;
+        if (!got) err = -22;
+        else err = type == 20 ? ip6_addr_add(ifi, a, h[17]) : ip6_addr_del(ifi, a);
+    }
+    uint8_t* m = nl_msg(q, 2, *(const uint32_t*)(h + 8), 20);
+    if (m) { *(uint16_t*)(m + 6) = 0; *(int32_t*)(m + 16) = err; memcpy(m + 20, h, 16); }
+}
+
 static int32_t nl_call(int call, file_t* f, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32_t f6) {
     pipe_t* q = f->pipe;
     switch (call) {
@@ -1719,12 +1866,21 @@ static int32_t nl_call(int call, file_t* f, uint32_t b, uint32_t c, uint32_t d, 
             *(uint32_t*)c = 12;
             return 0;
         }
+        case 16: {                                    /* sendmsg: busybox ip, iproute2 */
+            UCHK((void*)b, 28);
+            uint32_t* mh = (uint32_t*)b;
+            if (!mh[3]) return 0;
+            iovec_t* iov = (iovec_t*)mh[2];
+            UCHK(iov, sizeof(iovec_t));
+            b = (uint32_t)iov[0].base; c = iov[0].len;
+        }                                             /* fall through */
         case 9: case 11: {                            /* send(to) */
             UCHK((void*)b, c);
             if (c < 17) return -EINVAL;
             const uint8_t* h = (const uint8_t*)b;
             int type = *(const uint16_t*)(h + 4);
-            if (type == 18 || type == 22) nl_dump(q, type, *(const uint32_t*)(h + 8), h[16]);
+            if (type == 18 || type == 22 || type == 26) nl_dump(q, type, *(const uint32_t*)(h + 8), h[16]);
+            else if (type == 20 || type == 21) nl_addr(q, h, c);
             else {                                    /* anything else: error 0 = ack, good enough */
                 uint8_t* m = nl_msg(q, 2, *(const uint32_t*)(h + 8), 4);
                 if (m) *(uint16_t*)(m + 6) = 0;
@@ -1740,7 +1896,10 @@ static int32_t nl_call(int call, file_t* f, uint32_t b, uint32_t c, uint32_t d, 
                 iovec_t* iov = (iovec_t*)mh[2];
                 UCHK(iov, sizeof(iovec_t));
                 buf = (uint8_t*)iov[0].base; cap = iov[0].len;
-                mh[1] = 0; mh[5] = 0; mh[6] = 0;
+                mh[5] = 0; mh[6] = 0;
+                uint32_t ncap = mh[1];
+                mh[1] = 0;
+                if (mh[0] && ncap >= 12) { UCHK((void*)mh[0], 12); memset((void*)mh[0], 0, 12); *(uint16_t*)mh[0] = 16; mh[1] = 12; }   // sockaddr_nl, busybox ip wants it
             } else { buf = (uint8_t*)b; cap = c; }
             if (!q->count) return -EAGAIN;
             UCHK(buf, cap);
@@ -1762,6 +1921,8 @@ static int32_t nl_call(int call, file_t* f, uint32_t b, uint32_t c, uint32_t d, 
     return 0;
 }
 
+int nl_write(file_t* f, const char* buf, uint32_t n) { return nl_call(9, f, (uint32_t)buf, n, 0, 0, 0); }
+
 static int32_t sys_socket_call(int call, uint32_t a, uint32_t b, uint32_t c,
                                uint32_t d, uint32_t e, uint32_t f6) {
     int err = 0;
@@ -1776,6 +1937,7 @@ static int32_t sys_socket_call(int call, uint32_t a, uint32_t b, uint32_t c,
     }
     switch (call) {
         case 1: {                                                     /* socket */
+            if (a == 1 && (b & 0xF) == 2) b = (b & ~0xF) | 3, a = 16;   // unix dgram: dummy, musl if_nametoindex() only needs it for the ioctl
             if (a == 1) {                                             /* AF_UNIX */
                 if ((b & 0xF) != 1) return -93;                       /* stream only, no dgram yet */
                 fl = file_new(F_USOCK, 2 | ((b & 04000) ? O_NONBLOCK : 0));

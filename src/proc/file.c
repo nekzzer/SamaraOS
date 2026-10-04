@@ -374,7 +374,8 @@ int file_read(file_t* f, char* buf, uint32_t n) {
 
 int file_write(file_t* f, const char* buf, uint32_t n) {
     switch (f->type) {
-        case F_NULL: case F_ZERO: case F_RANDOM: case F_NETLINK: return (int)n;
+        case F_NULL: case F_ZERO: case F_RANDOM: return (int)n;
+        case F_NETLINK: { extern int nl_write(file_t*, const char*, uint32_t); return nl_write(f, buf, n); }   // busybox ip uses write()
         case F_EVENTFD: {
             if (n < 8) return -22;
             uint64_t v;

@@ -9,7 +9,6 @@
 /* IPv6: ethernet 0x86DD, ICMPv6 echo + NDP, SLAAC from RAs, a default route.
    No DAD, no MLD, no fragments (they get dropped), no pmtu discovery. */
 
-#define A6_MAX   4
 #define NB_SLOTS 16
 #define PFX_MAX  2
 #define LOOP6    32

@@ -38,6 +38,7 @@ int  net_http_get(uint32_t ip, uint16_t port, const char* host, const char* path
 void     net_send_ip(uint32_t dst, uint8_t proto, const void* payload, int len);
 uint32_t net_src_for(uint32_t dst);        /* our address as seen by `dst` */
 
+#define A6_MAX 4
 /* ipv6.c, addresses are 16 bytes network order */
 typedef struct { uint8_t dst[16], gw[16]; int dlen, ifi, metric; uint32_t flags; } ip6_route_t;
 void ip6_init(void);
