@@ -804,6 +804,7 @@ static void unlock(void) { busy = 0; }
 
 /* a lazy file is opened: read it now. the hash goes into its ent, else
    the next sync would think it changed and write it all back */
+static void rc_do(size_t need);
 static int ext2_lazy(fs_node_t* n) {
     ev_t* v = NULL;
     for (int i = 0; i < E2_MAX; i++) if (vols[i].used && vols[i].id == n->lazy_vol) v = &vols[i];
@@ -813,6 +814,14 @@ static int ext2_lazy(fs_node_t* n) {
        fail = the node just stays lazy, open() says ENOMEM. it used to zero the
        size and the next sync wrote the file back empty */
     char* d = kmalloc_big(sz + 1);
+    /* the reclaim in kmalloc_big only tries the lock and the sync holds it a
+       lot when memory is tight: exec failed with ENOMEM. here we may wait */
+    for (int t = 0; !d && t < 3; t++) {
+        lock();
+        rc_do(sz + 1);
+        unlock();
+        d = kmalloc_big(sz + 1);
+    }
     if (!d) { klog("ext2: no memory for a lazy file\r\n"); return -1; }
     lock();
     if (n->lazy != want || n->size != sz) { unlock(); kfree(d); return 0; }   /* somebody beat us to it */
@@ -857,6 +866,17 @@ static void rc_walk(ev_t* v, fs_node_t* d, uint32_t now) {
         c->lazy = e->ino; c->lazy_vol = (uint8_t)v->id;
         e->dp = NULL;
     }
+}
+
+/* lock held by the caller */
+static void rc_do(size_t need) {
+    uint32_t f = irq_save();
+    rc_freed = 0;
+    rc_want = (uint32_t)need + 8 * 1024 * 1024;
+    uint32_t now = pit_uptime_ms();
+    for (int i = 0; i < E2_MAX && rc_freed < rc_want; i++)
+        if (vols[i].used && !vols[i].ro && vols[i].E && vols[i].tab) rc_walk(&vols[i], vols[i].root, now);
+    irq_restore(f);
 }
 
 static void ext2_reclaim(size_t need) {
