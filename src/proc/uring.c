@@ -361,6 +361,7 @@ static int do_rw(req_t* q, char* buf, uint32_t n, bool wr) {
     if (wr ? (acc == 0 && f->type == F_NODE) : acc == 1) return -EBADF;
     if (!n) return 0;
     if (!sys_uok(buf, n)) return -EFAULT;
+    if (wr && f->type == F_PIPE_W && f->pipe->readers <= 0) return -32;     // EPIPE, no SIGPIPE from here
     uint64_t off = q->sqe.off;
     if (off == ~0ull || f->type != F_NODE) return wr ? file_write(f, buf, n) : file_read(f, buf, n);
     uint32_t save = f->off;
