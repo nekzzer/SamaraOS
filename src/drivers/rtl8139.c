@@ -104,6 +104,9 @@ int rtl8139_init(void) {
     outw(g_io + RTL_IMR, 0);
     outw(g_io + RTL_ISR, 0xFFFF);   /* clear */
 
+    /* multicast hash: let all in (33:33:.. for ipv6) */
+    outl(g_io + 0x08, 0xFFFFFFFF);
+    outl(g_io + 0x0C, 0xFFFFFFFF);
     /* configure RX */
     outl(g_io + RTL_RCR, RCR_VAL);
 

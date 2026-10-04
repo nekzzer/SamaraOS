@@ -13,21 +13,27 @@ void    sock_init(void);                      /* starts the netd polling task */
 /* Packet input from net.c (payload = TCP/UDP header onwards). */
 void    sock_input_tcp(uint32_t src, uint32_t dst, const uint8_t* seg, int len);
 void    sock_input_udp(uint32_t src, uint32_t dst, const uint8_t* dgram, int len);
+void    sock_input_tcp6(const uint8_t* src, const uint8_t* dst, const uint8_t* seg, int len);
+void    sock_input_udp6(const uint8_t* src, const uint8_t* dst, const uint8_t* dgram, int len);
+void    sock_input_icmp6(const uint8_t* src, const uint8_t* dst, const uint8_t* msg, int len);
 
 /* All return >= 0 or -errno. `nonblock` comes from the file's O_NONBLOCK. */
-sock_t* sock_create(int type, int* err);      /* 1 = SOCK_STREAM, 2 = SOCK_DGRAM */
+/* addresses below are 16 bytes, v4 as ::ffff:a.b.c.d */
+sock_t* sock_create(int af, int type, int proto, int* err);   /* type 1 stream, 2 dgram, 3 raw */
+int     sock_af(sock_t* s);
+int     sock_v6only(sock_t* s, int set, int val);   /* set < 0 = just read */
 void    sock_ref(sock_t* s);
 void    sock_close(sock_t* s);
-int     sock_bind(sock_t* s, uint32_t ip, uint16_t port);
+int     sock_bind(sock_t* s, const uint8_t* ip, uint16_t port);
 int     sock_listen(sock_t* s, int backlog);
-sock_t* sock_accept(sock_t* s, bool nonblock, int* err, uint32_t* ip, uint16_t* port);
-int     sock_connect(sock_t* s, uint32_t ip, uint16_t port, bool nonblock);
+sock_t* sock_accept(sock_t* s, bool nonblock, int* err, uint8_t* ip, uint16_t* port);
+int     sock_connect(sock_t* s, const uint8_t* ip, uint16_t port, bool nonblock);
 int     sock_send(sock_t* s, const uint8_t* buf, uint32_t len, bool nonblock,
-                  const uint32_t* to_ip, const uint16_t* to_port);
+                  const uint8_t* to_ip, const uint16_t* to_port);
 int     sock_recv(sock_t* s, uint8_t* buf, uint32_t len, bool nonblock, bool peek,
-                  uint32_t* from_ip, uint16_t* from_port);
+                  uint8_t* from_ip, uint16_t* from_port);
 int     sock_shutdown(sock_t* s, int how);
-void    sock_name(sock_t* s, bool peer, uint32_t* ip, uint16_t* port);
+void    sock_name(sock_t* s, bool peer, uint8_t* ip, uint16_t* port);
 int     sock_type(sock_t* s);
 int     sock_take_error(sock_t* s);           /* SO_ERROR */
 bool    sock_readable(sock_t* s);

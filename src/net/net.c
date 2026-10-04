@@ -186,6 +186,12 @@ static void send_eth(nif_t* f, uint16_t type, const uint8_t* dst_mac, const void
     nic_send(f, frame, ETH_HDR + len);
 }
 
+int net_eth_send(int ifi, const uint8_t* dmac, uint16_t type, const void* pl, int len) {
+    if (ifi < 0 || ifi >= n_nifs) return -1;
+    send_eth(&nifs[ifi], type, dmac, pl, len);
+    return 0;
+}
+
 static void send_arp_request(nif_t* f, uint32_t target_ip) {
     arp_hdr_t a;
     a.htype = htons(1);
@@ -529,7 +535,9 @@ void net_poll(void) {
             uint16_t type = ntohs(eh->type);
             if (type == ET_ARP) on_arp(&nifs[k], buf + ETH_HDR, n - ETH_HDR);
             else if (type == ET_IPV4) on_ipv4(buf + ETH_HDR, n - ETH_HDR);
+            else if (type == 0x86DD) ip6_input(k, buf + ETH_HDR, n - ETH_HDR, eh->src);
         }
+    ip6_poll();
     irq_restore(irq);
 }
 
@@ -667,6 +675,7 @@ int net_init(void) {
     for (const char* m = g_gw_known ? "samara: gw arp ok\r\n" : "samara: gw arp FAIL\r\n"; *m; m++) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, *m); }
     uint8_t dns_mac[6];
     resolve_mac(dns ? dns : IP4(NET_IP_A, NET_IP_B, NET_IP_C, 3), dns_mac, 500);
+    ip6_init();
     return 0;
 }
 

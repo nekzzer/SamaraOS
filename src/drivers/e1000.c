@@ -100,8 +100,8 @@ int e1000_init(void) {
     wr(0x2810, 0);
     wr(0x2818, NRX - 1);
     rx_cur = 0;
-    /* EN | BAM | BSIZE 2048 | SECRC */
-    wr(0x0100, (1 << 1) | (1 << 15) | (1 << 26));
+    /* EN | MPE (all multicast, ipv6 needs 33:33) | BAM | BSIZE 2048 | SECRC */
+    wr(0x0100, (1 << 1) | (1 << 4) | (1 << 15) | (1 << 26));
 
     tx = amalloc(sizeof(txd_t) * NTX);
     memset(tx, 0, sizeof(txd_t) * NTX);
