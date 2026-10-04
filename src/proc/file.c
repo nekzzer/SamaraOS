@@ -10,6 +10,7 @@
 #include "drivers/ata.h"
 #include "net/sock.h"
 #include "drivers/fbdev.h"
+#include "drivers/drm.h"
 #include "drivers/input.h"
 
 #define O_ACCMODE  3
@@ -50,6 +51,15 @@ file_t* file_open_node(fs_node_t* n, int flags) {
         if (!f) return NULL;
         f->disk = n->dev == FS_DEV_EVKBD ? INPUT_KBD : INPUT_MOUSE;   /* which ring */
         input_open(f->disk);
+        return f;
+    }
+    if (n->dev == FS_DEV_DRM || n->dev == FS_DEV_DRMR) {
+        struct drm_fd* d = drm_open(n->dev == FS_DEV_DRMR);
+        if (!d) return NULL;
+        file_t* f = file_new(F_DRM, flags);
+        if (!f) { drm_close(d); return NULL; }
+        f->drm = d;
+        f->disk = n->dev == FS_DEV_DRMR;
         return f;
     }
     if (n->dev == FS_DEV_PTMX) {                               /* new pty pair */
@@ -93,6 +103,7 @@ void file_close(file_t* f) {
     if (f->type == F_NODE && f->node) fs_release(f->node);
     if (f->type == F_SOCKET && f->sock) sock_close(f->sock);
     if (f->type == F_FB) fbdev_close();
+    if (f->type == F_DRM) drm_close(f->drm);
     if (f->type == F_INPUT) input_close(f->disk);
     if (f->type == F_PTM) pty_master_close(f->pty);
     if (f->type == F_PTS) pty_slave_close(f->pty);
@@ -259,6 +270,7 @@ bool file_readable(file_t* f) {
         case F_TIMERFD: return f->t_next && (int32_t)(pit_uptime_ms() - f->t_next) >= 0;
         case F_USOCK:  return false;
         case F_INPUT:  return input_pending(f->disk);
+        case F_DRM:    return drm_readable(f->drm);
         case F_PTM:    return pty_readable(f->pty, true);
         case F_PTS:    return pty_readable(f->pty, false);
         default:       return true;
@@ -351,6 +363,13 @@ int file_read(file_t* f, char* buf, uint32_t n) {
             return pty_read(f->pty, f->type == F_PTM, buf, (int)n, (f->flags & O_NONBLOCK) != 0);
         case F_DISK: return disk_rw(f, buf, n, false);
         case F_FB:   return -EBADF;
+        case F_DRM:
+            while (!drm_readable(f->drm)) {
+                if (f->flags & O_NONBLOCK) return -11;
+                if (proc_interrupted()) return -4;
+                task_sleep_ms(2);
+            }
+            return drm_read(f->drm, buf, n);
         case F_INPUT: return input_read(f->disk, buf, n, (f->flags & O_NONBLOCK) != 0);
         case F_SOCKET: return sock_recv(f->sock, (uint8_t*)buf, n, (f->flags & O_NONBLOCK) != 0, false, 0, 0);
         case F_PIPE_W: return -EBADF;
@@ -374,7 +393,7 @@ int file_read(file_t* f, char* buf, uint32_t n) {
 
 int file_write(file_t* f, const char* buf, uint32_t n) {
     switch (f->type) {
-        case F_NULL: case F_ZERO: case F_RANDOM: case F_NETLINK: return (int)n;
+        case F_NULL: case F_ZERO: case F_RANDOM: case F_NETLINK: case F_DRM: return (int)n;
         case F_EVENTFD: {
             if (n < 8) return -22;
             uint64_t v;

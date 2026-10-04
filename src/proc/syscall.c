@@ -24,6 +24,7 @@
 #include "fs/fatfs.h"
 #include "fs/ext2.h"
 #include "net/net.h"
+#include "drivers/drm.h"
 
 #define EPERM 1
 #define ENOENT 2
@@ -92,6 +93,7 @@ static bool uok(const void* p, uint32_t len) {
     }
     return true;
 }
+bool user_ok(const void* p, uint32_t len) { return uok(p, len); }
 #define UCHK(p, n) do { if (!uok((p), (n))) return -EFAULT; } while (0)
 
 /* user string: walk it page by page till the NUL */
@@ -240,6 +242,7 @@ static void fill_stat_node(kstat64_t* st, fs_node_t* n) {
         st->st_mode = S_IFCHR | (n->mode & 07777);
         st->st_rdev = n->dev == FS_DEV_TTY  ? (5u << 8) :
                       n->dev == FS_DEV_PTMX ? ((5u << 8) | 2) :
+                      n->dev == FS_DEV_DRM ? (226u << 8) : n->dev == FS_DEV_DRMR ? ((226u << 8) | 128) :
                       FS_DEV_IS_PTS(n->dev) ? ((136u << 8) | (uint32_t)(n->dev - FS_DEV_PTS)) :
                                               ((1u << 8) | n->dev);
     } else if (n->type == FS_DIR) {
@@ -274,7 +277,7 @@ static void fill_stat_file(kstat64_t* st, file_t* f) {
         st->st_mode = S_IFCHR | 0666;
         /* input: major 13, minor 64+n like /dev/input/eventN. evdev compares
            st_rdev and threw the mouse out as a duplicate of the keyboard */
-        st->st_rdev = f->type == F_TTY ? (5u << 8) : f->type == F_INPUT ? (13u << 8) | (64u + (uint32_t)f->disk)
+        st->st_rdev = f->type == F_DRM ? (226u << 8) | (f->disk ? 128u : 0) : f->type == F_TTY ? (5u << 8) : f->type == F_INPUT ? (13u << 8) | (64u + (uint32_t)f->disk)
                                                                        : (1u << 8) | 3;
     }
     st->st_atime = st->st_mtime = st->st_ctime = clock_epoch();
@@ -626,6 +629,7 @@ static int do_ioctl(int fd, uint32_t req, uint32_t arg) {
         *(int*)arg = n;
         return 0;
     }
+    if (f->type == F_DRM) return drm_ioctl(f->drm, req, (void*)arg);
     if (f->type == F_INPUT) {
         uint32_t len = (req >> 16) & 0x3FFF;
         if (len) UCHK((void*)arg, len);
@@ -887,7 +891,7 @@ static int32_t do_mmap(uint32_t addr, uint32_t len, int prot, int flags, int fd,
     if (!(flags & MAP_ANON)) {
         f = getf(fd);
         if (!f) return -EBADF;
-        if (f->type != F_NODE && f->type != F_ZERO && f->type != F_FB) return -EACCES;
+        if (f->type != F_NODE && f->type != F_ZERO && f->type != F_FB && f->type != F_DRM) return -EACCES;
     }
     uint32_t lo = USER_MMAP_BASE, hi = USER_STACK_TOP - USER_STACK_MAX;
     if (flags & MAP_FIXED) {
@@ -917,11 +921,17 @@ static int32_t do_mmap(uint32_t addr, uint32_t len, int prot, int flags, int fd,
         vmm_flush();
         return (int32_t)addr;
     }
+    if (f && f->type == F_DRM) {
+        int r = drm_mmap(f->drm, p->pd, addr, len, off, (prot & PROT_WRITE) != 0);
+        if (r < 0) { vmm_free_range(p->pd, addr, len); vmm_flush(); return r; }
+        vmm_flush();
+        return (int32_t)addr;
+    }
     if (f && f->type == F_FB) {
         /* the real lfb pages, shared. pmm_ref/unref skip frames outside the
            pool, so munmap/exit can't hand video memory out as ram. xorg fbdev */
         int pitch, bpp;
-        uint32_t fb = (uint32_t)gfx_front_fb(&pitch, &bpp);
+        uint32_t fb = (uint32_t)V2P(gfx_front_fb(&pitch, &bpp));
         uint32_t size = (uint32_t)pitch * (uint32_t)gfx_h();
         if (!fb || off >= size) return -EINVAL;
         for (uint32_t k = 0; k < len / PAGE_SIZE && off + k * PAGE_SIZE < size; k++)

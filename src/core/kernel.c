@@ -36,6 +36,7 @@
 #include "fs/fatfs.h"
 #include "fs/ext2.h"
 #include "shell/commands.h"
+#include "drivers/drm.h"
 
 /* ---------- Multiboot 1 header ---------- */
 #define MB_MAGIC 0x1BADB002
@@ -419,6 +420,7 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
 
     boot_step("usb");
     usb_init();
+    drm_init();
     boot_done("uhci (polled)");
 
     BOOT_OK("synth wavs", synth_install_demo_wavs());

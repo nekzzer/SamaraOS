@@ -111,6 +111,8 @@ KERN_SRC := \
     src/drivers/rtl8139.c \
     src/drivers/e1000.c \
     src/drivers/virtio.c \
+    src/drivers/vgpu.c \
+    src/drivers/drm.c \
     src/fs/ext2.c \
     src/drivers/usb.c \
     src/net/net.c \
