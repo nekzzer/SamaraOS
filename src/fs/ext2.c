@@ -988,6 +988,17 @@ int ext2_mount(int disk, fs_node_t* at) {
         if (rblk(v, v->first_data + 1 + b, v->gdt + b * v->bs) < 0) return -5;
     memcpy(v->mgdt, v->gdt, v->gdt_blocks * v->bs);
     v->itb = (v->ipg * v->isize + v->bs - 1) / v->bs;
+    /* descriptors that point outside their group: a broken disk, don't
+       write a single block to it (the guards below trust these) */
+    for (uint32_t g = 0; g < v->ngroups && !v->ro; g++) {
+        uint8_t* gd = v->gdt + g * 32;
+        uint32_t lo = v->first_data + g * v->bpg, hi = lo + v->bpg;
+        uint32_t bb = rd32(gd), ib = rd32(gd + 4), it = rd32(gd + 8);
+        if (bb < lo || bb >= hi || ib < lo || ib >= hi || it < lo || it + v->itb > hi || bb >= v->nblocks) {
+            klog("ext2: bad group descriptors, mounting read-only. run e2fsck on the host\r\n");
+            v->ro = true;
+        }
+    }
     if (!v->ro) {
         v->bbm = kmalloc_big(v->ngroups * v->bs);
         v->ibm = kmalloc_big(v->ngroups * v->bs);

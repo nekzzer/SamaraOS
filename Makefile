@@ -311,6 +311,11 @@ BOOT_MODS   := $(GCC_TAR),$(SRC_TAR)
 RUN_MODULES = $(if $(wildcard $(GCC_TAR)),-initrd "$(BOOT_MODS)")
 
 run: $(KERNEL) $(DISK_IMG) $(ROOTDISK) src-tar
+	@# preen the root disk first: small damage gets fixed here, big damage stops the run
+	@if [ -n "$(ROOTDISK)" ] && command -v e2fsck >/dev/null; then \
+	    e2fsck -fp $(ROOTDISK) >/tmp/samara-fsck.log 2>&1; r=$$?; \
+	    if [ $$r -ge 4 ]; then cat /tmp/samara-fsck.log; \
+	        echo "root disk $(ROOTDISK) is broken: e2fsck -fy $(ROOTDISK), or rm it to start clean"; exit 1; fi; fi
 	@mkdir -p $(MUSIC_DIR)
 	@test -f $(GCC_TAR) || $(MAKE) --no-print-directory $(GCC_TAR) || echo "(no gcc module: toolchain/gcc-native missing)"
 	K=$$(python3 tools/pick-kernel.py $(DISK_IMG) $(KERNEL) $(SELF_KERNEL)) && \
