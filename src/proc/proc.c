@@ -29,7 +29,7 @@ static int    next_pid = 1;
 
 static void com_putc(char c) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, c); }
 static void klog(const char* s) { while (*s) com_putc(*s++); }
-static void klog_num(uint64_t v, int base) { char b[16]; utoa(v, b, base); klog(b); }
+static void klog_num(uint64_t v, int base) { char b[24]; utoa(v, b, base); klog(b); }
 
 /* ---------------- lookup ---------------- */
 
@@ -940,6 +940,7 @@ int proc_execve(regs_t* r, const char* path, char* const argv[], char* const env
     char kpath[256];
     strncpy(kpath, path, sizeof(kpath) - 1);
     kpath[sizeof(kpath) - 1] = 0;
+    if (!strcmp(kpath, "/proc/self/exe")) strcpy(kpath, p->exe);   // busybox ash re-execs itself like this
     int e = kargs_build(&a, NULL, 0, argv, 0, envp);
     if (e < 0) return e;
     char cmdline[sizeof(p->cmdline)];               /* not a whole proc_t: kernel stack */

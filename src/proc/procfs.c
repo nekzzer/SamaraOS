@@ -160,10 +160,10 @@ static void fill_pid_dir(fs_node_t* d, proc_t* p, char* mem, uint32_t cap) {
     /* maps: rough, from what we know without walking page tables (too slow,
        this runs on every /proc lookup). mmap area is one blob */
     b = (sb_t){ mem, 0, cap };
-    char hx[12];
+    char hx[24];
 #define HX(v) do { utoa((v), hx, 16); for (int _i = (int)strlen(hx); _i < 8; _i++) sb_putc(&b, '0'); sb_puts(&b, hx); } while (0)
-    if (p->sh->brk_start > 0x08048000u) {
-        HX(0x08048000u); sb_putc(&b, '-'); HX(p->sh->brk_start);
+    if (p->sh->brk_start > 0x400000u) {
+        HX(0x400000u); sb_putc(&b, '-'); HX(p->sh->brk_start);
         sb_puts(&b, " r-xp 00000000 00:00 0          "); sb_puts(&b, p->name); sb_putc(&b, '\n');
     }
     if (p->sh->brk > p->sh->brk_start) {
@@ -253,11 +253,11 @@ static void fill_globals(char* mem, uint32_t cap) {
     put(proc_root, "stat", &b);
 
     b = (sb_t){ mem, 0, cap };
-    sb_puts(&b, "Linux version 5.0.0-samara (SamaraOS 0.5) #1 i686\n");
+    sb_puts(&b, "Linux version 5.0.0-samara (SamaraOS 0.5) #1 x86_64\n");
     put(proc_root, "version", &b);
 
     b = (sb_t){ mem, 0, cap };
-    sb_puts(&b, "processor\t: 0\nvendor_id\t: SamaraOS\nmodel name\t: i686 (QEMU)\n"
+    sb_puts(&b, "processor\t: 0\nvendor_id\t: SamaraOS\nmodel name\t: x86_64 (QEMU)\n"
                 "cpu MHz\t\t: 1000.000\nflags\t\t: fpu pse tsc fxsr\nbogomips\t: 2000.00\n\n");
     put(proc_root, "cpuinfo", &b);
 
