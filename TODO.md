@@ -36,6 +36,10 @@ make run SELF=0 NICS=3                      # + virtio-net cards eth1, eth2
 * merged ag/fm: static x86_64 `userland/fm` embedded as /usr/bin/fm (`make fm`, musl from void
   musl-devel in /tmp/int-x64sdk). samara.h structs have 64 bit pointers now
 * tested headless: drmtest on virtio-gpu and -vga std, `ip -6`/ping6/wget on rtl8139, e1000, virtio-net, fm in the DE
+* merged ag/uring: io_uring on x86_64 (425/426/427, ring frames via pmm_alloc_run + P2V, mapped with vmm_map_frame,
+  64 bit iovec/addrs, msghdr check 56). liburing static musl: io_uring-test/cp, link-cp (md5 ok), test/ nop probe link
+  link-timeout timeout fsync connect accept-link cq-full eventfd poll-many all rc=0. IORING_OP_STATX works only via uring
+  (syscall 332 is still ENOSYS)
 * left: userland/sysroot.tar is still the old i386 one (samarafetch, tetris, tcc... don't run), no
   x86_64 rebuild of it; ping6 prints ttl=-1 (no IPV6_HOPLIMIT cmsg); bochs drm has no hw cursor
   (ENXIO, expected); fm right click / menus only checked by eye on the first screen, not clicked through
