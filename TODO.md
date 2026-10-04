@@ -27,6 +27,19 @@ make run SELF=0 NICS=3                      # + virtio-net cards eth1, eth2
 * phone notifications: `tools/ntfy.sh msg|pic|read` (topic in ~/.config/samara-ntfy-topic)
 * headers are tracked (`-MMD`), a plain `make` is enough after editing a .h
 
+## Integration (ag/int: x64 + drm + ipv6 + fm)
+
+* merged ag/drm: modern virtio pci, virtio-gpu 2d, /dev/dri/card0 (virtio + bochs). `mmio_map()` in
+  vmm.c = direct map below 4G, a few 2M uncached slots hung into it above (no more bar_lo hack)
+* merged ag/ipv6: v6 sockets, nd/slaac, netlink v6, SIOC*, /proc/net. 64 bit msghdr, ifreq is 40
+  bytes, ifconf has the pointer at +8, x86_64 syscalls are separate (no socketcall)
+* merged ag/fm: static x86_64 `userland/fm` embedded as /usr/bin/fm (`make fm`, musl from void
+  musl-devel in /tmp/int-x64sdk). samara.h structs have 64 bit pointers now
+* tested headless: drmtest on virtio-gpu and -vga std, `ip -6`/ping6/wget on rtl8139, e1000, virtio-net, fm in the DE
+* left: userland/sysroot.tar is still the old i386 one (samarafetch, tetris, tcc... don't run), no
+  x86_64 rebuild of it; ping6 prints ttl=-1 (no IPV6_HOPLIMIT cmsg); bochs drm has no hw cursor
+  (ENXIO, expected); fm right click / menus only checked by eye on the first screen, not clicked through
+
 ## Done recently (all committed and pushed)
 
 * apk (Alpine 3.20 x86) in the sysroot; root disk `build/root.img` (ext2
