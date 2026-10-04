@@ -190,14 +190,23 @@ DGEN_OBJ  := $(DGEN_SRC:.c=.o)
 # Userland: a static i686 busybox (musl) + its applet list, and the TCC +
 # musl sysroot tarball (userland/build-sysroot.sh), linked into the kernel
 # image and unpacked into the ramfs at boot (src/proc/userland.c).
-USERLAND_BINS := userland/busybox userland/busybox.applets userland/sysroot.tar
+USERLAND_BINS := userland/busybox userland/busybox.applets userland/sysroot.tar userland/fm userland/samara/samara-fm.conf
 USERLAND_OBJS := $(addsuffix .bin.o,$(USERLAND_BINS))
+# fm is a static x86_64 musl binary, committed like busybox. `make fm` rebuilds it
+# from userland/samara/ against musl-devel from void: XBPS_ARCH=x86_64-musl xbps-install -S -r $(MUSL64) -R <void repo>/current/musl musl-devel
+MUSL64 ?= /tmp/int-x64sdk
+fm:
+	gcc -O2 -s -w -static -nostdinc -isystem $$(gcc -print-file-name=include) -isystem $(MUSL64)/usr/include -nostdlib \
+	    -fno-stack-protector -fno-pie -no-pie -Iuserland/samara -o userland/fm \
+	    $(MUSL64)/usr/lib/crt1.o $(MUSL64)/usr/lib/crti.o userland/samara/fm.c userland/samara/fm_samara.c userland/samara/fm_img.c \
+	    -Wl,--start-group $(MUSL64)/usr/lib/libc.a $$(gcc -print-libgcc-file-name) -Wl,--end-group $(MUSL64)/usr/lib/crtn.o
 # terminal font atlas (tools/mktermfont.py), linked in like the userland blobs
 TERMFONT_OBJ  := src/gfx/termfont.bin.o
 
 ALL_OBJ := $(KERN_OBJ) $(BOOT_OBJ) $(LIBC_OBJ) $(DGEN_LOC_OBJ) $(DGEN_OBJ) $(EMBED_OBJS) $(USERLAND_OBJS) $(TERMFONT_OBJ)
 
 KERNEL := build/samara.elf
+.DEFAULT_GOAL := all
 
 
 all: $(KERNEL)
@@ -439,7 +448,7 @@ clean:
 	rm -f $(ALL_OBJ) $(KERNEL)
 	rm -rf build
 
-.PHONY: run-internet
+.PHONY: run-internet fm
 .PHONY: all run run-doom run-sata run-debug iso run-iso run-install run-hd clean build compile_commands.json
 
 # header dependencies (gcc -MMD): editing a .h rebuilds who includes it

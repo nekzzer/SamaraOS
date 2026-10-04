@@ -9,6 +9,9 @@
 extern const char _binary_userland_busybox_start[], _binary_userland_busybox_end[];
 extern const char _binary_userland_busybox_applets_start[], _binary_userland_busybox_applets_end[];
 
+extern const char _binary_userland_fm_start[], _binary_userland_fm_end[];
+extern const char _binary_userland_samara_samara_fm_conf_start[];
+extern const char _binary_userland_samara_samara_fm_conf_end[];
 extern const char _binary_userland_sysroot_tar_start[], _binary_userland_sysroot_tar_end[];
 
 
@@ -213,6 +216,14 @@ int userland_install(void) {
 
     /* TCC + musl headers/libc (userland/sysroot.tar, see build-sysroot.sh). */
     untar(_binary_userland_sysroot_tar_start, _binary_userland_sysroot_tar_end);
+
+    /* file manager, x86_64 static (make fm) */
+    mkdir_p("/etc");
+    fs_node_t* fm = fs_create(fs_root(), "/usr/bin/fm", FS_FILE);
+    if (fm) { fs_set_static(fm, _binary_userland_fm_start, _binary_userland_fm_end - _binary_userland_fm_start); fm->mode = 0755; }
+    fs_node_t* fc = fs_create(fs_root(), "/etc/samara-fm.conf", FS_FILE);
+    if (fc) fs_set_static(fc, _binary_userland_samara_samara_fm_conf_start,
+                          _binary_userland_samara_samara_fm_conf_end - _binary_userland_samara_samara_fm_conf_start);
 
     put_text("/etc/passwd", "root:x:0:0:root:/root:/bin/sh\n");
     /* root has no password: logins over ssh/telnet only reach it through
