@@ -70,3 +70,7 @@ make run SELF=0 NICS=3                      # + virtio-net cards eth1, eth2
 Code like a person wrote it (see CLAUDE.md, local only): snake_case, short
 names, few comments with some life in them, no docstrings, no banners, no
 over-engineering. Talk to the user in Russian, informally.
+
+* io_uring: no SQPOLL, no provided buffer rings (PBUF_RING), no registered wait
+  regions, multishot poll is sampled by workers (no real wakeups), UDP sends
+  over MSS fail (send_recv test)
