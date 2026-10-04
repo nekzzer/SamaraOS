@@ -30,7 +30,7 @@
 #define ETIME 62
 #define EOPNOTSUPP 95
 
-#define MAX_ENTRIES 4096
+#define MAX_ENTRIES 32768
 #define NWORK 3
 #define AT_FDCWD (-100)
 
@@ -47,6 +47,7 @@ typedef struct req {
     uint32_t seq;
     uint32_t deadline, start_ncq;       /* timeouts: uptime ms, cqes seen when armed */
     uint32_t count, ms;
+    int16_t last;
     bool armed, pre;                    /* pre: res is known, no need to run anything */
     int res;
 } req_t;
@@ -140,7 +141,7 @@ int uring_setup(uint32_t entries, void* params) {
     struct io_uring_params* pr = params;
     if (!entries || entries > MAX_ENTRIES * 8) return -EINVAL;
     if (!sys_uok(pr, sizeof(*pr))) return -EFAULT;
-    if (pr->flags & (IORING_SETUP_IOPOLL | IORING_SETUP_SQPOLL)) return -EINVAL;
+    if (pr->flags & IORING_SETUP_SQPOLL) return -EINVAL;
     if (entries > MAX_ENTRIES) {
         if (!(pr->flags & IORING_SETUP_CLAMP)) return -EINVAL;
         entries = MAX_ENTRIES;
@@ -329,8 +330,10 @@ static req_t* prep(uring_t* r, struct io_uring_sqe* s) {
         else file_ref(q->f);
     }
     if (op == IORING_OP_TIMEOUT || op == IORING_OP_LINK_TIMEOUT) {
-        uint32_t ms;
-        int e = ts_ms(s->addr, &ms);
+        uint32_t ms = 0;
+        int e = 0;
+        if (s->timeout_flags & ~0xAFu) e = -EINVAL;            // abs, update, boottime, realtime, immediate
+        else if (!(s->timeout_flags & 0x80)) e = ts_ms(s->addr, &ms);
         if (e < 0) q->bad = e;
         else {
             if (s->timeout_flags & IORING_TIMEOUT_ABS) {
@@ -454,7 +457,7 @@ static int req_exec(req_t* q) {
     struct io_uring_sqe* s = &q->sqe;
     uring_t* r = q->r;
     switch (s->opcode) {
-        case IORING_OP_NOP: return 0;
+        case IORING_OP_NOP: return (s->rw_flags & 1) ? (int)s->len : 0;       // INJECT_RESULT
         case IORING_OP_READ: case IORING_OP_WRITE:
             return do_rw(q, (char*)(uintptr_t)s->addr, s->len, s->opcode == IORING_OP_WRITE);
         case IORING_OP_READV: case IORING_OP_WRITEV: return do_rwv(q, s->opcode == IORING_OP_WRITEV);
@@ -540,6 +543,12 @@ static req_t* pick(proc_t* only) {
         if (op == IORING_OP_POLL_ADD) {
             int16_t want = (int16_t)q->sqe.poll_events;
             int16_t rv = sys_revents(q->f, want);
+            if (q->sqe.len & IORING_POLL_ADD_MULTI) {
+                int16_t m = rv & (want | 0x18);
+                if (m & ~q->last) cq_post(q->r, q->sqe.user_data, m, IORING_CQE_F_MORE);
+                q->last = m;
+                continue;
+            }
             if (!rv) continue;
             q->res = rv & (want | 0x18);
             q->pre = true;
