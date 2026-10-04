@@ -22,6 +22,7 @@ typedef struct pipe {
     int  readers, writers;
     struct file* fds[8];    /* SCM_RIGHTS in flight (unix sockets) */
     int  nfds;
+    uint32_t wgen;          /* bumped on every write, io_uring multishot poll looks at it */
 } pipe_t;
 
 typedef struct file {
@@ -44,6 +45,7 @@ typedef struct file {
 } file_t;
 
 file_t* file_new(ftype_t type, int flags);
+uint32_t file_gen(file_t* f);
 file_t* file_open_node(fs_node_t* n, int flags);   /* handles device nodes */
 void    file_ref(file_t* f);
 void    file_close(file_t* f);

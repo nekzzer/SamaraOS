@@ -48,6 +48,7 @@ typedef struct req {
     uint32_t deadline, start_ncq;       /* timeouts: uptime ms, cqes seen when armed */
     uint32_t count, ms;
     int16_t last;
+    uint32_t gen;
     bool armed, pre;                    /* pre: res is known, no need to run anything */
     int res;
 } req_t;
@@ -587,8 +588,10 @@ static req_t* pick(proc_t* only) {
             int16_t rv = sys_revents(q->f, want);
             if (q->sqe.len & IORING_POLL_ADD_MULTI) {
                 int16_t m = rv & (want | 0x18);
-                if (m & ~q->last) cq_post(q->r, q->sqe.user_data, m, IORING_CQE_F_MORE);
+                uint32_t g = file_gen(q->f);
+                if (m && ((m & ~q->last) || g != q->gen)) cq_post(q->r, q->sqe.user_data, m, IORING_CQE_F_MORE);
                 q->last = m;
+                q->gen = g;
                 continue;
             }
             if (!rv) continue;

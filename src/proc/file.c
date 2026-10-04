@@ -318,8 +318,15 @@ static int pipe_write(file_t* f, pipe_t* p, const char* buf, uint32_t n) {
         put += k;
         p->head = (p->head + (int)k) % PIPE_SZ;
         p->count += (int)k;
+        p->wgen++;
     }
     return (int)put;
+}
+
+uint32_t file_gen(file_t* f) {
+    if (f->type == F_PIPE_R || f->type == F_PIPE_W) return f->pipe->wgen;
+    if (f->type == F_SPAIR) return f->pipe->wgen + f->pipe2->wgen;
+    return 0;
 }
 
 int file_read(file_t* f, char* buf, uint32_t n) {
