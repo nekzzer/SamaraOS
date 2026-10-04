@@ -43,6 +43,8 @@ typedef struct {
     volatile bool title_dirty;
     uint32_t* pix;
     window_t* win;
+    int flags;
+    int cap;                         /* pixels allocated in pix */
     volatile bool gone;              /* window closed (by user or WM exit) */
     sm_event_t q[EVQ];
     volatile int qh, qt;
@@ -196,13 +198,36 @@ static uwin_t* text_target(uint32_t buf, int bw, int bh) {
     if (!p || !buf) return NULL;
     for (int i = 0; i < UWIN_MAX; i++) {
         uwin_t* u = &U[i];
-        if (u->state == U_OPEN && u->pid == p->tgid && u->buf == buf && u->w == bw && u->h == bh)
+        if (u->state == U_OPEN && u->pid == p->tgid && u->buf == buf && u->w == bw && u->h == bh && !(u->flags & SM_F_RAW))
             return u;
     }
     return NULL;
 }
 
-static void u_key(window_t* w, char c) { push(of(w), SM_EV_KEY, (uint8_t)c, 0, 0); }
+static void u_key(window_t* w, char c) {
+    int m = (kbd_shift_held() ? 1 : 0) | (kbd_ctrl_held() ? 2 : 0) | (kbd_alt_held() ? 4 : 0);
+    push(of(w), SM_EV_KEY, (uint8_t)c, m, 0);
+}
+
+static void u_rclick(window_t* w, int rx, int ry) {
+    uwin_t* u = of(w);
+    int cx, cy, cw, ch, x, y;
+    wm_client_rect(w, &cx, &cy, &cw, &ch);
+    u_map(u, w, cx + rx, cy + ry, &x, &y);
+    push(u, SM_EV_RDOWN, x, y, 2);
+}
+
+static void u_resize(window_t* w) {
+    uwin_t* u = of(w);
+    if (!(u->flags & SM_F_RESIZE) || !u->pix) return;
+    int cx, cy, cw, ch;
+    wm_client_rect(w, &cx, &cy, &cw, &ch);
+    if (cw < 16 || ch < 16 || cw * ch > u->cap) return;
+    if (cw == u->w && ch == u->h) return;
+    u->w = cw; u->h = ch;
+    memset(u->pix, 0x18, (size_t)cw * ch * 4);
+    push(u, SM_EV_RESIZE, cw, ch, 0);
+}
 
 static void u_click(window_t* w, int rx, int ry) {
     uwin_t* u = of(w);
@@ -280,9 +305,12 @@ void uwin_wm_frame(void) {
             w->on_release = u_release;
             w->on_close = u_close;
             w->on_scroll = u_scroll;
+            w->on_rclick = u_rclick;
+            if (u->flags & SM_F_RESIZE) w->on_resize = u_resize;
             w->opaque = true;                    /* u_paint fills image + letterbox */
             w->min_w = u->w + 8;                 /* never below 1:1 */
             w->min_h = u->h + WM_TITLE_H + 6;
+            if (u->flags & SM_F_RESIZE) { w->min_w = 420; w->min_h = 300; }
             u->win = w;
             u->state = U_OPEN;
         } else if (u->state == U_CLOSING) {
@@ -334,6 +362,7 @@ static int32_t op_open(uint32_t a) {
     if (o.scale < 1) o.scale = 1;
     if (o.scale > 8) o.scale = 8;
     if (o.w < 16 || o.h < 16 || o.w * o.h > MAX_PIXELS) return -EINVAL;
+    if (o.flags & SM_F_RESIZE) o.scale = 1;
     if (o.w * o.scale + 8 > gfx_w() || o.h * o.scale + WM_TITLE_H + 6 > gfx_h() - 40) return -EINVAL;
     int slot = -1;
     for (int i = 0; i < UWIN_MAX; i++) if (U[i].state == U_FREE) { slot = i; break; }
@@ -342,9 +371,12 @@ static int32_t op_open(uint32_t a) {
     memset(u, 0, sizeof(*u));
     u->pid = p->tgid;
     u->w = o.w; u->h = o.h; u->scale = o.scale;
+    u->flags = o.flags;
     u->hover_x = u->hover_y = -1;
     if (!o.title || !ustr(o.title, u->title, sizeof(u->title))) strcpy(u->title, p->name);
-    u->pix = (uint32_t*)kmalloc((size_t)o.w * o.h * 4);
+    u->cap = o.w * o.h;
+    if (o.flags & SM_F_RESIZE) u->cap = gfx_w() * gfx_h();
+    u->pix = (uint32_t*)kmalloc((size_t)u->cap * 4);
     /* Wide enough for any scale a maximized window can reach. */
     u->row_cap = gfx_w() > o.w * o.scale ? gfx_w() : o.w * o.scale;
     u->row = (uint32_t*)kmalloc((size_t)u->row_cap * 4);
@@ -403,9 +435,10 @@ int32_t uwin_syscall(uint32_t op, uint32_t a, uint32_t b, uint32_t c) {
     if (!u) return -EBADF;
     switch (op) {
     case SM_OP_PRESENT:
-        if (!uok(b, (uint32_t)u->w * u->h * 4)) return -EFAULT;
         if (u->gone) return -EPIPE;
         if (u->state != U_OPEN) return -EAGAIN;
+        if (c && (c >> 16 != (uint32_t)u->w || (c & 0xFFFF) != (uint32_t)u->h)) return 0;   /* stale size after a resize */
+        if (!uok(b, (uint32_t)u->w * u->h * 4)) return -EFAULT;
         memcpy(u->pix, (const void*)b, (size_t)u->w * u->h * 4);
         if (u->buf == b) {                    /* frame's text goes live with its pixels */
             int nx = 1 - u->ovl_cur;
