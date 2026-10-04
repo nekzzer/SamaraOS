@@ -31,7 +31,7 @@
 #define TCP_PSH 0x08
 #define TCP_ACK 0x10
 
-#define MAX_SOCKS  160
+#define MAX_SOCKS  256
 #define RX_CAP     (64u * 1024u)
 #define TX_CAP     (64u * 1024u)
 #define MSS        1400

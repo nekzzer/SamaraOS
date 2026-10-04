@@ -328,6 +328,7 @@ static req_t* prep(uring_t* r, struct io_uring_sqe* s) {
             break;
         default: q->bad = -EINVAL; needf = false;
     }
+    if (op == IORING_OP_ACCEPT && (s->ioprio & 1) && s->file_index && s->file_index != ~0u) q->bad = -EINVAL;
     if (needf && !q->bad) {
         if (s->flags & IOSQE_FIXED_FILE) q->f = fixed_file(r, (uint32_t)s->fd);
         else q->f = sys_getf(s->fd);
