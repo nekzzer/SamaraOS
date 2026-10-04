@@ -1791,7 +1791,7 @@ static void nl_routes(pipe_t* q, uint32_t seq, int af) {
 
 static void nl_dump(pipe_t* q, int type, uint32_t seq, int af) {
     static const uint8_t zero[6], ff[6] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };
-    int n = (af == 10 || type == 26) ? -1 : net_ifcount();
+    int n = ((af == 10 && type == 22) || type == 26) ? -1 : net_ifcount();
     if (type == 26) nl_routes(q, seq, af);
     if (type == 22 && (af == 0 || af == 10)) nl_dump6(q, seq);
     for (int i = -1; i < n; i++) {                    /* -1 = lo */

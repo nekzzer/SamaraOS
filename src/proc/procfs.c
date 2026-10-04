@@ -13,6 +13,7 @@
 #include "core/clock.h"
 #include "boot/pit.h"
 #include "fs/fatfs.h"
+#include "net/net.h"
 
 extern uint32_t cpu_ticks_user, cpu_ticks_sys, cpu_ticks_idle, cpu_ctxt;
 
@@ -269,6 +270,54 @@ static void fill_globals(char* mem, uint32_t cap) {
     b = (sb_t){ mem, 0, cap };
     sb_puts(&b, "nodev\tramfs\nnodev\tproc\n\tvfat\n");
     put(proc_root, "filesystems", &b);
+
+    fs_node_t* nd = ensure(proc_root, "net", FS_DIR, 0555);
+    if (!nd) return;
+    static const char hx[] = "0123456789abcdef";
+    b = (sb_t){ mem, 0, cap };
+    for (int i = -1; i < net_ifcount(); i++) {
+        uint8_t a6[A6_MAX][16], pl[A6_MAX], sc[A6_MAX];
+        const char* name = "lo"; const uint8_t* mac; uint32_t ip, mask, gw, rx, tx;
+        if (i >= 0) net_ifinfo(i, &name, &mac, &ip, &mask, &gw, &rx, &tx);
+        int n = ip6_addrs(i, a6, pl, sc, A6_MAX);
+        for (int k = 0; k < n; k++) {
+            for (int j = 0; j < 16; j++) { sb_putc(&b, hx[a6[k][j] >> 4]); sb_putc(&b, hx[a6[k][j] & 15]); }
+            sb_putc(&b, ' '); sb_putc(&b, hx[(i + 2) >> 4]); sb_putc(&b, hx[(i + 2) & 15]);
+            sb_putc(&b, ' '); sb_putc(&b, hx[pl[k] >> 4]); sb_putc(&b, hx[pl[k] & 15]);
+            sb_putc(&b, ' '); sb_putc(&b, hx[sc[k] >> 4]); sb_putc(&b, hx[sc[k] & 15]);
+            sb_puts(&b, " 80 "); sb_puts(&b, name); sb_putc(&b, '\n');
+        }
+    }
+    put(nd, "if_inet6", &b);
+
+    b = (sb_t){ mem, 0, cap };
+    ip6_route_t r[16];
+    int nr = ip6_routes(r, 16);
+    for (int k = 0; k < nr; k++) {
+        const uint8_t* addrs[2] = { r[k].dst, r[k].gw };
+        for (int w = 0; w < 2; w++) {
+            for (int j = 0; j < 16; j++) { sb_putc(&b, hx[addrs[w][j] >> 4]); sb_putc(&b, hx[addrs[w][j] & 15]); }
+            if (!w) { sb_putc(&b, ' '); sb_putc(&b, hx[r[k].dlen >> 4 & 15]); sb_putc(&b, hx[r[k].dlen & 15]); sb_puts(&b, " "); }
+            if (!w) { for (int j = 0; j < 32; j++) sb_putc(&b, '0'); sb_puts(&b, " 00 "); }
+        }
+        const char* name = "lo";
+        if (r[k].ifi >= 0) { const uint8_t* mac; uint32_t ip, mask, gw, rx, tx; net_ifinfo(r[k].ifi, &name, &mac, &ip, &mask, &gw, &rx, &tx); }
+        sb_puts(&b, " 00000000 00000000 00000000 ");
+        for (int j = 7; j >= 0; j--) sb_putc(&b, hx[r[k].flags >> (j * 4) & 15]);
+        sb_putc(&b, ' '); sb_puts(&b, name); sb_putc(&b, '\n');
+    }
+    put(nd, "ipv6_route", &b);
+
+    b = (sb_t){ mem, 0, cap };
+    sb_puts(&b, "Inter-|   Receive                                                |  Transmit\n"
+                " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
+    for (int i = -1; i < net_ifcount(); i++) {
+        const char* name = "lo"; const uint8_t* mac; uint32_t ip, mask, gw, rx = 0, tx = 0;
+        if (i >= 0) net_ifinfo(i, &name, &mac, &ip, &mask, &gw, &rx, &tx);
+        sb_puts(&b, "  "); sb_puts(&b, name); sb_puts(&b, ": 0 ");
+        sb_num(&b, rx); sb_puts(&b, " 0 0 0 0 0 0 0 "); sb_num(&b, tx); sb_puts(&b, " 0 0 0 0 0 0\n");
+    }
+    put(nd, "dev", &b);
 }
 
 /* ---------------- refresh ---------------- */
