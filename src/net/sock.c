@@ -499,6 +499,18 @@ void sock_input_udp6(const uint8_t* src, const uint8_t* dst, const uint8_t* d, i
 
 /* icmpv6 for raw sockets (and the ping kind of dgram ones) */
 void sock_input_icmp6(const uint8_t* src, const uint8_t* dst, const uint8_t* m, int len) {
+    if (m[0] == 1 && len >= 8 + 40 + 4 && m[8 + 6] == 6) {      /* dest unreach for our syn */
+        const uint8_t* in = m + 8;
+        uint16_t sp = (in[40] << 8) | in[41], dp = (in[42] << 8) | in[43];
+        for (int i = 0; i < MAX_SOCKS; i++) {
+            sock_t* s = &socks[i];
+            if (s->used && s->type == 1 && s->state == S_SYN_SENT && s->lport == sp && s->rport == dp && !memcmp(s->rip, in + 24, 16)) {
+                s->err = ENETUNREACH;
+                s->state = S_CLOSED;
+            }
+        }
+        return;
+    }
     for (int i = 0; i < MAX_SOCKS; i++) {
         sock_t* s = &socks[i];
         if (!s->used || s->proto != 58 || s->type == 1) continue;
