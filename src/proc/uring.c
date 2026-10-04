@@ -229,6 +229,7 @@ static void req_start(req_t* q);
 
 static bool opt_fail(req_t* q, int res) {
     int op = q->sqe.opcode;
+    if (op == IORING_OP_TIMEOUT && res == -ETIME && (q->sqe.timeout_flags & IORING_TIMEOUT_ETIME_SUCCESS)) return false;
     if (res < 0) return true;
     if (op == IORING_OP_READ || op == IORING_OP_WRITE || op == IORING_OP_READ_FIXED ||
         op == IORING_OP_WRITE_FIXED || op == IORING_OP_SEND || op == IORING_OP_RECV)
@@ -520,9 +521,11 @@ static int req_exec(req_t* q) {
             return req_cancel(t, -ECANCELED) ? 0 : -EALREADY;
         }
         case IORING_OP_TIMEOUT_REMOVE: {
-            req_t* t = find_ud(r, s->addr, IORING_OP_TIMEOUT);
+            uint32_t tf = s->timeout_flags;
+            if ((tf & ~0x1Fu) || (tf && !(tf & 0x12))) return -EINVAL;
+            req_t* t = find_ud(r, s->addr, (tf & IORING_LINK_TIMEOUT_UPDATE) ? IORING_OP_LINK_TIMEOUT : IORING_OP_TIMEOUT);
             if (!t) return -ENOENT;
-            if (s->timeout_flags & IORING_TIMEOUT_UPDATE) {
+            if (tf & (IORING_TIMEOUT_UPDATE | IORING_LINK_TIMEOUT_UPDATE)) {
                 uint32_t ms;
                 int e = ts_ms(s->addr2, &ms);
                 if (e < 0) return e;
@@ -561,8 +564,7 @@ static req_t* pick(proc_t* only) {
         if (op == IORING_OP_TIMEOUT || op == IORING_OP_LINK_TIMEOUT) {
             bool cnt = op == IORING_OP_TIMEOUT && q->count && q->r->ncq - q->start_ncq >= q->count;
             if (cnt) q->res = 0;
-            else if ((int32_t)(now - q->deadline) >= 0)
-                q->res = (op == IORING_OP_TIMEOUT && (q->sqe.timeout_flags & IORING_TIMEOUT_ETIME_SUCCESS)) ? 0 : -ETIME;
+            else if ((int32_t)(now - q->deadline) >= 0) q->res = -ETIME;
             else continue;
             q->pre = true;
             break;
