@@ -898,6 +898,13 @@ static int32_t do_mmap(uint32_t addr, uint32_t len, int prot, int flags, int fd,
         /* honour the hint */
     } else {
         addr = vmm_find_free(p->pd, lo, hi, len);
+        /* the mmap window (0x20000000 up) is ~500 MB. java + mesa (libLLVM is
+           161 MB) + the java heap don't fit, while the space between brk and
+           it sat empty. leave brk 64 MB to grow and use the rest */
+        if (!addr) {
+            uint32_t below = (p->sh->brk + (64u << 20) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+            if (below < lo) addr = vmm_find_free(p->pd, below, lo, len);
+        }
         if (!addr) return -ENOMEM;
     }
     if (f && f->type == F_NODE && (flags & MAP_SHARED) && is_shm(f->node)) {
