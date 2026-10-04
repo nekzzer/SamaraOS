@@ -68,6 +68,9 @@ int      vmm_copy_to(uint64_t pd, uint64_t va, const void* src, uint64_t len);
 
 uint64_t vmm_count_pages(uint64_t pd);                  /* mapped user pages */
 
+/* device memory (pci bars), anywhere in the physical space */
+void*    mmio_map(uint64_t pa, size_t len);
+
 /* After editing the live tables. */
 void     vmm_flush(void);
 

@@ -332,3 +332,21 @@ uint64_t vmm_count_pages(uint64_t pd) {
         if (d[i] & PTE_P) n += count_level(d[i] & PTE_ADDR, 2);
     return n;
 }
+
+/* below 4G the direct map already covers it. above: hang a 1G slot of 2M
+   uncached pages into the direct map (pools of 4, bars up there are rare) */
+extern uint64_t boot_pdpt_a[];
+void* mmio_map(uint64_t pa, size_t len) {
+    static uint64_t pd[4][512] __attribute__((aligned(4096)));
+    static int used;
+    if (pa + len <= 0x100000000ull) return P2V(pa);
+    for (uint64_t g = pa >> 30; g <= (pa + len - 1) >> 30; g++) {
+        if (g >= 512) return NULL;
+        if (boot_pdpt_a[g] & PTE_P) continue;
+        if (used == 4) return NULL;
+        for (int i = 0; i < 512; i++) pd[used][i] = (g << 30) | ((uint64_t)i << 21) | 0x9b;
+        boot_pdpt_a[g] = V2P(pd[used++]) | 3;
+    }
+    vmm_flush();
+    return P2V(pa);
+}

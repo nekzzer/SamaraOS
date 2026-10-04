@@ -6,6 +6,7 @@
 #include "core/string.h"
 #include "core/io.h"
 #include "core/heap.h"
+#include "drivers/drm.h"
 
 static uint8_t* fb;            /* current draw target */
 static uint8_t* real_fb;       /* actual framebuffer */
@@ -141,7 +142,31 @@ static uint32_t pci_find_vga_lfb(void) {
     return 0;
 }
 
+static bool on_virtio;
+
+void gfx_remode(void) {
+    if (!fb_ok || on_virtio) return;
+    bga_write(VBE_ENABLE, VBE_DISABLED);
+    bga_write(VBE_XRES, (uint16_t)fb_w);
+    bga_write(VBE_YRES, (uint16_t)fb_h);
+    bga_write(VBE_BPP, (uint16_t)fb_bpp);
+    bga_write(VBE_ENABLE, VBE_ENABLED | VBE_LFB);
+}
+
 bool gfx_init_vbe(int w, int h, int bpp) {
+    if (bpp == 32 && drm_virtio()) {
+        uint8_t* p = drm_console_fb(w, h);
+        if (!p) return false;
+        real_fb = fb = p;
+        back_buf = NULL;
+        fb_w = w; fb_h = h; fb_bpp = 32;
+        fb_pitch_bytes = w * 4;
+        indexed = false;
+        on_virtio = true;
+        fb_ok = true;
+        gfx_reset_clip();
+        return true;
+    }
     uint16_t id = bga_read(VBE_ID);
     if (id < 0xB0C0 || id > 0xB0CF) return false;     /* not Bochs VBE */
 

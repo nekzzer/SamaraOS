@@ -36,6 +36,7 @@
 #include "fs/fatfs.h"
 #include "fs/ext2.h"
 #include "shell/commands.h"
+#include "drivers/drm.h"
 
 /* ---------- boot stack ----------
    DOOM's R_RenderBSPNode is deeply recursive (especially when the BSP tree
@@ -396,6 +397,7 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
 
     boot_step("usb");
     usb_init();
+    drm_init();
     boot_done("uhci (polled)");
 
     BOOT_OK("synth wavs", synth_install_demo_wavs());
