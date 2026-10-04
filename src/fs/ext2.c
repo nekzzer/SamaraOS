@@ -150,14 +150,25 @@ static char* read_data(ev_t* v, const uint8_t* ino, uint32_t size) {
     return d;
 }
 
+/* runs of blocks that sit next to each other on disk go in one request,
+   straight into d. one 4k request per block made xorg start in a minute
+   (libLLVM alone is 161 MB) */
 static int fill_data(ev_t* v, const uint8_t* ino, uint32_t size, char* d) {
     static uint8_t blk[4096];
-    uint32_t n = (size + v->bs - 1) / v->bs;
-    for (uint32_t i = 0; i < n; i++) {
+    uint32_t n = (size + v->bs - 1) / v->bs, full = size / v->bs;
+    for (uint32_t i = 0; i < n; ) {
         uint32_t pb = bmap(v, ino, i), take = size - i * v->bs < v->bs ? size - i * v->bs : v->bs;
-        if (!pb) { memset(d + i * v->bs, 0, take); continue; }
-        if (rblk(v, pb, blk) < 0) return -1;
+        if (!pb) { memset(d + i * v->bs, 0, take); i++; continue; }
+        if (i < full) {
+            uint32_t run = 1;
+            while (i + run < full && run < 128 && bmap(v, ino, i + run) == pb + run) run++;
+            if (ata_read(v->disk, pb * v->spb, (int)(run * v->spb), d + i * v->bs) < 0) return -1;
+            i += run;
+            continue;
+        }
+        if (rblk(v, pb, blk) < 0) return -1;                     /* the tail */
         memcpy(d + i * v->bs, blk, take);
+        i++;
     }
     d[size] = 0;
     return 0;
