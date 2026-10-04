@@ -742,7 +742,23 @@ static void purge(uring_t* r, proc_t* p) {
     }
 }
 
-void uring_exit(proc_t* p) { purge(NULL, p); }
+void uring_exit(proc_t* p) {
+    // timeouts live on without the submitter, the rest gets canceled
+    for (;;) {
+        req_t* hit = NULL;
+        uint32_t fl = irq_save();
+        for (req_t* q = reqs; q; q = q->next) {
+            if (q->p != p || q->r->dead || q->st != R_WAIT) continue;
+            if (q->sqe.opcode == IORING_OP_TIMEOUT && !q->link) { q->p = NULL; continue; }
+            hit = q;
+            break;
+        }
+        irq_restore(fl);
+        if (!hit) break;
+        req_cancel(hit, -ECANCELED);
+    }
+    purge(NULL, p);
+}
 
 static void drop_files(uring_t* r) {
     for (uint32_t i = 0; i < r->nfiles; i++) file_close(r->files[i]);
