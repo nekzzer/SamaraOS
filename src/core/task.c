@@ -113,21 +113,23 @@ static int finish_spawn(int id, const char* name, uint8_t* stack, uint32_t esp,
     return id;
 }
 
-int task_spawn(const char* name, void (*entry)(void)) {
-    uint8_t* stack = (uint8_t*)kmalloc(TASK_STACK_SZ);
+int task_spawn_sz(const char* name, void (*entry)(void), uint32_t sz) {
+    uint8_t* stack = (uint8_t*)kmalloc(sz);
     if (!stack) return -1;
-    memset(stack, 0, TASK_STACK_SZ);
+    memset(stack, 0, sz);
     uint32_t f = irq_save();
     int id = alloc_slot();
     int r = -1;
     if (id >= 0) {
-        uint32_t esp = build_initial_stack(stack + TASK_STACK_SZ, entry);
+        uint32_t esp = build_initial_stack(stack + sz, entry);
         r = finish_spawn(id, name, stack, esp, 0, 0, NULL, fpu_clean);
     }
     irq_restore(f);
     if (r < 0) kfree(stack);
     return r;
 }
+
+int task_spawn(const char* name, void (*entry)(void)) { return task_spawn_sz(name, entry, TASK_STACK_SZ); }
 
 int task_spawn_frame(const char* name, uint8_t* stack, uint32_t stack_size,
                      uint32_t esp, uint32_t cr3, struct proc* p) {

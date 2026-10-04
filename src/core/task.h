@@ -39,6 +39,7 @@ typedef struct regs {
 
 void  task_init(void);
 int   task_spawn(const char* name, void (*entry)(void));
+int   task_spawn_sz(const char* name, void (*entry)(void), uint32_t sz);   /* bigger kernel stack */
 /* Create a task from a caller-built kernel stack whose saved esp points at a
    regs_t frame (see proc.c). The task owns `stack` and frees it on reuse. */
 int   task_spawn_frame(const char* name, uint8_t* stack, uint32_t stack_size,
