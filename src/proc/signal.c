@@ -120,6 +120,15 @@ void proc_deliver_signal(regs_t* r, int nr, int32_t ret) {
         u[2] = p->ss_sp; u[3] = p->ss_size ? (on_alt ? 1 : 0) : 2; u[4] = p->ss_size;
         save_context((sigcontext_t*)(u + 5), r, fx, oldmask);
         memcpy(u + 5 + 22, &oldmask, 8);             /* uc_sigmask */
+        if (sig == p->fault_sig) {                   /* from a cpu fault: what and where */
+            uint32_t* si = (uint32_t*)info;
+            si[2] = p->fault_trap == 14 ? ((p->fault_err & 1) ? 2 : 1)    /* SEGV_ACCERR / MAPERR */
+                  : p->fault_trap == 0 ? 1 : p->fault_trap == 6 ? 1 : 1;   /* FPE_INTDIV, ILL_ILLOPC */
+            si[3] = p->fault_trap == 14 ? p->fault_addr : r->eip;          /* si_addr */
+            sigcontext_t* sc = (sigcontext_t*)(u + 5);
+            sc->trapno = p->fault_trap; sc->err = p->fault_err; sc->cr2 = p->fault_addr;
+            p->fault_sig = 0;
+        }
     } else {
         w[0] = restorer; w[1] = (uint32_t)sig;
         save_context((sigcontext_t*)(w + 2), r, fx, oldmask);
@@ -138,6 +147,23 @@ void proc_deliver_signal(regs_t* r, int nr, int32_t ret) {
     r->eflags &= ~0x400u;                            /* DF=0 on entry per ABI */
     r->cs = GDT_UCODE; r->ss = GDT_UDATA;
     r->ds = r->es = GDT_UDATA;
+}
+
+/* hotspot lives on this: implicit null checks, safepoint polls and stack
+   banging are SIGSEGVs it catches and fixes up in the ucontext. before,
+   every ring 3 fault killed the process (minecraft died at once) */
+bool proc_fault_signal(regs_t* r, int sig, uint32_t trap, uint32_t err, uint32_t addr) {
+    proc_t* p = proc_current();
+    if (!p || p->state != P_ALIVE) return false;
+    if (p->sh->sa[sig].handler <= 1 || (p->sig_mask & SIGBIT(sig))) return false;   /* DFL/IGN/blocked: die */
+    p->fault_sig = sig; p->fault_trap = trap; p->fault_err = err; p->fault_addr = addr;
+    uint64_t other = p->sig_pending;                 /* this one first, the rest stays queued */
+    p->sig_pending = SIGBIT(sig);
+    proc_deliver_signal(r, -1, 0);
+    bool done = !(p->sig_pending & SIGBIT(sig)) && r->eip == p->sh->sa[sig].handler;
+    p->sig_pending |= other;
+    if (!done) { p->fault_sig = 0; return false; }
+    return true;
 }
 
 static uint32_t sane_seg(uint32_t s) {

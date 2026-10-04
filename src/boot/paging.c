@@ -5,6 +5,7 @@
 #include "drivers/vga.h"
 #include "core/io.h"
 #include "proc/proc.h"
+#include "core/task.h"
 
 /* Single page directory, 4 MiB PSE pages, identity map of the full 4 GiB.
    Forced into .data (not .bss) via an explicit non-zero initializer so it
@@ -103,26 +104,44 @@ static void dump(const char* tag, uint32_t err, uint32_t eip,
     fb_panic_banner(tag, err, eip, cs, cr2);
 }
 
-__attribute__((interrupt))
-static void pf_isr(struct interrupt_frame* f, uint32_t err) {
-    uint32_t cr2;
-    __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-    /* Lazily grown user stack (also hit by the kernel copying into it). */
-    if (proc_handle_fault(cr2, err)) return;
-    if ((f->cs & 3) == 3) { proc_fault_stack(f->esp); proc_fault_kill("Segmentation fault", 11, f->eip, cr2); }
+/* #PF #GP #UD #DE come in through stubs that save every register (regs_t),
+   so a ring 3 fault can become a signal with a full context the handler may
+   edit - java needs that. the error code is popped into fault_errcode first,
+   so the frame looks like the int 0x80 one */
+uint32_t fault_errcode;
+void fault_c(regs_t* r, uint32_t vec);
+
+#define FAULT_BODY(vec)                                                 \
+        "pusha\n push %ds\n push %es\n push %fs\n push %gs\n"         \
+        "mov $0x10, %ax\n mov %ax, %ds\n mov %ax, %es\n"               \
+        "mov %esp, %eax\n push $" #vec "\n push %eax\n"               \
+        "call fault_c\n add $8, %esp\n"                                \
+        "pop %gs\n pop %fs\n pop %es\n pop %ds\n popa\n iret\n"
+#define FAULT_STUB_ERR(name, vec) __attribute__((naked)) static void name(void) { __asm__ volatile ( \
+        "push %eax\n mov 4(%esp), %eax\n mov %eax, fault_errcode\n pop %eax\n add $4, %esp\n" FAULT_BODY(vec)); }
+#define FAULT_STUB(name, vec) __attribute__((naked)) static void name(void) { __asm__ volatile ( \
+        "movl $0, fault_errcode\n" FAULT_BODY(vec)); }
+
+void fault_c(regs_t* r, uint32_t vec) {
+    uint32_t err = fault_errcode, cr2 = 0;
+    if (vec == 14) {
+        __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+        /* Lazily grown user stack (also hit by the kernel copying into it). */
+        if (proc_handle_fault(cr2, err)) return;
+    }
+    if ((r->cs & 3) == 3) {
+        int sig = vec == 6 ? 4 : vec == 0 ? 8 : 11;
+        if (proc_fault_signal(r, sig, vec, err, cr2)) return;      /* the handler runs on iret */
+        const char* what = vec == 14 ? "Segmentation fault" : vec == 13 ? "General protection fault"
+                         : vec == 6 ? "Illegal instruction" : "Floating point exception";
+        if (vec == 14) proc_fault_stack(r->useresp);
+        proc_fault_kill(what, sig, r->eip, vec == 14 ? cr2 : err);
+    }
     /* kernel tripped over a bad pointer from a syscall: kill the process,
        not the whole box. TODO proper copy_from_user + EFAULT */
-    if (cr2 >= USER_BASE && cr2 < USER_TOP && proc_current())
-        proc_fault_kill("bad user ptr", 11, f->eip, cr2);
-    dump("PF", err, f->eip, f->cs, cr2);
-    __asm__ volatile ("cli");
-    for (;;) __asm__ volatile ("hlt");
-}
-
-__attribute__((interrupt))
-static void gp_isr(struct interrupt_frame* f, uint32_t err) {
-    if ((f->cs & 3) == 3) proc_fault_kill("General protection fault", 11, f->eip, err);
-    dump("GP", err, f->eip, f->cs, 0);
+    if (vec == 14 && cr2 >= USER_BASE && cr2 < USER_TOP && proc_current())
+        proc_fault_kill("bad user ptr", 11, r->eip, cr2);
+    dump(vec == 14 ? "PF" : vec == 13 ? "GP" : vec == 6 ? "UD" : "DE", err, r->eip, r->cs, cr2);
     __asm__ volatile ("cli");
     for (;;) __asm__ volatile ("hlt");
 }
@@ -134,21 +153,10 @@ static void df_isr(struct interrupt_frame* f, uint32_t err) {
     for (;;) __asm__ volatile ("hlt");
 }
 
-__attribute__((interrupt))
-static void ud_isr(struct interrupt_frame* f) {
-    if ((f->cs & 3) == 3) proc_fault_kill("Illegal instruction", 4, f->eip, 0);
-    dump("UD", 0, f->eip, f->cs, 0);
-    __asm__ volatile ("cli");
-    for (;;) __asm__ volatile ("hlt");
-}
-
-__attribute__((interrupt))
-static void de_isr(struct interrupt_frame* f) {
-    if ((f->cs & 3) == 3) proc_fault_kill("Floating point exception", 8, f->eip, 0);
-    dump("DE", 0, f->eip, f->cs, 0);
-    __asm__ volatile ("cli");
-    for (;;) __asm__ volatile ("hlt");
-}
+FAULT_STUB_ERR(pf_stub, 14)
+FAULT_STUB_ERR(gp_stub, 13)
+FAULT_STUB(ud_stub, 6)
+FAULT_STUB(de_stub, 0)
 
 void paging_init(void) {
     for (uint32_t i = 0; i < 1024; i++) {
@@ -159,11 +167,11 @@ void paging_init(void) {
     for (uint32_t i = 0; i < (DMAP_SIZE >> 22); i++)
         pdir[(DMAP_BASE >> 22) + i] = (i << 22) | PDE_P | PDE_RW | PDE_PS;
 
-    idt_set_gate(0,  de_isr, 0x08, 0x8E);        /* #DE Divide Error */
-    idt_set_gate(6,  ud_isr, 0x08, 0x8E);        /* #UD Invalid Opcode */
+    idt_set_gate(0,  de_stub, 0x08, 0x8E);       /* #DE Divide Error */
+    idt_set_gate(6,  ud_stub, 0x08, 0x8E);       /* #UD Invalid Opcode */
     idt_set_gate(8,  df_isr, 0x08, 0x8E);        /* #DF Double Fault */
-    idt_set_gate(13, gp_isr, 0x08, 0x8E);        /* #GP General Protection */
-    idt_set_gate(14, pf_isr, 0x08, 0x8E);        /* #PF Page Fault */
+    idt_set_gate(13, gp_stub, 0x08, 0x8E);       /* #GP General Protection */
+    idt_set_gate(14, pf_stub, 0x08, 0x8E);       /* #PF Page Fault */
 
     __asm__ volatile (
         "mov %0, %%cr3\n\t"

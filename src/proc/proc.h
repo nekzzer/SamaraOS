@@ -59,7 +59,9 @@ typedef struct proc {
     int      ctty;                 /* controlling terminal: 0 console, -1 none, n>0 pty n-1 */
     char     name[32];
     char     exe[128];
-    bool     in_fs;                /* inside a syscall that changes files (ext2 sync waits) */             /* /proc/self/exe, symlinks resolved ($ORIGIN in java) */
+    bool     in_fs;                /* inside a syscall that changes files (ext2 sync waits) */
+    int      fault_sig;            /* a cpu fault being turned into a signal: siginfo/sigcontext details */
+    uint32_t fault_addr, fault_trap, fault_err;             /* /proc/self/exe, symlinks resolved ($ORIGIN in java) */
     bool     vfork_shared;         /* vfork child running on the parent's page directory */
     /* Accounting for /proc. */
     uint32_t start_ms;
@@ -97,6 +99,9 @@ proc_t* proc_at(int i);
 /* Fault plumbing called from the exception handlers. */
 bool    proc_handle_fault(uint32_t addr, uint32_t err);
 void    proc_fault_stack(uint32_t esp);
+/* cpu fault in ring 3 with a handler installed: queue the signal with its
+   details and build the frame now. false = no handler, caller kills */
+bool    proc_fault_signal(regs_t* r, int sig, uint32_t trap, uint32_t err, uint32_t addr);
 void    proc_fault_kill(const char* what, int sig, uint32_t eip, uint32_t addr) __attribute__((noreturn));
 
 /* Syscall-level operations (syscall.c calls these). */
