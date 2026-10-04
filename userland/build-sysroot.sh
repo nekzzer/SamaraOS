@@ -298,6 +298,12 @@ cp "$SAM/breakout.py" "$OUT/usr/games/breakout.py"
 # logo + system info in true-colour gradients; also makes the sh prompt
 "$XBIN/i686-linux-musl-gcc" -static -no-pie -O2 -s "$SAM/samarafetch.c" -o "$OUT/usr/bin/samarafetch"
 
+# file manager: /usr/bin/fm (start menu, desktop icon), sources next to the other samara demos
+mkdir -p "$OUT/etc" "$OUT/usr/src/fm"
+"$XBIN/i686-linux-musl-gcc" -static -no-pie -O2 -s -w -I"$SAM" "$SAM/fm.c" "$SAM/fm_samara.c" "$SAM/fm_img.c" -o "$OUT/usr/bin/fm"
+cp "$SAM/fm.c" "$SAM/fm_be.h" "$SAM/fm_samara.c" "$SAM/fm_img.c" "$OUT/usr/src/fm/"
+cp "$SAM/samara-fm.conf" "$OUT/etc/samara-fm.conf"
+
 # SSH: dropbear (server + dbclient + scp + dropbearkey) as one static
 # multi-call binary, hard-linked under each name (the kernel's untar shares
 # the bytes). Built by: toolchain/dropbear-*/ (see the SSH notes in README).
