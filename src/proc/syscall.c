@@ -1300,7 +1300,9 @@ static int do_wait(int pid, int* status, int options) {
 /* ---------------- sockets ---------------- */
 
 #define AF_INET 2
+#define AF_INET6 10
 typedef struct { uint16_t family, port; uint32_t addr; uint8_t zero[8]; } sockaddr_in_t;
+typedef struct { uint16_t family, port; uint32_t flow; uint8_t addr[16]; uint32_t scope; } sockaddr_in6_t;
 
 static inline uint16_t nbo16(uint16_t v) { return (uint16_t)((v >> 8) | (v << 8)); }
 static inline uint32_t nbo32(uint32_t v) {
@@ -1314,29 +1316,51 @@ static sock_t* getsock(int fd, int* err) {
     return f->sock;
 }
 
-static int read_addr(uint32_t uaddr, uint32_t len, uint32_t* ip, uint16_t* port) {
+static int read_addr(uint32_t uaddr, uint32_t len, uint8_t* ip, uint16_t* port) {
     if (len < 8) return -EINVAL;
     UCHK((void*)uaddr, 8);
     sockaddr_in_t* sa = (sockaddr_in_t*)uaddr;
+    if (sa->family == AF_INET6) {
+        if (len < 24) return -EINVAL;
+        UCHK((void*)uaddr, 24);
+        memcpy(ip, ((sockaddr_in6_t*)uaddr)->addr, 16);
+        *port = nbo16(sa->port);
+        return 0;
+    }
     if (sa->family != AF_INET) return -97;                            /* EAFNOSUPPORT */
-    *ip = nbo32(sa->addr);
+    uint32_t a = nbo32(sa->addr);
+    memset(ip, 0, 16);
+    if (a) {                                                          /* 0.0.0.0 stays any */
+        ip[10] = ip[11] = 0xFF;
+        memcpy(ip + 12, &sa->addr, 4);
+    }
     *port = nbo16(sa->port);
     return 0;
 }
 
-static int write_addr(uint32_t uaddr, uint32_t ulen, uint32_t ip, uint16_t port) {
+static int write_addr(uint32_t uaddr, uint32_t ulen, int af, const uint8_t* ip, uint16_t port) {
     if (!uaddr || !ulen) return 0;
     UCHK((void*)ulen, 4);
     uint32_t cap = *(uint32_t*)ulen;
-    sockaddr_in_t sa;
+    sockaddr_in6_t sa;
     memset(&sa, 0, sizeof(sa));
-    sa.family = AF_INET;
-    sa.port = nbo16(port);
-    sa.addr = nbo32(ip);
-    uint32_t n = cap < sizeof(sa) ? cap : sizeof(sa);
+    uint32_t sz;
+    if (af == AF_INET6) {
+        sa.family = AF_INET6;
+        sa.port = nbo16(port);
+        memcpy(sa.addr, ip, 16);
+        sz = sizeof(sa);
+    } else {
+        sockaddr_in_t* si = (sockaddr_in_t*)&sa;
+        si->family = AF_INET;
+        si->port = nbo16(port);
+        memcpy(&si->addr, ip + 12, 4);
+        sz = sizeof(*si);
+    }
+    uint32_t n = cap < sz ? cap : sz;
     UCHK((void*)uaddr, n);
     memcpy((void*)uaddr, &sa, n);
-    *(uint32_t*)ulen = sizeof(sa);
+    *(uint32_t*)ulen = sz;
     return 0;
 }
 
@@ -1742,7 +1766,7 @@ static int32_t sys_socket_call(int call, uint32_t a, uint32_t b, uint32_t c,
                                uint32_t d, uint32_t e, uint32_t f6) {
     int err = 0;
     sock_t* s;
-    uint32_t ip; uint16_t port;
+    uint8_t ip[16]; uint16_t port;
     file_t* fl;
     if (call != 1 && call != 8) {
         file_t* pf = getf((int)a);
@@ -1768,10 +1792,11 @@ static int32_t sys_socket_call(int call, uint32_t a, uint32_t b, uint32_t c,
                 memset(fl->pipe, 0, sizeof(pipe_t));
                 return install_fd(fl, 0, (b & 02000000) != 0);
             }
-            if (a != AF_INET) return -97;
+            if (a != AF_INET && a != AF_INET6) return -97;
             int type = (int)(b & 0xF);
-            if (c && !((type == 1 && c == 6) || (type == 2 && c == 17))) return -93;  /* EPROTONOSUPPORT */
-            s = sock_create(type, &err);
+            if (type == 3) { if (c != (a == AF_INET ? 1 : 58)) return -93; }
+            else if (c && !((type == 1 && c == 6) || (type == 2 && (c == 17 || (c == 58 && a == AF_INET6))))) return -93;  /* EPROTONOSUPPORT */
+            s = sock_create((int)a, type, (int)c, &err);
             if (!s) return err ? err : -93;
             fl = file_new(F_SOCKET, 2 | ((b & 04000) ? O_NONBLOCK : 0));
             if (!fl) { sock_close(s); return -ENOMEM; }
@@ -1780,38 +1805,38 @@ static int32_t sys_socket_call(int call, uint32_t a, uint32_t b, uint32_t c,
         }
         case 2:                                                       /* bind */
             if (!(s = getsock((int)a, &err))) return err;
-            if ((err = read_addr(b, c, &ip, &port)) < 0) return err;
+            if ((err = read_addr(b, c, ip, &port)) < 0) return err;
             return sock_bind(s, ip, port);
         case 3:                                                       /* connect */
             if (!(s = getsock((int)a, &err))) return err;
-            if ((err = read_addr(b, c, &ip, &port)) < 0) return err;
+            if ((err = read_addr(b, c, ip, &port)) < 0) return err;
             return sock_connect(s, ip, port, (getf((int)a)->flags & O_NONBLOCK) != 0);
         case 4:                                                       /* listen */
             if (!(s = getsock((int)a, &err))) return err;
             return sock_listen(s, (int)b);
         case 5: case 18: {                                            /* accept(4) */
             if (!(s = getsock((int)a, &err))) return err;
-            sock_t* ns = sock_accept(s, (getf((int)a)->flags & O_NONBLOCK) != 0, &err, &ip, &port);
+            sock_t* ns = sock_accept(s, (getf((int)a)->flags & O_NONBLOCK) != 0, &err, ip, &port);
             if (!ns) return err;
             fl = file_new(F_SOCKET, 2 | ((call == 18 && (d & 04000)) ? O_NONBLOCK : 0));
             if (!fl) { sock_close(ns); return -ENOMEM; }
             fl->sock = ns;
-            write_addr(b, c, ip, port);
+            write_addr(b, c, sock_af(ns), ip, port);
             return install_fd(fl, 0, call == 18 && (d & 02000000));
         }
         case 6: case 7:                                               /* getsockname / getpeername */
             if (!(s = getsock((int)a, &err))) return err;
-            sock_name(s, call == 7, &ip, &port);
+            sock_name(s, call == 7, ip, &port);
             if (call == 7 && !port) return -107;                      /* ENOTCONN */
-            return write_addr(b, c, ip, port);
+            return write_addr(b, c, sock_af(s), ip, port);
         case 8: return do_socketpair(a, b, c, (int*)d);               /* socketpair */
         case 9: case 11: {                                            /* send / sendto */
             if (!(s = getsock((int)a, &err))) return err;
             UCHK((void*)b, c);
             bool nb = (getf((int)a)->flags & O_NONBLOCK) || (d & 0x40);
             if (call == 11 && e) {
-                if ((err = read_addr(e, f6, &ip, &port)) < 0) return err;
-                return sock_send(s, (const uint8_t*)b, c, nb, &ip, &port);
+                if ((err = read_addr(e, f6, ip, &port)) < 0) return err;
+                return sock_send(s, (const uint8_t*)b, c, nb, ip, &port);
             }
             return sock_send(s, (const uint8_t*)b, c, nb, 0, 0);
         }
@@ -1819,14 +1844,20 @@ static int32_t sys_socket_call(int call, uint32_t a, uint32_t b, uint32_t c,
             if (!(s = getsock((int)a, &err))) return err;
             UCHK((void*)b, c);
             bool nb = (getf((int)a)->flags & O_NONBLOCK) || (d & 0x40);
-            int r = sock_recv(s, (uint8_t*)b, c, nb, (d & 2) != 0, &ip, &port);
-            if (r >= 0 && call == 12) write_addr(e, f6, ip, port);
+            int r = sock_recv(s, (uint8_t*)b, c, nb, (d & 2) != 0, ip, &port);
+            if (r >= 0 && call == 12) write_addr(e, f6, sock_af(s), ip, port);
             return r;
         }
         case 13:                                                      /* shutdown */
             if (!(s = getsock((int)a, &err))) return err;
             return sock_shutdown(s, (int)b);
-        case 14: return getsock((int)a, &err) ? 0 : err;             /* setsockopt: accepted */
+        case 14:                                                      /* setsockopt: accepted */
+            if (!(s = getsock((int)a, &err))) return err;
+            if (b == 41 && c == 26 && d && e >= 4) {                  /* IPV6_V6ONLY */
+                UCHK((void*)d, 4);
+                sock_v6only(s, 1, *(int*)d);
+            }
+            return 0;
         case 15: {                                                    /* getsockopt */
             if (!(s = getsock((int)a, &err))) return err;
             if (!d || !e) return -EFAULT;
@@ -1836,6 +1867,7 @@ static int32_t sys_socket_call(int call, uint32_t a, uint32_t b, uint32_t c,
             if (b == 1 && c == 4) v = sock_take_error(s);             /* SO_ERROR */
             else if (b == 1 && c == 3) v = sock_type(s);              /* SO_TYPE */
             else if (b == 1 && (c == 7 || c == 8)) v = 65536;         /* SO_SNDBUF/RCVBUF */
+            else if (b == 41 && c == 26) v = sock_v6only(s, -1, 0);   /* IPV6_V6ONLY */
             *(int*)d = v;
             *(uint32_t*)e = 4;
             return 0;
@@ -1848,13 +1880,13 @@ static int32_t sys_socket_call(int call, uint32_t a, uint32_t b, uint32_t c,
             UCHK(iov, m[3] * sizeof(iovec_t));
             bool nb = (getf((int)a)->flags & O_NONBLOCK) || (c & 0x40);
             int total = 0;
-            if (call == 16 && m[0]) { if ((err = read_addr(m[0], m[1], &ip, &port)) < 0) return err; }
+            if (call == 16 && m[0]) { if ((err = read_addr(m[0], m[1], ip, &port)) < 0) return err; }
             for (uint32_t i = 0; i < m[3]; i++) {
                 if (!iov[i].len) continue;
                 UCHK((void*)iov[i].base, iov[i].len);
                 int r = call == 16
-                    ? sock_send(s, (const uint8_t*)iov[i].base, iov[i].len, nb, m[0] ? &ip : 0, m[0] ? &port : 0)
-                    : sock_recv(s, (uint8_t*)iov[i].base, iov[i].len, nb || total > 0, false, &ip, &port);
+                    ? sock_send(s, (const uint8_t*)iov[i].base, iov[i].len, nb, m[0] ? ip : 0, m[0] ? &port : 0)
+                    : sock_recv(s, (uint8_t*)iov[i].base, iov[i].len, nb || total > 0, false, ip, &port);
                 if (r < 0) { if (total) break; return r; }
                 total += r;
                 if ((uint32_t)r < iov[i].len || sock_type(s) == 2) break;
@@ -1862,7 +1894,7 @@ static int32_t sys_socket_call(int call, uint32_t a, uint32_t b, uint32_t c,
             if (call == 17) {
                 /* was &len on the kernel stack, UCHK said no and the name never got written.
                    musl 1.2.5 dns drops replies without it (apk) */
-                if (m[0]) write_addr(m[0], (uint32_t)&m[1], ip, port);
+                if (m[0]) write_addr(m[0], (uint32_t)&m[1], sock_af(s), ip, port);
                 m[5] = 0; m[6] = 0;
             }
             return total;

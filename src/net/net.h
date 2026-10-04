@@ -38,4 +38,20 @@ int  net_http_get(uint32_t ip, uint16_t port, const char* host, const char* path
 void     net_send_ip(uint32_t dst, uint8_t proto, const void* payload, int len);
 uint32_t net_src_for(uint32_t dst);        /* our address as seen by `dst` */
 
+/* ipv6.c, addresses are 16 bytes network order */
+typedef struct { uint8_t dst[16], gw[16]; int dlen, ifi, metric; uint32_t flags; } ip6_route_t;
+void ip6_init(void);
+void ip6_poll(void);
+void ip6_input(int ifi, const uint8_t* pkt, int len, const uint8_t* smac);
+int  ip6_send(const uint8_t* src, const uint8_t* dst, uint8_t proto, const void* pl, int len);
+bool ip6_src_for(const uint8_t* dst, uint8_t* src);   /* false = no route */
+uint16_t ip6_sum(const uint8_t* src, const uint8_t* dst, uint8_t proto, const void* d, int len);
+int  ip6_str(char* out, const uint8_t* a);
+int  ip6_addr_add(int ifi, const uint8_t* a, int plen);
+int  ip6_addr_del(int ifi, const uint8_t* a);
+int  ip6_addrs(int ifi, uint8_t addrs[][16], uint8_t* plen, uint8_t* scope, int max);   /* ifi -1 = lo */
+int  ip6_routes(ip6_route_t* r, int max);
+/* net.c */
+int  net_eth_send(int ifi, const uint8_t* dmac, uint16_t type, const void* pl, int len);
+
 #endif

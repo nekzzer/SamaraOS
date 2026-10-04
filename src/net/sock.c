@@ -43,7 +43,7 @@ enum { S_CLOSED, S_LISTEN, S_SYN_SENT, S_SYN_RCVD, S_ESTABLISHED, S_FIN_WAIT1,
 
 typedef struct dgram {
     struct dgram* next;
-    uint32_t ip;
+    uint8_t  ip[16];
     uint16_t port;
     uint16_t len;
     uint8_t  data[];
@@ -52,9 +52,11 @@ typedef struct dgram {
 struct sock {
     bool     used;
     int      refs;                 /* open file descriptions (0 = orphaned) */
-    int      type;                 /* 1 stream, 2 dgram */
+    int      type;                 /* 1 stream, 2 dgram, 3 raw */
     int      state;
-    uint32_t lip, rip;
+    int      af, proto;            /* 2 or 10 as the user sees it */
+    bool     v6only;
+    uint8_t  lip[16], rip[16];     /* ipv4 is ::ffff:a.b.c.d, zero = any */
     uint16_t lport, rport;
     bool     bound, connected;
     int      err;
@@ -79,11 +81,30 @@ struct sock {
 };
 
 static sock_t socks[MAX_SOCKS];
+static const uint8_t zero_ip[16];
 static uint16_t next_eph = 49152;
 
 static inline uint16_t be16(uint16_t v) { return (uint16_t)((v >> 8) | (v << 8)); }
 static inline uint32_t be32(uint32_t v) {
     return (v >> 24) | ((v >> 8) & 0xFF00) | ((v << 8) & 0xFF0000) | (v << 24);
+}
+
+static bool is4(const uint8_t* a) {
+    for (int i = 0; i < 10; i++) if (a[i]) return false;
+    return a[10] == 0xFF && a[11] == 0xFF;
+}
+static bool zero16(const uint8_t* a) { for (int i = 0; i < 16; i++) if (a[i]) return false; return true; }
+static void map4(uint8_t* o, uint32_t ip) {
+    memset(o, 0, 10);
+    o[10] = o[11] = 0xFF;
+    o[12] = ip >> 24; o[13] = ip >> 16; o[14] = ip >> 8; o[15] = ip;
+}
+static uint32_t un4(const uint8_t* a) { return (uint32_t)a[12] << 24 | a[13] << 16 | a[14] << 8 | a[15]; }
+
+/* does the packet's dst hit our local address */
+static bool dst_ok(sock_t* s, const uint8_t* dst) {
+    if (zero16(s->lip)) return s->af == 10 ? (!is4(dst) || !s->v6only) : is4(dst);
+    return !memcmp(s->lip, dst, 16);
 }
 
 typedef struct __attribute__((packed)) {
@@ -106,25 +127,31 @@ static uint32_t sum16(uint32_t s, const void* d, int len) {
     return s;
 }
 
-static uint16_t l4_sum(uint32_t src, uint32_t dst, uint8_t proto, const void* d, int len) {
+static uint16_t l4_sum(const uint8_t* src, const uint8_t* dst, uint8_t proto, const void* d, int len) {
+    if (!is4(dst)) return ip6_sum(src, dst, proto, d, len);
     uint8_t ph[12];
-    uint32_t bs = be32(src), bd = be32(dst);
-    memcpy(ph, &bs, 4); memcpy(ph + 4, &bd, 4);
+    memcpy(ph, src + 12, 4); memcpy(ph + 4, dst + 12, 4);
     ph[8] = 0; ph[9] = proto; ph[10] = (uint8_t)(len >> 8); ph[11] = (uint8_t)len;
     uint32_t s = sum16(sum16(0, ph, 12), d, len);
     while (s >> 16) s = (s & 0xFFFF) + (s >> 16);
     return (uint16_t)~s;
 }
 
+static int ip_out(const uint8_t* src, const uint8_t* dst, uint8_t proto, const void* d, int len) {
+    if (is4(dst)) { net_send_ip(un4(dst), proto, d, len); return 0; }
+    return ip6_send(src, dst, proto, d, len);
+}
+
 /* ---------------- allocation ---------------- */
 
-static sock_t* alloc_sock(int type) {
+static sock_t* alloc_sock(int type, int af) {
     for (int i = 0; i < MAX_SOCKS; i++) {
         sock_t* s = &socks[i];
         if (s->used) continue;
         memset(s, 0, sizeof(*s));
         s->used = true;
         s->type = type;
+        s->af = af;
         s->refs = 1;
         s->rto = 300;
         if (type == 1) {
@@ -184,7 +211,8 @@ static void tcp_segment(sock_t* s, uint32_t seq, uint8_t flags, const uint8_t* d
     tcph_t* h = (tcph_t*)buf;
     uint32_t hl = 20;
     if (flags & TCP_SYN) {                           /* MSS option */
-        buf[20] = 2; buf[21] = 4; buf[22] = RX_MSS >> 8; buf[23] = RX_MSS & 0xFF;
+        int mss = is4(s->rip) ? RX_MSS : RX_MSS - 20;
+        buf[20] = 2; buf[21] = 4; buf[22] = mss >> 8; buf[23] = mss & 0xFF;
         hl = 24;
     }
     h->sport = be16(s->lport);
@@ -199,13 +227,13 @@ static void tcp_segment(sock_t* s, uint32_t seq, uint8_t flags, const uint8_t* d
     h->urg = 0;
     if (len) memcpy(buf + hl, data, len);
     h->sum = be16(l4_sum(s->lip, s->rip, 6, buf, (int)(hl + len)));
-    net_send_ip(s->rip, 6, buf, (int)(hl + len));
+    ip_out(s->lip, s->rip, 6, buf, (int)(hl + len));
 }
 
-static void send_rst(uint32_t src, uint32_t dst, const tcph_t* in, int datalen) {
+static void send_rst(const uint8_t* src, const uint8_t* dst, const tcph_t* in, int datalen) {
     sock_t tmp;
     memset(&tmp, 0, sizeof(tmp));
-    tmp.lip = dst; tmp.rip = src;
+    memcpy(tmp.lip, dst, 16); memcpy(tmp.rip, src, 16);
     tmp.lport = be16(in->dport); tmp.rport = be16(in->sport);
     if (in->flags & TCP_ACK) {
         tcp_segment(&tmp, be32(in->ack), TCP_RST, NULL, 0);
@@ -252,17 +280,17 @@ static void reap_if_done(sock_t* s) {
 
 /* ---------------- TCP input ---------------- */
 
-static sock_t* find_tcp(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport) {
+static sock_t* find_tcp(const uint8_t* src, uint16_t sport, const uint8_t* dst, uint16_t dport) {
     sock_t* listener = NULL;
     for (int i = 0; i < MAX_SOCKS; i++) {
         sock_t* s = &socks[i];
         if (!s->used || s->type != 1 || s->lport != dport) continue;
         if (s->state == S_LISTEN) {
-            if (!s->lip || s->lip == dst) listener = s;
+            if (dst_ok(s, dst)) listener = s;
             continue;
         }
-        if (s->state != S_CLOSED && s->rport == sport && s->rip == src &&
-            (!s->lip || s->lip == dst)) return s;
+        if (s->state != S_CLOSED && s->rport == sport && !memcmp(s->rip, src, 16) &&
+            dst_ok(s, dst)) return s;
     }
     return listener;
 }
@@ -282,7 +310,7 @@ static void tcp_ack_in(sock_t* s, uint32_t ack) {
     s->last_tx_ms = pit_uptime_ms();
 }
 
-void sock_input_tcp(uint32_t src, uint32_t dst, const uint8_t* seg, int len) {
+static void tcp_in(const uint8_t* src, const uint8_t* dst, const uint8_t* seg, int len) {
     if (len < 20) return;
     const tcph_t* h = (const tcph_t*)seg;
     int hl = (h->off >> 4) * 4;
@@ -303,12 +331,12 @@ void sock_input_tcp(uint32_t src, uint32_t dst, const uint8_t* seg, int len) {
         for (int i = 0; i < MAX_SOCKS; i++)
             if (socks[i].used && socks[i].parent == s && socks[i].state == S_SYN_RCVD) pending++;
         if (pending >= s->backlog) return;               /* drop: peer retries */
-        sock_t* c = alloc_sock(1);
+        sock_t* c = alloc_sock(1, s->af);
         if (!c) return;
         c->refs = 0;
         c->parent = s;
-        c->lip = dst; c->lport = dport;
-        c->rip = src; c->rport = sport;
+        memcpy(c->lip, dst, 16); c->lport = dport;
+        memcpy(c->rip, src, 16); c->rport = sport;
         c->iss = 0x20000000u + pit_uptime_ms() * 64 + (uint32_t)(c - socks) * 4096;
         c->snd_una = c->iss;
         c->snd_nxt = c->iss + 1;
@@ -430,9 +458,16 @@ static void sock_tick(void) {
     }
 }
 
+void sock_input_tcp(uint32_t src, uint32_t dst, const uint8_t* seg, int len) {
+    uint8_t a[16], b[16];
+    map4(a, src); map4(b, dst);
+    tcp_in(a, b, seg, len);
+}
+void sock_input_tcp6(const uint8_t* src, const uint8_t* dst, const uint8_t* seg, int len) { tcp_in(src, dst, seg, len); }
+
 /* ---------------- UDP ---------------- */
 
-void sock_input_udp(uint32_t src, uint32_t dst, const uint8_t* d, int len) {
+static void udp_in(const uint8_t* src, const uint8_t* dst, const uint8_t* d, int len) {
     if (len < 8) return;
     const udph_t* h = (const udph_t*)d;
     uint16_t sport = be16(h->sport), dport = be16(h->dport);
@@ -440,18 +475,44 @@ void sock_input_udp(uint32_t src, uint32_t dst, const uint8_t* d, int len) {
     if (ulen < 8 || ulen > len) return;
     for (int i = 0; i < MAX_SOCKS; i++) {
         sock_t* s = &socks[i];
-        if (!s->used || s->type != 2 || s->lport != dport) continue;
-        if (s->lip && s->lip != dst && (dst >> 24) != 127) continue;
-        if (s->connected && (s->rip != src || s->rport != sport)) continue;
+        if (!s->used || s->type != 2 || s->proto == 58 || s->lport != dport) continue;
+        if (!dst_ok(s, dst) && !(is4(dst) && dst[12] == 127 && is4(s->lip))) continue;
+        if (s->connected && (memcmp(s->rip, src, 16) || s->rport != sport)) continue;
         if (s->q_n >= UDP_QMAX) return;
         dgram_t* g = (dgram_t*)kmalloc(sizeof(dgram_t) + (uint32_t)(ulen - 8));
         if (!g) return;
-        g->next = NULL; g->ip = src; g->port = sport; g->len = (uint16_t)(ulen - 8);
+        g->next = NULL; memcpy(g->ip, src, 16); g->port = sport; g->len = (uint16_t)(ulen - 8);
         memcpy(g->data, d + 8, (uint32_t)(ulen - 8));
         if (s->q_tail) s->q_tail->next = g; else s->q_head = g;
         s->q_tail = g;
         s->q_n++;
         return;
+    }
+}
+
+void sock_input_udp(uint32_t src, uint32_t dst, const uint8_t* d, int len) {
+    uint8_t a[16], b[16];
+    map4(a, src); map4(b, dst);
+    udp_in(a, b, d, len);
+}
+void sock_input_udp6(const uint8_t* src, const uint8_t* dst, const uint8_t* d, int len) { udp_in(src, dst, d, len); }
+
+/* icmpv6 for raw sockets (and the ping kind of dgram ones) */
+void sock_input_icmp6(const uint8_t* src, const uint8_t* dst, const uint8_t* m, int len) {
+    for (int i = 0; i < MAX_SOCKS; i++) {
+        sock_t* s = &socks[i];
+        if (!s->used || s->proto != 58 || s->type == 1) continue;
+        if (s->type == 2 && (m[0] != 129 || len < 8 || ((m[4] << 8) | m[5]) != s->lport)) continue;
+        if (!zero16(s->lip) && memcmp(s->lip, dst, 16)) continue;
+        if (s->connected && memcmp(s->rip, src, 16)) continue;
+        if (s->q_n >= UDP_QMAX) continue;
+        dgram_t* g = (dgram_t*)kmalloc(sizeof(dgram_t) + (uint32_t)len);
+        if (!g) continue;
+        g->next = NULL; memcpy(g->ip, src, 16); g->port = 0; g->len = (uint16_t)len;
+        memcpy(g->data, m, (uint32_t)len);
+        if (s->q_tail) s->q_tail->next = g; else s->q_head = g;
+        s->q_tail = g;
+        s->q_n++;
     }
 }
 
@@ -491,11 +552,20 @@ void sock_init(void) { task_spawn("netd", netd); }
 
 /* ---------------- API ---------------- */
 
-sock_t* sock_create(int type, int* err) {
-    if (type != 1 && type != 2) { *err = -EINVAL; return NULL; }
-    sock_t* s = alloc_sock(type);
-    if (!s) *err = -ENOMEM;
+sock_t* sock_create(int af, int type, int proto, int* err) {
+    if (type < 1 || type > 3) { *err = -EINVAL; return NULL; }
+    sock_t* s = alloc_sock(type, af);
+    if (!s) { *err = -ENOMEM; return NULL; }
+    s->proto = proto;
+    if (type == 2 && proto == 58 && !s->lport) s->lport = ephemeral(2);       /* ping socket: the port is the echo id */
     return s;
+}
+
+int sock_af(sock_t* s) { return s->af; }
+
+int sock_v6only(sock_t* s, int set, int val) {
+    if (set >= 0) s->v6only = val != 0;
+    return s->v6only;
 }
 
 void sock_ref(sock_t* s) { s->refs++; }
@@ -503,7 +573,7 @@ int  sock_type(sock_t* s) { return s->type; }
 
 void sock_close(sock_t* s) {
     if (--s->refs > 0) return;
-    if (s->type == 2 || s->state == S_CLOSED || s->state == S_SYN_SENT) { free_sock(s); return; }
+    if (s->type != 1 || s->state == S_CLOSED || s->state == S_SYN_SENT) { free_sock(s); return; }
     if (s->state == S_LISTEN) {
         for (int i = 0; i < s->aq_n; i++) {
             sock_t* c = s->acceptq[i];
@@ -523,11 +593,12 @@ void sock_close(sock_t* s) {
     reap_if_done(s);
 }
 
-int sock_bind(sock_t* s, uint32_t ip, uint16_t port) {
+int sock_bind(sock_t* s, const uint8_t* ip, uint16_t port) {
     if (s->bound) return -EINVAL;
+    if (s->type == 3) { memcpy(s->lip, ip, 16); s->bound = true; return 0; }
     if (!port) port = ephemeral(s->type);
     else if (port_in_use(s->type, port)) return -EADDRINUSE;
-    s->lip = ip;
+    memcpy(s->lip, ip, 16);
     s->lport = port;
     s->bound = true;
     return 0;
@@ -536,13 +607,13 @@ int sock_bind(sock_t* s, uint32_t ip, uint16_t port) {
 int sock_listen(sock_t* s, int backlog) {
     if (s->type != 1) return -EOPNOTSUPP;
     if (s->state != S_CLOSED && s->state != S_LISTEN) return -EINVAL;
-    if (!s->bound) { int r = sock_bind(s, 0, 0); if (r < 0) return r; }
+    if (!s->bound) { int r = sock_bind(s, zero_ip, 0); if (r < 0) return r; }
     s->state = S_LISTEN;
     s->backlog = backlog <= 0 ? 1 : backlog > ACCEPT_MAX ? ACCEPT_MAX : backlog;
     return 0;
 }
 
-sock_t* sock_accept(sock_t* s, bool nonblock, int* err, uint32_t* ip, uint16_t* port) {
+sock_t* sock_accept(sock_t* s, bool nonblock, int* err, uint8_t* ip, uint16_t* port) {
     if (s->state != S_LISTEN) { *err = -EINVAL; return NULL; }
     pump();
     while (!s->aq_n) {
@@ -555,26 +626,30 @@ sock_t* sock_accept(sock_t* s, bool nonblock, int* err, uint32_t* ip, uint16_t* 
     memmove(s->acceptq, s->acceptq + 1, (uint32_t)(--s->aq_n) * sizeof(sock_t*));
     c->parent = NULL;
     c->refs = 1;
-    *ip = c->rip;
+    memcpy(ip, c->rip, 16);
     *port = c->rport;
     return c;
 }
 
-int sock_connect(sock_t* s, uint32_t ip, uint16_t port, bool nonblock) {
-    if (s->type == 2) {                                /* UDP: default destination */
-        if (!s->bound) sock_bind(s, 0, 0);
-        s->rip = ip; s->rport = port; s->connected = true;
+int sock_connect(sock_t* s, const uint8_t* ip, uint16_t port, bool nonblock) {
+    if (s->type != 1) {                                /* UDP: default destination */
+        if (!s->bound) sock_bind(s, zero_ip, 0);
+        memcpy(s->rip, ip, 16); s->rport = port; s->connected = true;
         return 0;
     }
+    uint8_t src[16];
     if (s->state == S_ESTABLISHED) return -EISCONN;
     if (s->state == S_SYN_SENT) {
         if (nonblock) return -EALREADY;
     } else {
         if (s->state != S_CLOSED) return -EINVAL;
-        if (!s->bound) { int r = sock_bind(s, 0, 0); if (r < 0) return r; }
-        s->rip = ip;
+        if (is4(ip) && s->af == 10 && s->v6only) return -ENETUNREACH;
+        if (!is4(ip) && (!ip6_src_for(ip, src))) return -ENETUNREACH;      /* fast, so getaddrinfo falls back to v4 */
+        if (!s->bound) { int r = sock_bind(s, zero_ip, 0); if (r < 0) return r; }
+        memcpy(s->rip, ip, 16);
         s->rport = port;
-        if (!s->lip || (ip >> 24) == 127) s->lip = net_src_for(ip);
+        if (!is4(ip)) { if (zero16(s->lip) || is4(s->lip)) memcpy(s->lip, src, 16); }
+        else if (zero16(s->lip) || un4(ip) >> 24 == 127) map4(s->lip, net_src_for(un4(ip)));
         s->iss = 0x10000000u + pit_uptime_ms() * 64 + (uint32_t)(s - socks) * 4096;
         s->snd_una = s->iss;
         s->snd_nxt = s->iss + 1;
@@ -599,13 +674,36 @@ int sock_connect(sock_t* s, uint32_t ip, uint16_t port, bool nonblock) {
 }
 
 int sock_send(sock_t* s, const uint8_t* buf, uint32_t len, bool nonblock,
-              const uint32_t* to_ip, const uint16_t* to_port) {
-    if (s->type == 2) {
-        uint32_t ip = to_ip ? *to_ip : s->rip;
+              const uint8_t* to_ip, const uint16_t* to_port) {
+    if (s->type != 1) {
+        const uint8_t* ip = to_ip ? to_ip : s->rip;
         uint16_t port = to_port ? *to_port : s->rport;
+        uint8_t src[16];
         if (!to_ip && !s->connected) return -EDESTADDRREQ;
         if (len > 1472) return -90;                    /* EMSGSIZE */
-        if (!s->bound) sock_bind(s, 0, 0);
+        if (is4(ip)) {
+            uint32_t d = un4(ip);
+            if (!zero16(s->lip) && is4(s->lip) && d >> 24 != 127) memcpy(src, s->lip, 16);
+            else map4(src, net_src_for(d));
+        } else if (!zero16(s->lip) && !is4(s->lip)) memcpy(src, s->lip, 16);
+        else if (!ip6_src_for(ip, src)) return -ENETUNREACH;
+        if (s->type == 3 || s->proto == 58) {          /* icmp: whole message from the user */
+            uint8_t m[1472];
+            if (len < 8) return -EINVAL;
+            memcpy(m, buf, len);
+            if (s->type == 2) { m[4] = s->lport >> 8; m[5] = (uint8_t)s->lport; }
+            if (s->proto == 58) {
+                m[2] = m[3] = 0;
+                uint16_t c = l4_sum(src, ip, 58, m, (int)len);
+                m[2] = c >> 8; m[3] = (uint8_t)c;
+            }
+            uint32_t f = irq_save();
+            int r = ip_out(src, ip, (uint8_t)s->proto, m, (int)len);
+            irq_restore(f);
+            pump();
+            return r < 0 ? r : (int)len;
+        }
+        if (!s->bound) sock_bind(s, zero_ip, 0);
         uint8_t pkt[8 + 1472];
         udph_t* h = (udph_t*)pkt;
         h->sport = be16(s->lport);
@@ -613,14 +711,13 @@ int sock_send(sock_t* s, const uint8_t* buf, uint32_t len, bool nonblock,
         h->len = be16((uint16_t)(8 + len));
         h->sum = 0;
         memcpy(pkt + 8, buf, len);
-        uint32_t src = (s->lip && (ip >> 24) != 127) ? s->lip : net_src_for(ip);
         uint16_t cs = l4_sum(src, ip, 17, pkt, 8 + (int)len);
         h->sum = be16(cs ? cs : 0xFFFF);
         uint32_t f = irq_save();
-        net_send_ip(ip, 17, pkt, 8 + (int)len);
+        int r = ip_out(src, ip, 17, pkt, 8 + (int)len);
         irq_restore(f);
         pump();
-        return (int)len;
+        return r < 0 ? r : (int)len;
     }
     if (s->state == S_SYN_SENT || s->state == S_SYN_RCVD) return -ENOTCONN;
     uint32_t done = 0;
@@ -653,13 +750,13 @@ int sock_send(sock_t* s, const uint8_t* buf, uint32_t len, bool nonblock,
 }
 
 int sock_recv(sock_t* s, uint8_t* buf, uint32_t len, bool nonblock, bool peek,
-              uint32_t* from_ip, uint16_t* from_port) {
-    if (s->type == 2) {
+              uint8_t* from_ip, uint16_t* from_port) {
+    if (s->type != 1) {
         WAIT_FOR(s->q_head, nonblock);
         dgram_t* g = s->q_head;
         uint32_t n = g->len < len ? g->len : len;
         memcpy(buf, g->data, n);
-        if (from_ip) *from_ip = g->ip;
+        if (from_ip) memcpy(from_ip, g->ip, 16);
         if (from_port) *from_port = g->port;
         if (!peek) {
             s->q_head = g->next;
@@ -686,7 +783,7 @@ int sock_recv(sock_t* s, uint8_t* buf, uint32_t len, bool nonblock, bool peek,
         if (s->state != S_CLOSED && rx_window(s) >= (uint32_t)s->adv_wnd + 2 * RX_MSS)
             tcp_segment(s, s->snd_nxt, TCP_ACK, NULL, 0);
     }
-    if (from_ip) *from_ip = s->rip;
+    if (from_ip) memcpy(from_ip, s->rip, 16);
     if (from_port) *from_port = s->rport;
     return (int)n;
 }
@@ -704,21 +801,21 @@ int sock_shutdown(sock_t* s, int how) {
     return 0;
 }
 
-void sock_name(sock_t* s, bool peer, uint32_t* ip, uint16_t* port) {
-    *ip = peer ? s->rip : s->lip;
+void sock_name(sock_t* s, bool peer, uint8_t* ip, uint16_t* port) {
+    memcpy(ip, peer ? s->rip : s->lip, 16);
     *port = peer ? s->rport : s->lport;
 }
 
 int sock_take_error(sock_t* s) { int e = s->err; s->err = 0; return e; }
 
 bool sock_readable(sock_t* s) {
-    if (s->type == 2) return s->q_head != NULL;
+    if (s->type != 1) return s->q_head != NULL;
     if (s->state == S_LISTEN) return s->aq_n > 0;
     return s->rx_count || s->fin_rcvd || s->err || s->state == S_CLOSED;
 }
 
 bool sock_writable(sock_t* s) {
-    if (s->type == 2) return true;
+    if (s->type != 1) return true;
     if (s->state == S_SYN_SENT || s->state == S_LISTEN || s->state == S_SYN_RCVD) return false;
     return s->tx_len < TX_CAP || s->err || s->state == S_CLOSED;
 }
