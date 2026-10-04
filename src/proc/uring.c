@@ -706,7 +706,7 @@ static int sq_submit(uring_t* r, uint32_t n) {
         else { if (hl) hl->snext = q; else heads = q; hl = q; }
         tl = q;
         open = lnk;
-        if (q->bad && !(r->flags & IORING_SETUP_SUBMIT_ALL)) break;      // stop at the first broken sqe
+        if (q->bad && q->bad != -ENOENT && !lnk && s.opcode != IORING_OP_LINK_TIMEOUT && !(r->flags & IORING_SETUP_SUBMIT_ALL)) break;      // stop at the first broken sqe
     }
     *r->sq_head = head;
     bar();
