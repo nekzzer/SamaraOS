@@ -1,4 +1,5 @@
 #include "gui/desktop.h"
+#include "drivers/drm.h"
 #include "gfx/termfont.h"
 #include "gfx/gfx_term.h"
 #include "drivers/vga.h"
@@ -76,6 +77,7 @@ static bool video_param(int* w, int* h) {
 bool desktop_init_graphics(void) {
     int vw, vh;
     if (video_param(&vw, &vh) && gfx_init_vbe(vw, vh, 32)) return true;
+    if (drm_pref_size(&vw, &vh) && vw <= 4096 && gfx_init_vbe(vw, vh, 32)) return true;
     /* Try 1080p first (QEMU stdvga happily does it with 16 MiB VRAM).
        Fall back through common modes if the card refuses. */
     bool ok = gfx_init_vbe(1920, 1080, 32);

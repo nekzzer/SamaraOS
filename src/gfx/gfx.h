@@ -9,6 +9,7 @@ bool     gfx_init(multiboot_info_t* mbi);     /* true if framebuffer ready */
 bool     gfx_init_vbe(int w, int h, int bpp); /* Bochs VBE — used by QEMU stdvga */
 bool     gfx_init_mode13h(void);              /* fallback: 320x200 indexed */
 bool     gfx_ready(void);
+void     gfx_remode(void);                    /* bga: set the mode gfx had again */
 
 /* Double buffering — render scene to back buffer, then present atomically */
 bool     gfx_enable_double_buffer(void);      /* allocates back buffer */
