@@ -291,7 +291,7 @@ $(DISK_IMG):
 #     cd /usr/src/samaraos && make CROSS=/opt/gcc/bin/
 GCC_TAR := build/gcc.tar
 SRC_TAR := build/src.tar
-GCC_MEM ?= 1024
+GCC_MEM ?= 1900
 
 $(GCC_TAR): tools/mk-gcc-tar.py
 	python3 tools/mk-gcc-tar.py $@

@@ -23,7 +23,7 @@
    including the ones behind the user window - while a process is current.
    All frame contents are touched through P2V(). */
 #define DMAP_BASE        0x40000000u
-#define DMAP_SIZE        0x40000000u            /* 1 GiB of RAM */
+#define DMAP_SIZE        0x78000000u            /* 1.875 GiB of RAM, up to 0xB8000000: lfb/pci live above */
 #define P2V(p)           ((void*)((uint32_t)(p) + DMAP_BASE))
 /* Physical address of a kernel buffer, for DMA: direct-map addresses (big
    heap arena, module data) translate back; the rest of kernel space below

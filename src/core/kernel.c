@@ -198,6 +198,9 @@ static void relocate_modules(multiboot_info_t* mbi, uint32_t ram_end) {
     mods_floor = top;
 }
 
+static uint32_t ram_end_g;
+#define LOW_RAM 0x40000000u     /* modules and process frames stay below: identity map */
+
 static uint32_t ram_top(uint32_t magic, uint32_t mb_info_addr) {
     uint32_t ram_end = 0x08000000;
     if (magic == MB1_BOOTED_MAGIC && mb_info_addr) {
@@ -205,7 +208,8 @@ static uint32_t ram_top(uint32_t magic, uint32_t mb_info_addr) {
         if (mbi->flags & 1) ram_end = 0x100000 + mbi->mem_upper * 1024;
     }
     if (ram_end > DMAP_SIZE) ram_end = DMAP_SIZE;
-    return ram_end;
+    ram_end_g = ram_end;
+    return ram_end > LOW_RAM ? LOW_RAM : ram_end;   /* the rest is file cache, see user memory */
 }
 
 void kmain(uint32_t magic, uint32_t mb_info_addr) {
@@ -298,10 +302,14 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
         uint32_t pool_end = mods_floor & ~0x3FFFFFu;
         uint32_t avail = pool_end > pool_start ? pool_end - pool_start : 0;
         uint32_t big = avail >= 0x10000000u ? (avail / 5 * 2) & ~0x3FFFFFu : 0;   /* >= 256 MiB */
+        /* more than 1 GB: everything above it is the file arena (only the
+           direct map reaches it), processes get all of the low gig */
+        uint32_t hi = (ram_end_g & ~0x3FFFFFu) > LOW_RAM ? (ram_end_g & ~0x3FFFFFu) - LOW_RAM : 0;
+        if (hi >= 0x10000000u) { big = 0; heap_add_big(P2V(LOW_RAM), hi); }
         if (big) heap_add_big(P2V(pool_end - big), big);
         boot_step("user memory");
         pmm_init(pool_start, pool_end - big);
-        vga_printf("ok (%u KB, files %u KB, modules %d)\n", pmm_total_frames() * 4, big / 1024,
+        vga_printf("ok (%u KB, files %u KB, modules %d)\n", pmm_total_frames() * 4, (uint32_t)(heap_big_total() / 1024),
                    n_bootmods);
     }
     BOOT_OK("syscalls", (proc_init(), syscall_init()));
