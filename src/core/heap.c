@@ -83,7 +83,11 @@ void* kmalloc_big(size_t n) {
         p = arena_alloc(&big, n);
         irq_restore(f);
     }
-    if (!p) { f = irq_save(); p = arena_alloc(&low, n); irq_restore(f); }
+    /* the kernel heap only if plenty stays free: apk filled the file arena,
+       file data ate the kernel heap and everything after that went bad */
+    if (!p && (!big.head || low.size - low.used > n + (24u << 20))) {
+        f = irq_save(); p = arena_alloc(&low, n); irq_restore(f);
+    }
     return p;
 }
 

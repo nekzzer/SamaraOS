@@ -2393,10 +2393,88 @@ static int32_t dispatch(regs_t* r) {
     return -ENOSYS;
 }
 
+/* ext2 sync vs syscalls that change files. the sync walks the tree and
+   reads file bytes while apk writes and unlinks under it. a writer marks
+   its process, a sync waits until no live process is marked and keeps new
+   writers waiting. per process, not a counter: the counter leaked when a
+   process died inside a write, every sync after that hung and X sat on a
+   black screen waiting in open() */
+static volatile bool fs_syncing;
+
+void fs_write_begin(void) {
+    proc_t* p = proc_current();
+    for (;;) {
+        uint32_t f = irq_save();
+        if (!fs_syncing) { if (p) p->in_fs = true; irq_restore(f); return; }
+        irq_restore(f);
+        task_sleep_ms(2);
+    }
+}
+
+void fs_write_end(void) {
+    proc_t* p = proc_current();
+    if (p) p->in_fs = false;
+}
+
+static bool fs_writers(void) {
+    for (int i = 0; i < MAX_PROCS; i++) {
+        proc_t* p = proc_at(i);
+        if (p && p->state == P_ALIVE && p->in_fs) return true;
+    }
+    return false;
+}
+
+void fs_sync_begin(void) {
+    for (;;) {
+        uint32_t f = irq_save();
+        if (!fs_syncing) { fs_syncing = true; irq_restore(f); break; }
+        irq_restore(f);
+        task_sleep_ms(2);
+    }
+    /* bounded: a writer stuck in a lazy read for long is still better than a hung sync */
+    uint32_t t0 = pit_uptime_ms();
+    while (fs_writers() && pit_uptime_ms() - t0 < 3000) task_sleep_ms(1);
+}
+
+void fs_sync_end(void) { fs_syncing = false; }
+
+/* a write ran out of file memory. step out of the writers (the file isn't
+   touched yet), let a sync run and drop clean files, step back in */
+void fs_wait_room(uint32_t need) {
+    proc_t* p = proc_current();
+    if (!p || !p->in_fs) return;
+    p->in_fs = false;
+    ext2_make_room(need);
+    fs_write_begin();
+}
+
+/* syscalls that change files or the tree. they don't run while an ext2
+   sync walks it (fs_write_begin). writes only when they hit a ramfs file:
+   a blocking write into a pipe would hold the sync off forever */
+static bool changes_fs(uint32_t nr, uint32_t a) {
+    switch (nr) {
+        case 4: case 146: case 181: case 334: case 93: case 194: case 324: case 94: {
+            file_t* f = getf((int)a);
+            return f && f->type == F_NODE;
+        }
+        case 5: case 8: case 295: case 10: case 301: case 38: case 302: case 353:
+        case 39: case 296: case 40: case 83: case 304: case 9: case 303:
+        case 92: case 193: case 15: case 306: case 30: case 271: case 320: case 412:
+            return true;
+    }
+    return false;
+}
+
 void syscall_dispatch(regs_t* r) {
     uint32_t nr = r->eax;
     proc_check_alarm(proc_current(), false);
+    bool mut = changes_fs(nr, r->ebx);
+    if (mut) {
+        ext2_throttle();                      /* before: the sync waits for writers */
+        fs_write_begin();
+    }
     int32_t ret = dispatch(r);
+    if (mut) fs_write_end();
     if (g_strace && g_strace_pid && proc_current() && proc_current()->pid == g_strace_pid) {
         /* buffered: record now, print when the process exits (timing stays intact) */
         static struct { int32_t nr, a, b, c, ret; } rec[4096];

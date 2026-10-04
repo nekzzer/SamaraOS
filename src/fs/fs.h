@@ -47,6 +47,11 @@ void        fs_need(fs_node_t* n);            /* read a lazy file in */
 bool        fs_recent(fs_node_t* n);          /* looked up just now: exec & co read ->data right after */
 void        fs_need_tree(fs_node_t* n);       /* a whole subtree (moving it to another volume) */
 fs_node_t*  fs_owner(fs_node_t* n);           /* the mount root above n */
+void        fs_write_begin(void);             /* a syscall that changes files/tree */
+void        fs_write_end(void);
+void        fs_sync_begin(void);              /* a volume sync: waits writers out */
+void        fs_sync_end(void);
+void        fs_wait_room(uint32_t need);     /* writer out of file memory: wait for a sync */
 fs_node_t*  fs_symlink(fs_node_t* dir, const char* name, const char* target);
 fs_node_t*  fs_create(fs_node_t* cwd, const char* path, fs_type_t type);
 int         fs_unlink(fs_node_t* cwd, const char* path);

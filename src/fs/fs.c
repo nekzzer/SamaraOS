@@ -1,4 +1,6 @@
 #include "fs/fs.h"
+#include "core/task.h"
+#include "core/io.h"
 #include "core/heap.h"
 #include "core/string.h"
 #include "core/clock.h"
@@ -136,6 +138,8 @@ static fs_node_t* resolve(fs_node_t* cwd, const char* path, bool follow, int dep
 }
 
 int (*fs_lazy_hook)(fs_node_t* n);
+
+/* fs_write_begin/end, fs_sync_begin/end: in proc/syscall.c, they need the process table */
 
 /* last few lookups. eviction keeps its hands off them: the caller is about to
    use ->data. was a 1 s age check on the uptime, but with lost ticks thrown

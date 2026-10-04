@@ -163,6 +163,11 @@ static int node_reserve(fs_node_t* n, uint32_t need) {
     while (cap < need + 1) cap = cap < (1u << 20) ? cap * 2 : cap + cap / 4;   /* big files: gentle growth */
     if (n->data && n->cap && kgrow(n->data, cap)) { n->cap = cap; return 0; }   /* no copy, no second buffer */
     char* nb = (char*)kmalloc_big(cap);
+    for (int t = 0; !nb && t < 3; t++) {          /* dirty files fill the arena until they're on disk */
+        fs_wait_room(cap);
+        if (n->data && n->cap && kgrow(n->data, cap)) { n->cap = cap; return 0; }
+        nb = (char*)kmalloc_big(cap);
+    }
     if (!nb) return -ENOMEM;
     if (n->data) memcpy(nb, n->data, n->size);
     uint32_t size = n->size;

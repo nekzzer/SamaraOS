@@ -58,7 +58,8 @@ typedef struct proc {
     bool     tty_detached;         /* background job: console reads EOF, writes are dropped */
     int      ctty;                 /* controlling terminal: 0 console, -1 none, n>0 pty n-1 */
     char     name[32];
-    char     exe[128];             /* /proc/self/exe, symlinks resolved ($ORIGIN in java) */
+    char     exe[128];
+    bool     in_fs;                /* inside a syscall that changes files (ext2 sync waits) */             /* /proc/self/exe, symlinks resolved ($ORIGIN in java) */
     bool     vfork_shared;         /* vfork child running on the parent's page directory */
     /* Accounting for /proc. */
     uint32_t start_ms;

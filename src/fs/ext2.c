@@ -47,7 +47,7 @@ typedef struct {
     uint32_t tcap;
     uint32_t acur, icur;
     volatile bool dirty;
-    uint32_t dirty_ms;
+    uint32_t dirty_ms, dirty_since;       /* last change, first change since the last sync */
 } ev_t;
 
 static ev_t vols[E2_MAX];
@@ -720,8 +720,16 @@ static int sync_vol(ev_t* v) {
 
 void ext2_dirty(int id) {
     for (int i = 0; i < E2_MAX; i++)
-        if (vols[i].used && vols[i].id == id && !vols[i].ro) { vols[i].dirty = true; vols[i].dirty_ms = pit_uptime_ms(); }
+        if (vols[i].used && vols[i].id == id && !vols[i].ro) {
+            if (!vols[i].dirty) vols[i].dirty_since = pit_uptime_ms();
+            vols[i].dirty = true;
+            vols[i].dirty_ms = pit_uptime_ms();
+        }
 }
+
+static bool started;
+static volatile uint32_t nsyncs;          /* finished passes, ext2_throttle waits on it */
+static volatile bool kicked;
 
 /* sync(2) and the task below both get here; the layout state is shared */
 static volatile int busy;
@@ -807,29 +815,70 @@ static void ext2_reclaim(size_t need) {
 }
 
 int ext2_sync_all(void) {
+    fs_sync_begin();                      /* before our lock: a writer may be in a lazy read */
     lock();
     for (int i = 0; i < E2_MAX; i++)
         if (vols[i].used && vols[i].dirty) { vols[i].dirty = false; sync_vol(&vols[i]); }
+    nsyncs++;
     unlock();
+    fs_sync_end();
     return 0;
 }
 
+static bool pressure(void) { return heap_big_used() > heap_big_total() / 20 * 17; }   /* 85% */
+
+/* a quiet second, or 3 s since the first change, or the file arena filling
+   up. it used to wait for a quiet second only: apk never stops writing,
+   nothing got saved and dirty files filled all memory */
 static void e2syncd(void) {
     for (;;) {
-        task_sleep_ms(300);
+        task_sleep_ms(kicked ? 20 : 300);
+        uint32_t now = pit_uptime_ms();
+        bool any = false;
         for (int i = 0; i < E2_MAX; i++) {
             ev_t* v = &vols[i];
-            if (v->used && v->dirty && pit_uptime_ms() - v->dirty_ms > 1000) {
-                lock();
-                v->dirty = false;
-                if (sync_vol(v) < 0) klog("ext2: sync failed\r\n");
-                unlock();
-            }
+            if (v->used && v->dirty && (now - v->dirty_ms > 1000 || now - v->dirty_since > 3000 || pressure() || kicked)) any = true;
         }
+        if (!any) { if (kicked) { kicked = false; nsyncs++; } continue; }
+        kicked = false;
+        fs_sync_begin();
+        lock();
+        for (int i = 0; i < E2_MAX; i++) {
+            ev_t* v = &vols[i];
+            if (!v->used || !v->dirty) continue;
+            v->dirty = false;
+            if (sync_vol(v) < 0) klog("ext2: sync failed\r\n");
+        }
+        nsyncs++;
+        unlock();
+        fs_sync_end();
     }
 }
 
-static bool started;
+/* a writer when the file arena is nearly full: get the dirty files on disk
+   (then they can be dropped) before adding more. called outside
+   fs_write_begin, the sync waits for writers */
+static void ext2_reclaim(size_t need);
+static uint32_t last_throttle;
+
+/* out of file memory in the middle of a write: sync, then drop clean files */
+void ext2_make_room(size_t need) {
+    if (!started) return;
+    uint32_t n = nsyncs, t0 = pit_uptime_ms();
+    kicked = true;
+    while (nsyncs == n && pit_uptime_ms() - t0 < 5000) task_sleep_ms(5);
+    ext2_reclaim(need + heap_big_total() / 8);
+}
+void ext2_throttle(void) {
+    if (!started || !pressure()) return;
+    uint32_t now = pit_uptime_ms();
+    if (now - last_throttle < 1000) return;     /* once a second, not every write(): dd crawled */
+    last_throttle = now;
+    uint32_t n = nsyncs;
+    kicked = true;
+    while (nsyncs == n && pit_uptime_ms() - now < 5000) task_sleep_ms(5);
+    ext2_reclaim(heap_big_total() / 4);          /* clean now: drop them, or the pressure never goes */
+}
 
 int ext2_mount(int disk, fs_node_t* at) {
     int s = -1;
