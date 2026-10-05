@@ -568,7 +568,11 @@ static void thread_kill(proc_t* q) {
         t->cr3 = 0;
         t->state = T_DEAD;
     }
-    q->state = P_FREE;
+    proc_t* tr = q->tracer ? proc_by_pid(q->tracer) : NULL;
+    if (tr && tr->state == P_ALIVE && tr->sh != q->sh) {     // strace -f wants to wait4 the dead thread
+        q->state = P_ZOMBIE;
+        tr->sig_pending |= SIGBIT(17);
+    } else q->state = P_FREE;
 }
 
 /* Release everything of a process that is not running right now, or of the
@@ -581,7 +585,7 @@ static void teardown(proc_t* p, int status) {
     bool cur_in = cur && cur->sh == p->sh;
     for (int i = 0; i < MAX_PROCS; i++) {
         proc_t* q = &procs[i];
-        if (q != p && q->state != P_FREE && q->is_thread && q->tgid == p->pid) thread_kill(q);
+        if (q != p && q->state != P_FREE && q->is_thread && q->tgid == p->pid) { q->exit_status = status; thread_kill(q); }
     }
     p->zleader = false;
     futex_forget(p);
@@ -656,6 +660,7 @@ void proc_thread_exit(int status) {
         t->cr3 = 0;
         t->state = T_DEAD;
     } else {
+        p->exit_status = status;
         thread_kill(p);
     }
     for (;;) task_yield();
@@ -1049,7 +1054,7 @@ int proc_wait(int pid, int* status, int options) {
         for (int i = 0; i < MAX_PROCS; i++) {
             proc_t* c = &procs[i];
             if (c->state == P_FREE) continue;
-            bool mine = c->ppid == me->tgid;
+            bool mine = c->ppid == me->tgid && !c->is_thread;
             if (!mine && c->tracer != me->tgid) continue;
             if (pid > 0 && c->pid != pid) continue;
             if (pid == 0 && c->pgid != me->pgid) continue;
@@ -1065,7 +1070,7 @@ int proc_wait(int pid, int* status, int options) {
                 int cp = c->pid;
                 c->tracer = 0;
                 proc_t* par = c->ppid ? proc_by_pid(c->ppid) : NULL;
-                if (!par || par->state != P_ALIVE) c->state = P_FREE;
+                if (c->is_thread || !par || par->state != P_ALIVE) c->state = P_FREE;
                 return cp;
             }
             if (c->state == P_ZOMBIE) {
