@@ -1,5 +1,6 @@
 #include "boot/pic.h"
 #include "core/io.h"
+#include "boot/apic.h"
 
 void pic_remap(void) {
 
@@ -27,17 +28,20 @@ uint16_t pic_isr(void) {
 }
 
 void pic_send_eoi(uint8_t irq) {
+    if (apic_on) { lapic_eoi(); return; }
     if (irq >= 8) outb(PIC2_CMD, PIC_EOI);
     outb(PIC1_CMD, PIC_EOI);
 }
 
 void pic_set_mask(uint8_t irq) {
+    if (apic_on) { ioapic_irq(irq, true); return; }
     uint16_t port = irq < 8 ? PIC1_DATA : PIC2_DATA;
     if (irq >= 8) irq -= 8;
     outb(port, inb(port) | (1 << irq));
 }
 
 void pic_clear_mask(uint8_t irq) {
+    if (apic_on) { ioapic_irq(irq, false); return; }
     uint16_t port = irq < 8 ? PIC1_DATA : PIC2_DATA;
     if (irq >= 8) irq -= 8;
     outb(port, inb(port) & ~(1 << irq));

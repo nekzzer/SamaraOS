@@ -14,6 +14,8 @@ typedef long                ssize_t;
 typedef unsigned long       uintptr_t;
 typedef long                intptr_t;
 
+#define MAX_CPUS 8
+
 #define NULL ((void*)0)
 #define true  1
 #define false 0
