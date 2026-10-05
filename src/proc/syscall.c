@@ -2245,7 +2245,15 @@ static int64_t dispatch(regs_t* r) {
             file_t* fl = getf((int)a);
             return fl ? flk_flock(fl, (int)b) : -EBADF;
         }
-        case 162: case 74: case 75: case 306:                        /* sync, fsync, fdatasync, syncfs */
+        case 74: case 75: case 306: case 277: {                      /* fsync, fdatasync, syncfs, sync_file_range */
+            file_t* fl = getf((int)a);
+            if (!fl) return -EBADF;
+            if (r->rax == 277 && (d & ~7ull)) return -EINVAL;
+            if (r->rax != 306 && fl->type != F_NODE && fl->type != F_DISK) return -EINVAL;
+            ext2_sync_all();
+            return fatfs_sync_all();
+        }
+        case 162:                                                    /* sync */
             ext2_sync_all();
             return fatfs_sync_all();
         case 165: {                                                  /* mount */
@@ -2503,7 +2511,24 @@ static int64_t dispatch(regs_t* r) {
                 if (c + d > fl->node->size && node_truncate(fl->node, c + d) < 0) return -ENOMEM;
                 return 0;
             }
-            return -95;                                              /* apk asks. EOPNOTSUPP and it just writes */
+            if (!fl) return -EBADF;
+            if (fl->type != F_NODE) return -19;
+            fs_node_t* n = fl->node;
+            if (n->type == FS_DIR) return -EISDIR;
+            if (n->type != FS_FILE || n->dev) return -19;
+            if ((fl->flags & 3) == 0) return -EBADF;
+            if ((int64_t)c < 0 || (int64_t)d <= 0) return -EINVAL;
+            if (b & ~(uint64_t)(1 | 2 | 16)) return -95;                 /* EOPNOTSUPP: collapse, insert */
+            if ((b & 2) && !(b & 1)) return -95;                     /* punch hole needs keep size */
+            uint64_t end = c + d;
+            if (end > 0x7FFFFFFF) return -27;                        /* EFBIG, 32 bit sizes in the ramfs */
+            fs_need(n);
+            if (b & (2 | 16)) {                                      /* hole = zeros, the fs has no holes in memory */
+                uint64_t z = c < n->size ? c : n->size, ze = end < n->size ? end : n->size;
+                if (ze > z && n->data) { memset(n->data + z, 0, ze - z); n->mtime = fs_now(); fs_touch(n); }
+            }
+            if (!(b & 1) && end > n->size && node_truncate(n, (uint32_t)end) < 0) return -ENOMEM;
+            return 0;
         }
         // membarrier, rseq: not here yet. glib/qemu fall back
         // to pipes and poll on ENOSYS, so just say no without spamming the log
