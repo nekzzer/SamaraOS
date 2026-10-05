@@ -392,12 +392,14 @@ static int do_open(int dirfd, const char* path, int flags, int mode) {
         n = fs_create(parent, name, FS_FILE);
         if (!n) return -EACCES;
         n->mode = (uint16_t)(mode & ~me()->sh->umask & 07777);
+        ino_node(n, 0x100);
     }
     if ((flags & O_DIRECTORY) && n->type != FS_DIR) return -ENOTDIR;
     if (n->type == FS_DIR && (flags & O_ACCMODE) != 0) return -EISDIR;
-    if ((flags & O_TRUNC) && n->type == FS_FILE && !n->dev && (flags & O_ACCMODE)) node_truncate(n, 0);
+    if ((flags & O_TRUNC) && n->type == FS_FILE && !n->dev && (flags & O_ACCMODE)) { uint32_t os = n->size; node_truncate(n, 0); if (os) ino_node(n, 2); }
     file_t* f = file_open_node(n, flags & ~(O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC));
     if (!f) return n->dev == FS_DEV_TTY ? -ENXIO : -ENOMEM;     // xterm dies on ENOMEM here
+    ino_node(n, 0x20);
     return install_fd(f, 0, (flags & O_CLOEXEC) != 0);
 }
 
@@ -523,6 +525,7 @@ static int do_getdents64(int fd, uint8_t* buf, uint64_t n) {
 
 static bool is_shm(fs_node_t* n);
 static void shm_drop(fs_node_t* n);
+static void shm_drop_ino(fs_node_t* n) { ino_gone(n, false); shm_drop(n); }
 
 static int do_unlink(int dirfd, const char* path, int flags) {
     UCHK(path, 1);
@@ -543,6 +546,8 @@ static int do_unlink(int dirfd, const char* path, int flags) {
     fs_node_t* parent = n->parent;
     if (!parent) return -EBUSY;
     if (is_shm(n) && !n->xl && !n->hl) shm_drop(n);       // mappings keep their own refs
+    ino_ev(parent, 0x200 | (n->type == FS_DIR ? 0x40000000 : 0), n->name, 0);
+    ino_gone(n, !n->xl && !n->hl);
     fs_drop_name(n);
     return 0;
 }
@@ -557,6 +562,7 @@ static int do_mkdir(int dirfd, const char* path, int mode) {
     fs_node_t* n = fs_create(parent, name, FS_DIR);
     if (!n) return -EEXIST;
     n->mode = (uint16_t)(mode & ~me()->sh->umask & 07777);
+    ino_node(n, 0x100);
     return 0;
 }
 
@@ -588,10 +594,15 @@ static int do_rename(int ofd, const char* from, int nfd, const char* to) {
         int r = do_unlink(nfd, to, dst->type == FS_DIR ? AT_REMOVEDIR : 0);
         if (r < 0) return r;
     }
+    static uint32_t cookie;
+    uint32_t ck = ++cookie, isd = src->type == FS_DIR ? 0x40000000 : 0;
+    ino_ev(src->parent, 0x40 | isd, src->name, ck);
     fs_detach(src);
     strncpy(src->name, name, FS_NAME_MAX - 1);
     src->name[FS_NAME_MAX - 1] = 0;
     fs_attach(parent, src);
+    ino_ev(parent, 0x80 | isd, src->name, ck);
+    ino_ev(src, 0x800, NULL, 0);
     return 0;
 }
 
@@ -616,7 +627,9 @@ static int do_link(int ofd, const char* from, int nfd, const char* to, int flags
     if (ow != fs_owner(par)) return -EXDEV;
     if (ow->mount_id && ow->mount_id < 8) return -EPERM;       /* fat */
     if (src->xl > 60000) return -EMLINK;
-    return fs_hlink(src, par, name) < 0 ? -ENOMEM : 0;
+    if (fs_hlink(src, par, name) < 0) return -ENOMEM;
+    ino_ev(par, 0x100, name, 0);
+    return 0;
 }
 
 static int do_access(int dirfd, const char* path) {
@@ -690,7 +703,7 @@ static int do_ioctl(int fd, uint32_t req, uint64_t arg) {
     if (req == 0x541B) {                                      /* FIONREAD */
         UCHK((void*)arg, 4);
         int n = 0;
-        if (f->type == F_PIPE_R || f->type == F_SPAIR) n = f->pipe->count;
+        if (f->type == F_PIPE_R || f->type == F_SPAIR || f->type == F_INOTIFY) n = f->pipe->count;
         else if (f->type == F_NODE && f->node->type == FS_FILE && f->off < f->node->size)
             n = (int)(f->node->size - f->off);
         else if (f->type == F_TTY) n = tty_readable() ? 1 : 0;
@@ -1780,6 +1793,7 @@ int file_wqs(file_t* f, wq_t** v) {
         case F_PIPE_R: case F_PIPE_W: v[0] = &f->pipe->wq; return 1;
         case F_SPAIR: v[0] = &f->pipe->wq; v[1] = &f->pipe2->wq; return 2;
         case F_EVENTFD: v[0] = &f->wq; return 1;
+        case F_INOTIFY: v[0] = &f->pipe->wq; return 1;
         case F_TTY: v[0] = &tty_wq; return 1;
         case F_PTM: case F_PTS: v[0] = pty_wq(f->pty); return v[0] ? 1 : 0;
         case F_ULISTEN: v[0] = &f->ux->wq; return 1;
@@ -2734,6 +2748,26 @@ static int64_t dispatch(regs_t* r) {
         }
         case 324: case 334: case 435:
             return -ENOSYS;
+        case 253: case 294: {                                        /* inotify_init(1) */
+            file_t* f = ino_new(r->rax == 294 ? (int)a : 0);
+            if (!f) return -ENOMEM;
+            return install_fd(f, 0, r->rax == 294 && (a & 02000000));
+        }
+        case 254: {                                                  /* inotify_add_watch */
+            file_t* f = getf((int)a);
+            if (!f || f->type != F_INOTIFY) return -EBADF;
+            UCHK((void*)b, 1);
+            int err;
+            fs_node_t* n = lookup_ex(AT_FDCWD, (const char*)b, &err, !(c & 0x02000000));
+            if (!n) return err;
+            if ((c & 0x01000000) && n->type != FS_DIR) return -ENOTDIR;
+            return ino_add(f, n, (uint32_t)c);
+        }
+        case 255: {
+            file_t* f = getf((int)a);
+            if (!f || f->type != F_INOTIFY) return -EBADF;
+            return ino_rm(f, (int)b);
+        }
         case 284: case 290: {                                        /* eventfd(2) */
             int fl = r->rax == 290 ? (int)b : 0;
             file_t* f = file_new(F_EVENTFD, 2 | ((fl & 04000) ? O_NONBLOCK : 0) | ((fl & 1) ? 0x10000000 : 0));
@@ -3179,7 +3213,7 @@ int64_t syscall_nobkl(regs_t* r) {
 }
 
 void syscall_init(void) {
-    fs_free_hook = shm_drop;
+    fs_free_hook = shm_drop_ino;
     static const uint16_t nb[] = { 0, 1, 9, 10, 11, 39, 186, 102, 104, 107, 108, 96, 228, 229, 24, 35, 230, 202 };
     for (unsigned i = 0; i < sizeof(nb) / sizeof(nb[0]); i++) nobkl_tab[nb[i]] = 1;
 }

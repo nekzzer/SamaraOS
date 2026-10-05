@@ -14,7 +14,7 @@ typedef enum { F_NODE = 1, F_TTY, F_PIPE_R, F_PIPE_W, F_NULL, F_ZERO, F_RANDOM, 
                F_USOCK, F_ULISTEN,                 /* AF_UNIX not connected yet / listening (ux) */
                F_EPOLL,
                F_EVENTFD, F_TIMERFD, F_DRM, F_SIGNALFD,
-               F_URING } ftype_t;
+               F_URING, F_INOTIFY } ftype_t;
 
 #define PIPE_SZ 65536           /* was 8k, x11 images through a socketpair crawled */
 
@@ -55,7 +55,15 @@ uint32_t file_gen(file_t* f);
 file_t* file_open_node(fs_node_t* n, int flags);   /* handles device nodes */
 void    file_ref(file_t* f);
 void    file_close(file_t* f);
-void    efd_wake(void);                            /* an eventfd counter went up */
+void    efd_wake(void);
+file_t* ino_new(int fl);
+int     ino_read(file_t* f, char* buf, uint32_t n);
+void    ino_close(file_t* f);
+int     ino_add(file_t* f, fs_node_t* n, uint32_t mask);
+int     ino_rm(file_t* f, int wd);
+void    ino_ev(fs_node_t* n, uint32_t mask, const char* name, uint32_t cookie);
+void    ino_node(fs_node_t* n, uint32_t mask);
+void    ino_gone(fs_node_t* n, bool self);                            /* an eventfd counter went up */
 
 int     file_read(file_t* f, char* buf, uint32_t n);
 int     file_write(file_t* f, const char* buf, uint32_t n);

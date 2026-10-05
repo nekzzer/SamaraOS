@@ -121,7 +121,8 @@ void file_ref(file_t* f) { if (f) __atomic_add_fetch(&f->refs, 1, __ATOMIC_ACQ_R
 
 void file_close(file_t* f) {
     if (!f || __atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL) > 0) return;
-    if (f->type == F_NODE && f->node) { flk_release(f); fs_release(f->node); }
+    if (f->type == F_NODE && f->node) { ino_node(f->node, (f->flags & O_ACCMODE) ? 8 : 0x10); flk_release(f); fs_release(f->node); }
+    if (f->type == F_INOTIFY) ino_close(f);
     if (f->type == F_SOCKET && f->sock) sock_close(f->sock);
     if (f->type == F_FB) fbdev_close();
     if (f->type == F_DRM) drm_close(f->drm);
@@ -289,6 +290,7 @@ bool file_readable(file_t* f) {
         case F_SOCKET: return sock_readable(f->sock);
         case F_ULISTEN: return ux_pending(f);
         case F_EVENTFD: return f->cnt > 0;
+        case F_INOTIFY: return f->pipe->count > 0;
         case F_URING:  return uring_readable(f->ur);
         case F_TIMERFD: return f->t_next && (int32_t)(pit_uptime_ms() - f->t_next) >= 0;
         case F_SIGNALFD: { proc_t* c = proc_current(); return c && (c->sig_pending & f->cnt); }
@@ -395,6 +397,7 @@ void efd_wake(void) {
 int file_read(file_t* f, char* buf, uint32_t n) {
     switch (f->type) {
         case F_URING: return -22;
+        case F_INOTIFY: return ino_read(f, buf, n);
         case F_NULL: case F_NETLINK: case F_USOCK: case F_ULISTEN: case F_EPOLL: return 0;   // netlink goes through recv
         case F_EVENTFD: case F_TIMERFD: {               /* both hand out a u64 */
             if (n < 8) return -22;
@@ -469,6 +472,7 @@ int file_read(file_t* f, char* buf, uint32_t n) {
             if (k > n) k = n;
             memcpy(buf, nd->data + f->off, k);
             f->off += k;
+            ino_node(nd, 1);
             return (int)k;
         }
     }
@@ -489,7 +493,7 @@ int file_write(file_t* f, const char* buf, uint32_t n) {
             wq_wake(&f->wq);
             return 8;
         }
-        case F_TIMERFD: case F_SIGNALFD: return -22;
+        case F_TIMERFD: case F_SIGNALFD: case F_INOTIFY: return -22;
         case F_USOCK: case F_ULISTEN: return -107;   /* ENOTCONN */
         case F_EPOLL: case F_URING: return -22;
         case F_TTY:  return tty_write(buf, (int)n);
@@ -515,7 +519,7 @@ int file_write(file_t* f, const char* buf, uint32_t n) {
         case F_NODE: {
             if (f->flags & O_APPEND) f->off = f->node->size;
             int r = node_write_at(f->node, f->off, buf, n);
-            if (r > 0) f->off += (uint32_t)r;
+            if (r > 0) { f->off += (uint32_t)r; ino_node(f->node, 2); }
             return r;
         }
     }
