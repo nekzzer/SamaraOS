@@ -35,7 +35,7 @@ xsamara        # X11 + Mesa, once the X packages are in (see "X11")
   rebuild its own kernel
 * FAT32 and ext2 with write support, ext3/ext4 read only, virtio-blk disks
 * any number of terminal windows, stacked into one taskbar button
-* USB mouse (UHCI), SoundBlaster 16
+* USB mouse (UHCI), SoundBlaster 16, Intel HDA (ALSA uapi on /dev/snd, alsa-lib works)
 * DOOM, Tetris, Snake, Breakout, Paint, a music player
 
 ## Quick start
@@ -432,7 +432,7 @@ Pass them with `make run APPEND="..."`.
 |---|---|
 | `src/boot` | GDT, IDT, paging, FPU and SSE, PIC, PIT |
 | `src/core` | `kmain`, heap, tasks, vmm, strings |
-| `src/drivers` | keyboard, mouse, USB (UHCI), VGA, ATA, AHCI, PCI, RTL8139, e1000, virtio, SB16, fbdev, input |
+| `src/drivers` | keyboard, mouse, USB (UHCI), VGA, ATA, AHCI, PCI, RTL8139, e1000, virtio, SB16, HDA + ALSA (snd.c), fbdev, input |
 | `src/fs` | ramfs, FAT12/16, FAT32, ext2 |
 | `src/proc` | processes, threads, syscalls, signals, tty, pty, procfs, ELF loader |
 | `src/net` | TCP/IP stack, DHCP, sockets |

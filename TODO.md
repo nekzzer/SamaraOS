@@ -147,3 +147,4 @@ over-engineering. Talk to the user in Russian, informally.
 - wl: GL via mesa swrast (es2gears_wayland / glxgears) not tried yet
 - wl: X11 PRIMARY and wl primary selection, clipboard bridge to pterm/fm, INCR for big selections
 - wl: ctrl+click xterm menu, xdg_toplevel/X11 resize and gtk3 not tested in qemu
+- snd: hda is polled (4 ms kernel task reads LPIB), no irq/MSI; no capture (no pcmC0D0c), no mmap of pcm data/status (alsa-lib falls back to sync_ptr + write), only s16le stereo 44100/48000 (plug does the rest), one codec output path
