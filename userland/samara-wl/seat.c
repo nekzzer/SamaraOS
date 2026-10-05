@@ -289,7 +289,7 @@ static void ddm_device(struct wl_client *c, struct wl_resource *r, uint32_t id, 
     d->r = wl_resource_create(c, &wl_data_device_interface, wl_resource_get_version(r), id);
     wl_resource_set_implementation(d->r, &dd_impl, d, dd_free);
     wl_list_insert(&ddevs, &d->link);
-    if (sel) send_sel(d);
+    send_sel(d);
 }
 static const struct wl_data_device_manager_interface ddm_impl = { ddm_source, ddm_device };
 

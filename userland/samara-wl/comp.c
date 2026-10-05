@@ -384,7 +384,8 @@ static void subc_bind(struct wl_client *c, void *d, uint32_t ver, uint32_t id) {
 /* ---- toplevel windows ---- */
 
 void tl_open(struct tl *t) {
-    uopen_t o = { t->s->w, t->s->h, 1, F_WL, (uint64_t)(uintptr_t)t->title };
+    // wl-copy has a 1x1 window, kernel wants 16 at least
+    uopen_t o = { t->s->w < 16 ? 16 : t->s->w, t->s->h < 16 ? 16 : t->s->h, 1, F_WL, (uint64_t)(uintptr_t)t->title };
     long h = sm(OP_OPEN, (long)&o, 0, 0);
     if (h < 0) { fprintf(stderr, "samara-wl: window open failed %ld\n", h); return; }
     t->h = h;
