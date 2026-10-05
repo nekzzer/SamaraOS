@@ -733,6 +733,10 @@ static int do_fcntl(int fd, int cmd, uint64_t arg) {
         case 5: case 6: case 7: case 12: case 13: case 14: case 36: case 37: case 38:   /* record locks, ofd */
             UCHK((void*)arg, 32);
             return flk_fcntl(f, cmd, (uint8_t*)arg);
+        case 1033: return 0;                                     /* F_ADD_SEALS: taken, not enforced */
+        case 1034: return 0;                                     /* F_GET_SEALS */
+        case 1031: return PIPE_SZ;                               /* F_SETPIPE_SZ */
+        case 1032: return PIPE_SZ;                               /* F_GETPIPE_SZ */
     }
     return -EINVAL;
 }
@@ -1168,7 +1172,7 @@ static int64_t do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd,
         vmm_flush();
         return (int64_t)addr;
     }
-    if (f && f->type == F_NODE && f->node->type == FS_FILE && !(off & (PAGE_SIZE - 1))) {
+    if (f && f->type == F_NODE && f->node->type == FS_FILE && !(off & (PAGE_SIZE - 1)) && !is_shm(f->node)) {
         /* file pages come from the page cache, shared by everybody who maps this file */
         int md = ((flags & MAP_SHARED) ? PCM_SHARED : 0) | ((prot & PROT_WRITE) ? PCM_W : 0);
         if (pc_map(p->pd, addr, f->node, off, len, md) < 0) {
@@ -1185,7 +1189,17 @@ static int64_t do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd,
         vmm_flush();
         return -ENOMEM;
     }
-    if (f && f->type == F_NODE && f->node->type == FS_FILE && off < f->node->size) {
+    if (f && f->type == F_NODE && is_shm(f->node)) {
+        /* private map of a memfd: its bytes live in the shm frames, not in node->data.
+           the wayland keymap goes this way, foot died on the last page */
+        char* tmp = kmalloc(PAGE_SIZE);
+        for (uint64_t d = 0; tmp && d < len; d += PAGE_SIZE) {
+            int got = shm_rw(f->node, off + d, tmp, PAGE_SIZE, false);
+            if (got <= 0) break;
+            vmm_copy_to(p->pd, addr + d, tmp, (uint64_t)got);
+        }
+        kfree(tmp);
+    } else if (f && f->type == F_NODE && f->node->type == FS_FILE && off < f->node->size) {
         uint64_t n = f->node->size - off;
         if (n > len) n = len;
         vmm_copy_to(p->pd, addr, f->node->data + off, n);
