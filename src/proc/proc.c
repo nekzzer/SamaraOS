@@ -760,7 +760,7 @@ void proc_fault_kill(const char* what, int sig, uint64_t eip, uint64_t addr) {
     klog(" addr=0x"); klog_num(addr, 16);
     if (p) { klog(" pte="); klog_num(vmm_pte(p->pd, addr & ~0xFFFul), 16); }
     klog("\r\n");
-    if (!p) { cli(); for (;;) hlt(); }
+    if (!p) task_exit();      /* thread of a process that is being torn down on another cpu, was a hard hang */
     proc_exit(sig & 0x7F);
 }
 
