@@ -7,13 +7,18 @@
 #include "core/task.h"
 #include "core/vmm.h"
 #include "boot/pit.h"
+#include "core/wq.h"
+#include "net/sock.h"
 #include "fs/ext2.h"
 #include "fs/fatfs.h"
 
 /* io_uring, linux uapi compatible (liburing runs as is). Submission is
    inline when the file is ready, the rest waits in one global list and
-   a few worker tasks poll it every ms and run what became ready, in the
-   address space of whoever submitted it. Same polling style as poll/epoll. */
+   a few worker tasks run what became ready, in the address space of whoever
+   submitted it. Waiting requests hang a callback on the file's wait queue
+   that kicks the workers; files without a queue still get a 1ms tick. */
+
+int file_wqs(struct file* f, wq_t** v);
 
 #define EPERM 1
 #define ENXIO 6
@@ -53,6 +58,8 @@ typedef struct req {
     uint32_t count, ms;
     int16_t last;
     uint32_t gen;
+    wq_ent_t* we[2];                    /* our callbacks on the file queues */
+    bool reg;
     bool armed, pre;                    /* pre: res is known, no need to run anything */
     int res;
 } req_t;
@@ -96,6 +103,13 @@ static void kick(void) {
         if (t && t->state == T_BLOCKED) { t->wake_ms = 0; t->state = T_READY; }
     }
     irq_restore(fl);
+}
+
+static void kick_cb(void* a) { (void)a; kick(); }
+
+static void unreg(req_t* q) {
+    for (int i = 0; i < 2; i++)
+        if (q->we[i]) { wq_del(q->we[i]); q->we[i] = NULL; }
 }
 
 static void cq_flush(uring_t* r) {
@@ -257,10 +271,12 @@ static void req_done(req_t* q, int res) {
     if (q->target) q->target->lt = NULL;
     if (q->sqe.flags & IOSQE_IO_DRAIN) r->ndrain--;
     irq_restore(fl);
+    unreg(q);
     file_close(q->f);
     bool fail = opt_fail(q, res);
     bool hard = (q->sqe.flags & IOSQE_IO_HARDLINK) != 0;
     kfree(q);
+    kick();                                     // drain order, links
     if (lt) { lt->target = NULL; req_done(lt, lt->bad ? lt->bad : -ECANCELED); }
     if (nx) {
         if (fail && !hard) req_done(nx, -ECANCELED);
@@ -658,14 +674,50 @@ static int run_all(proc_t* only) {
     return n;
 }
 
+// hang a kick on whatever the request waits for. 1: nothing to hang it on, tick
+static int req_reg(req_t* q) {
+    if (!q->f) return 0;
+    wq_t* v[2];
+    int n;
+    if (q->f->type == F_SOCKET) { v[0] = sock_wqp(q->f->sock); n = 1; }
+    else n = file_wqs(q->f, v);
+    if (n < 0) return 1;
+    int unk = 0;
+    for (int i = 0; i < n; i++) {
+        q->we[i] = wq_add_cb(v[i], kick_cb, NULL);
+        if (!q->we[i]) unk = 1;
+    }
+    return unk;
+}
+
 static void uw(void) {
     for (;;) {
         if (run_all(NULL)) continue;
         uint32_t fl = irq_save();
-        bool wait = false;
-        for (req_t* q = reqs; q; q = q->next) if (q->st == R_WAIT) wait = true;
+        bool wait = false, again = false;
+        uint32_t ms = 0, now = pit_uptime_ms();
+        for (req_t* q = reqs; q; q = q->next) {
+            if (q->st != R_WAIT) continue;
+            wait = true;
+            int op = q->sqe.opcode;
+            if (op == IORING_OP_TIMEOUT || op == IORING_OP_LINK_TIMEOUT) {
+                int32_t d = (int32_t)(q->deadline - now);
+                uint32_t m = d > 0 ? (uint32_t)d : 1;
+                if (!ms || m < ms) ms = m;
+                if (op == IORING_OP_TIMEOUT && q->count) { if (!ms || 20 < ms) ms = 20; }   // counted ones are woken by cqes, 20ms is a net
+                continue;
+            }
+            if (!q->reg) {
+                q->reg = true;
+                req_reg(q);
+                again = true;
+            }
+            if (q->f && (q->we[0] == NULL)) ms = 1;
+        }
+        if (again) { irq_restore(fl); continue; }       // recheck: it could have become ready before we hung the callback
+        if (wait && (!ms || ms > 100)) ms = 100;
         task_t* t = task_current();
-        t->wake_ms = wait ? pit_uptime_ms() + 1 : 0;
+        t->wake_ms = wait ? now + ms : 0;
         t->state = T_BLOCKED;
         while (t->state == T_BLOCKED) task_yield();
         irq_restore(fl);
@@ -741,6 +793,7 @@ static void purge(uring_t* r, proc_t* p) {
     irq_restore(fl);
     while (dead) {
         req_t* nx = dead->next;
+        unreg(dead);
         file_close(dead->f);
         kfree(dead);
         dead = nx;

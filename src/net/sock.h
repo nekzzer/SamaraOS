@@ -45,6 +45,7 @@ bool    sock_readable(sock_t* s);
 bool    sock_writable(sock_t* s);
 bool    sock_hup(sock_t* s);
 struct wq_w; struct wq_ent;
+struct wq* sock_wqp(sock_t* s);
 struct wq_ent* sock_wq_add(sock_t* s, struct wq_w* w);   /* wakes on any readiness change */
 
 #endif

@@ -992,6 +992,8 @@ int sock_cmsg(sock_t* s, uint8_t* out, int cap) {
     return n;
 }
 
+wq_t* sock_wqp(sock_t* s) { return &s->wq; }
+
 /* queue a waiter; the first one sets the baseline, later ones wake the others if something changed meanwhile */
 wq_ent_t* sock_wq_add(sock_t* s, wq_w_t* w) {
     bool first = !s->wq.head;
