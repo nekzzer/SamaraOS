@@ -14,9 +14,11 @@
 #include <grp.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <pthread.h>
 #include "fm_be.h"
 
 uint32_t *img_decode(const uint8_t *d, int n, int *w, int *h);
+int img_peek(const uint8_t *d, int n, int *w, int *h);
 
 #define BG      0x17181B
 #define BG2     0x1E1F23
@@ -42,7 +44,7 @@ uint32_t *img_decode(const uint8_t *d, int n, int *w, int *h);
 
 enum { K_DIR, K_TEXT, K_IMG, K_AUDIO, K_EXE, K_ARC, K_FILE };
 enum { S_NAME, S_SIZE, S_DATE };
-enum { M_BROWSE, M_TEXT, M_IMG };
+enum { M_BROWSE, M_TEXT, M_IMG, M_HEX };
 enum { MD_NONE, MD_CONFIRM, MD_INPUT, MD_PROPS, MD_MSG, MD_PROG };
 enum { IA_RENAME = 1, IA_NEWDIR, IA_NEWFILE };
 enum { A_OPEN = 1, A_CUT, A_COPY, A_PASTE, A_RENAME, A_DELETE, A_NEWDIR, A_NEWFILE, A_PROPS,
@@ -101,11 +103,31 @@ static long long tot_bytes, done_bytes;
 static char prog_name[256];
 static uint32_t last_pump;
 
-static char *tv_buf;
-static int tv_len, *tv_ln, tv_n, tv_top;
+/* text and hex view read the file through a 256k window, nothing is loaded whole */
+#define WIN (256 << 10)
+static int v_fd = -1;
+static long long v_size, tv_top;
+static uint8_t *w_buf;
+static long long w_off;
+static int w_len;
 static uint32_t *iv_px;
-static int iv_w, iv_h;
-static char v_name[256];
+static int iv_w, iv_h, iv_ow, iv_oh;
+static char v_name[256], v_path[1024];
+
+/* line numbers: thread counts newlines, tab[k] = lines before byte k*64k */
+typedef struct { long long *tab; long long lines; volatile int n, done, stop, rel; char path[1024]; long long size; } Idx;
+static Idx *idx;
+
+/* background image load: read, decode, shrink */
+typedef struct {
+    char path[1024], name[256], err[80];
+    volatile int stop, state, phase, rel;
+    volatile long long done, total;
+    uint32_t *px;
+    int w, h, ow, oh, ent;
+} Job;
+static Job *job;
+static pthread_mutex_t dec_mx = PTHREAD_MUTEX_INITIALIZER;
 
 static struct { char ext[16]; char cmd[256]; } assoc[64];
 static int n_assoc;
@@ -902,9 +924,27 @@ static void quote(const char *s, char *o) {
     *o = 0;
 }
 
+static void idx_rel(Idx *x) { if (x && __sync_add_and_fetch(&x->rel, 1) == 2) { free(x->tab); free(x); } }
+static void job_rel(Job *j) { if (j && __sync_add_and_fetch(&j->rel, 1) == 2) { free(j->px); free(j); } }
+
+static void job_cancel(void) {
+    if (!job) return;
+    job->stop = 1;
+    job_rel(job);
+    job = 0;
+}
+
 static void free_viewers(void) {
-    free(tv_buf); free(tv_ln); free(iv_px);
-    tv_buf = 0; tv_ln = 0; iv_px = 0;
+    if (idx) { idx->stop = 1; idx_rel(idx); idx = 0; }
+    job_cancel();
+    free(iv_px);
+    iv_px = 0;
+    if (v_fd >= 0) close(v_fd);
+    v_fd = -1;
+    free(w_buf);
+    w_buf = 0;
+    w_len = 0;
+    v_size = 0;
 }
 
 static uint32_t *load_pnm_bmp(const uint8_t *d, int n, int *w, int *h) {
@@ -955,67 +995,247 @@ static uint32_t *load_pnm_bmp(const uint8_t *d, int n, int *w, int *h) {
     return 0;
 }
 
-static uint8_t *slurp(const char *p, int max, int *n) {
-    int fd = open(p, O_RDONLY), got = 0, r;
-    uint8_t *b;
-    struct stat st;
-    long cap;
-    if (fd < 0) return 0;
-    cap = (!fstat(fd, &st) && st.st_size > 0) ? st.st_size + 1 : 4096;
-    if (cap > max) cap = max;
-    b = malloc(cap + 1);
-    while (b && (r = read(fd, b + got, cap - got)) > 0) {
-        got += r;
-        if (got == cap) {
-            if (cap >= max) break;
-            cap *= 2;
-            if (cap > max) cap = max;
-            b = realloc(b, cap + 1);
+static const uint8_t *vget(long long off, int *n) {
+    if (off < 0 || off >= v_size) { *n = 0; return w_buf; }
+    if (!w_buf) w_buf = malloc(WIN);
+    if (!(off >= w_off && off < w_off + w_len && (off < w_off + w_len - 8192 || w_off + w_len >= v_size))) {
+        long long st = off > 65536 ? (off - 65536) & ~4095LL : 0;
+        int r = 0, q;
+        while (r < WIN && (q = pread(v_fd, w_buf + r, WIN - r, st + r)) > 0) r += q;
+        w_off = st;
+        w_len = r;
+        if (off >= w_off + w_len) { *n = 0; return w_buf; }
+    }
+    *n = w_off + w_len - off;
+    return w_buf + (off - w_off);
+}
+
+static int vbyte(long long i) {
+    int n;
+    const uint8_t *p = vget(i, &n);
+    return n ? *p : -1;
+}
+
+/* a line is cut at 4k, minified 100M one-liners would kill the scrolling */
+static long long ln_next(long long off) {
+    long long o = off;
+    int lim = 4096;
+    while (o < v_size && lim > 0) {
+        int n;
+        const uint8_t *p = vget(o, &n), *q;
+        if (!n) break;
+        if (n > lim) n = lim;
+        q = memchr(p, '\n', n);
+        if (q) return o + (q - p) + 1;
+        o += n;
+        lim -= n;
+    }
+    return o;
+}
+
+static long long ln_prev(long long off) {
+    long long i;
+    if (off <= 0) return 0;
+    for (i = off - 2; i >= 0 && i > off - 4098; i--)
+        if (vbyte(i) == '\n') return i + 1;
+    return i < 0 ? 0 : i + 1;
+}
+
+static void *idx_run(void *a) {
+    Idx *x = a;
+    int fd = open(x->path, O_RDONLY), r, k;
+    uint8_t *b = malloc(65536);
+    long long off = 0, lines = 0;
+    if (fd >= 0 && b) {
+        for (;;) {
+            r = 0;
+            while (r < 65536) {                       // short reads happen
+                int q = pread(fd, b + r, 65536 - r, off + r);
+                if (q <= 0) break;
+                r += q;
+            }
+            if (x->stop || r <= 0) break;
+            x->tab[off >> 16] = lines;
+            __sync_synchronize();
+            x->n = (off >> 16) + 1;
+            for (k = 0; k < r; k++) lines += b[k] == '\n';
+            off += r;
+            if (r < 65536) break;
+        }
+        if (!x->stop) {
+            uint8_t l = 0;
+            if (off > 0 && pread(fd, &l, 1, off - 1) == 1 && l != '\n') lines++;
+            x->lines = lines;
+            __sync_synchronize();
+            x->done = 1;
         }
     }
-    close(fd);
-    if (!b) return 0;
-    *n = got;
-    b[got] = 0;
-    return b;
-}
-
-static int view_text(const char *p, const char *name) {
-    int n, i, l = 0;
-    uint8_t *b = slurp(p, 4 << 20, &n);
-    if (!b) { sayf(name, strerror(errno)); return -1; }
-    for (i = 0; i < n && i < 4096; i++)
-        if (!b[i]) { free(b); say("binary file"); return -1; }
-    free_viewers();
-    tv_buf = (char *)b;
-    tv_len = n;
-    tv_n = 1;
-    for (i = 0; i < n; i++) if (b[i] == '\n') tv_n++;
-    tv_ln = malloc(tv_n * sizeof(int));
-    tv_ln[l++] = 0;
-    for (i = 0; i < n; i++) if (b[i] == '\n') tv_ln[l++] = i + 1;
-    tv_top = 0;
-    mode = M_TEXT;
-    strncpy(v_name, name, 255);
-    dirty = 1;
-    return 0;
-}
-
-static int view_img(const char *p, const char *name) {
-    int n, w = 0, h = 0;
-    uint8_t *b = slurp(p, 32 << 20, &n);
-    uint32_t *px;
-    if (!b) { sayf(name, strerror(errno)); return -1; }
-    px = load_pnm_bmp(b, n, &w, &h);
-    if (!px) px = img_decode(b, n, &w, &h);
+    if (fd >= 0) close(fd);
     free(b);
-    if (!px) { sayf(name, "cant decode"); return -1; }
+    idx_rel(x);
+    return 0;
+}
+
+static void idx_start(void) {
+    pthread_t t;
+    Idx *x = calloc(1, sizeof *x);
+    if (!x) return;
+    x->tab = calloc((v_size >> 16) + 2, sizeof(long long));
+    if (!x->tab) { free(x); return; }
+    strcpy(x->path, v_path);
+    x->size = v_size;
+    idx = x;
+    if (pthread_create(&t, 0, idx_run, x)) { idx = 0; free(x->tab); free(x); return; }
+    pthread_detach(t);
+}
+
+static int open_view(const char *p, const char *name, int hex) {
+    uint8_t b[4096];
+    struct stat st;
+    int fd = open(p, O_RDONLY), n, i;
+    if (fd < 0) { sayf(name, strerror(errno)); return -1; }
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode)) { close(fd); say("not a regular file"); return -1; }
+    n = pread(fd, b, sizeof b, 0);
+    if (!hex)
+        for (i = 0; i < n; i++) if (!b[i]) { hex = 1; break; }
     free_viewers();
-    iv_px = px; iv_w = w; iv_h = h;
-    mode = M_IMG;
+    v_fd = fd;
+    v_size = st.st_size;
+    if (!v_size && n > 0) v_size = n;          // /proc stuff
+    tv_top = 0;
     strncpy(v_name, name, 255);
+    strncpy(v_path, p, 1023);
+    mode = hex ? M_HEX : M_TEXT;
+    if (!hex && v_size > 0) idx_start();
     dirty = 1;
     return 0;
+}
+
+static int view_text(const char *p, const char *name) { return open_view(p, name, 0); }
+
+static void jfail(Job *j, const char *m) {
+    snprintf(j->err, sizeof j->err, "%s", m);
+    __sync_synchronize();
+    j->state = 2;
+}
+
+static uint32_t *shrink_px(uint32_t *px, int *w, int *h, int max) {
+    int f = (*w > *h ? *w : *h) / max + 1, nw = *w / f, nh = *h / f, x, y, i, j;
+    uint32_t *o;
+    if (f < 2) return px;
+    o = malloc((size_t)nw * nh * 4);
+    if (!o) return px;
+    for (y = 0; y < nh; y++)
+        for (x = 0; x < nw; x++) {
+            unsigned r = 0, g = 0, b = 0;
+            for (j = 0; j < f; j++)
+                for (i = 0; i < f; i++) {
+                    uint32_t c = px[(y * f + j) * *w + x * f + i];
+                    r += c >> 16 & 255; g += c >> 8 & 255; b += c & 255;
+                }
+            o[y * nw + x] = (r / (f * f)) << 16 | (g / (f * f)) << 8 | (b / (f * f));
+        }
+    free(px);
+    *w = nw; *h = nh;
+    return o;
+}
+
+static void *job_run(void *a) {
+    Job *j = a;
+    struct stat st;
+    int fd = open(j->path, O_RDONLY), w = 0, h = 0, r, pk;
+    long long got = 0;
+    uint8_t *b = 0;
+    uint32_t *px;
+    char t[80];
+    if (fd < 0) { jfail(j, strerror(errno)); goto out; }
+    if (fstat(fd, &st) || st.st_size <= 0) { close(fd); jfail(j, "empty file"); goto out; }
+    if (st.st_size > (64 << 20)) {
+        close(fd);
+        sprintf(t, "file too big (%d MB)", (int)(st.st_size >> 20));
+        jfail(j, t);
+        goto out;
+    }
+    j->total = st.st_size;
+    b = malloc(st.st_size + 1);
+    if (!b) { close(fd); jfail(j, "no memory"); goto out; }
+    while (got < st.st_size && !j->stop) {
+        long long want = st.st_size - got;
+        r = read(fd, b + got, want > 262144 ? 262144 : want);
+        if (r <= 0) break;
+        got += r;
+        j->done = got;
+    }
+    close(fd);
+    if (j->stop) goto out;
+    j->phase = 1;
+    pk = img_peek(b, got, &w, &h);
+    if (pk) {
+        j->ow = w; j->oh = h;
+        if (w <= 0 || h <= 0 || (long long)w * h > 120000000 || (b[0] != 0xFF && (w > 4096 || h > 4096))) {
+            sprintf(t, "image too large (%dx%d)", w, h);
+            jfail(j, t);
+            goto out;
+        }
+    }
+    pthread_mutex_lock(&dec_mx);
+    px = load_pnm_bmp(b, got, &w, &h);
+    if (!px) px = img_decode(b, got, &w, &h);
+    pthread_mutex_unlock(&dec_mx);
+    free(b);
+    b = 0;
+    if (!px) { jfail(j, "cant decode"); goto out; }
+    if (j->stop) { free(px); goto out; }
+    if (!pk) { j->ow = w; j->oh = h; }
+    px = shrink_px(px, &w, &h, 2048);
+    j->px = px;
+    j->w = w; j->h = h;
+    __sync_synchronize();
+    j->state = 1;
+out:
+    free(b);
+    job_rel(j);
+    return 0;
+}
+
+static int view_img(const char *p, const char *name, int ent) {
+    pthread_t t;
+    pthread_attr_t at;
+    Job *j = calloc(1, sizeof *j);
+    job_cancel();
+    if (!j) return -1;
+    strncpy(j->path, p, 1023);
+    strncpy(j->name, name, 255);
+    j->ent = ent;
+    job = j;
+    pthread_attr_init(&at);
+    pthread_attr_setstacksize(&at, 1 << 20);
+    if (pthread_create(&t, &at, job_run, j)) { job = 0; free(j); sayf(name, "no thread"); return -1; }
+    pthread_detach(t);
+    dirty = 1;
+    return 0;
+}
+
+/* called from tick(): swap in the picture or show why not */
+static void job_poll(void) {
+    Job *j = job;
+    if (!j || !j->state) return;
+    if (j->state == 1) {
+        uint32_t *px = j->px;
+        int w = j->w, h = j->h, ow = j->ow, oh = j->oh, e = j->ent;
+        char nm[256];
+        strcpy(nm, j->name);
+        j->px = 0;
+        free_viewers();
+        iv_px = px; iv_w = w; iv_h = h; iv_ow = ow; iv_oh = oh;
+        mode = M_IMG;
+        strcpy(v_name, nm);
+        if (e >= 0 && e < n_ents) { cur = e; sel_none(); ents[e].sel = 1; anchor = e; }
+    } else {
+        sayf(j->name, j->err);
+        job_cancel();
+    }
+    dirty = 1;
 }
 
 /* looks like text? */
@@ -1043,7 +1263,7 @@ static void open_ent(int i) {
         if (!strcasecmp(assoc[k].ext, x)) { cmd = assoc[k].cmd; break; }
     if (cmd) {
         if (!strcmp(cmd, "@view")) { view_text(p, e->name); return; }
-        if (!strcmp(cmd, "@image")) { view_img(p, e->name); return; }
+        if (!strcmp(cmd, "@image")) { view_img(p, e->name, i); return; }
         quote(p, q);
         if (strstr(cmd, "%f")) {
             const char *s = strstr(cmd, "%f");
@@ -1054,9 +1274,9 @@ static void open_ent(int i) {
         return;
     }
     if (e->kind == K_EXE) { quote(p, q); spawn(q); say("started"); return; }
-    if (e->kind == K_IMG) { view_img(p, e->name); return; }
+    if (e->kind == K_IMG) { view_img(p, e->name, i); return; }
     if (e->kind == K_TEXT || sniff_text(p)) { view_text(p, e->name); return; }
-    ask_msg("Open", "No program for this file.\nAdd one to /etc/samara-fm.conf:\next = command %f");
+    open_view(p, e->name, 1);
 }
 
 static void img_step(int d) {
@@ -1067,7 +1287,7 @@ static void img_step(int d) {
         if (i < 0 || i >= n_ents) return;
         if (ents[i].kind != K_IMG) continue;
         join(p, cwd, ents[i].name);
-        if (view_img(p, ents[i].name) == 0) { cur = i; sel_none(); ents[i].sel = 1; anchor = i; }
+        view_img(p, ents[i].name, i);
         return;
     }
 }
@@ -1263,28 +1483,113 @@ static void draw_status(void) {
     txt(SB_W + 12, H - ST_H, 0, ST_H, t, DIM, F_SMALL);
 }
 
+static long long cur_line(void) {
+    long long k, l, o, top = tv_top;
+    if (!idx) return -1;
+    k = top >> 16;
+    if (k >= idx->n) return -1;
+    l = idx->tab[k];
+    for (o = k << 16; o < top; ) {
+        int n, m;
+        const uint8_t *p = vget(o, &n);
+        if (!n) break;
+        if (n > top - o) n = top - o;
+        for (m = 0; m < n; m++) l += p[m] == '\n';
+        o += n;
+    }
+    return l + 1;
+}
+
 static void draw_text_view(void) {
     int W = be_w(), H = be_h(), rows = (H - TB_H - ST_H - 8) / fh_mono, i, y = TB_H + 6;
     char t[320], hd[300];
+    long long o = tv_top, l;
     be_fill(0, 0, W, H, BG);
-    for (i = 0; i < rows && tv_top + i < tv_n; i++) {
-        const char *s = tv_buf + tv_ln[tv_top + i];
-        int e = tv_top + i + 1 < tv_n ? tv_ln[tv_top + i + 1] - 1 : tv_len, k = 0;
-        while (s < tv_buf + e && k < 300) {
-            if (*s == '\t') { do t[k++] = ' '; while (k & 3); }
-            else if (*s != '\r' && (unsigned char)*s >= 32) t[k++] = *s;
-            else if (*s != '\r') t[k++] = '.';
-            s++;
+    for (i = 0; i < rows && o < v_size; i++) {
+        long long e = ln_next(o), q = o;
+        int k = 0;
+        while (q < e && k < 300) {
+            int n, m;
+            const uint8_t *s = vget(q, &n);
+            if (!n) break;
+            if (n > e - q) n = e - q;
+            for (m = 0; m < n && k < 300; m++) {
+                uint8_t c = s[m];
+                if (c == '\t') { do t[k++] = ' '; while (k & 3); }
+                else if (c == '\r' || c == '\n') continue;
+                else t[k++] = c >= 32 ? c : '.';
+            }
+            q += n;
         }
         if (k > 300) k = 300;
         t[k] = 0;
         if (k) be_text(14, y + i * fh_mono, t, INK, F_MONO);
+        o = e;
     }
     be_fill(0, 0, W, TB_H, BG2);
     be_fill(0, TB_H - 1, W, 1, RULE);
     be_text(14, (TB_H - fh_reg) / 2, v_name, INK, F_BOLD);
-    sprintf(hd, "line %d / %d   Esc: back", tv_top + 1, tv_n);
+    l = cur_line();
+    if (l < 0) sprintf(hd, "%d%%  (counting lines)   Esc: back", v_size ? (int)(tv_top * 100 / v_size) : 0);
+    else if (idx && idx->done) sprintf(hd, "line %lld / %lld   %d%%   Esc: back", l, idx->lines, (int)(tv_top * 100 / v_size));
+    else sprintf(hd, "line %lld   %d%%   Esc: back", l, (int)(tv_top * 100 / v_size));
     be_text(W - be_text_w(hd, F_SMALL) - 14, (TB_H - fh_small) / 2, hd, DIM, F_SMALL);
+}
+
+static void draw_hex_view(void) {
+    int W = be_w(), H = be_h(), rows = (H - TB_H - ST_H - 8) / fh_mono, i, y = TB_H + 6;
+    char t[120], hd[300];
+    be_fill(0, 0, W, H, BG);
+    for (i = 0; i < rows; i++) {
+        long long o = tv_top + i * 16;
+        uint8_t b[16];
+        int k, n = 0, m, c;
+        if (o >= v_size) break;
+        while (n < 16 && o + n < v_size) {
+            const uint8_t *p = vget(o + n, &m);
+            if (!m) break;
+            if (m > 16 - n) m = 16 - n;
+            memcpy(b + n, p, m);
+            n += m;
+        }
+        c = sprintf(t, "%08llx  ", o);
+        for (k = 0; k < 16; k++) {
+            if (k < n) c += sprintf(t + c, "%02x ", b[k]);
+            else c += sprintf(t + c, "   ");
+            if (k == 7) t[c++] = ' ';
+        }
+        t[c++] = ' ';
+        for (k = 0; k < n; k++) t[c++] = b[k] >= 32 && b[k] < 127 ? b[k] : '.';
+        t[c] = 0;
+        be_text(14, y + i * fh_mono, t, INK, F_MONO);
+    }
+    be_fill(0, 0, W, TB_H, BG2);
+    be_fill(0, TB_H - 1, W, 1, RULE);
+    be_text(14, (TB_H - fh_reg) / 2, v_name, INK, F_BOLD);
+    sprintf(hd, "hex  %llx / %llx   %d%%   Esc: back", tv_top, v_size, v_size ? (int)(tv_top * 100 / v_size) : 0);
+    be_text(W - be_text_w(hd, F_SMALL) - 14, (TB_H - fh_small) / 2, hd, DIM, F_SMALL);
+}
+
+static void draw_job(void) {
+    int W = be_w(), H = be_h(), w = 380, h = 112, x = (W - w) / 2, y = (H - h) / 2, bw = w - 40;
+    char t[300];
+    be_fill(x, y, w, h, BG2);
+    frame(x, y, w, h, RULE);
+    fit(job->name, w - 40, F_BOLD, t, sizeof t);
+    be_text(x + 20, y + 16, t, INK, F_BOLD);
+    be_fill(x + 20, y + 52, bw, 10, WELL);
+    if (job->phase == 0) {
+        long long d = job->done, tt = job->total;
+        be_fill(x + 20, y + 52, tt ? (int)(d * bw / tt) : 0, 10, ACC);
+        sprintf(t, "reading, %d%%", tt ? (int)(d * 100 / tt) : 0);
+    } else {
+        int p = now_ms() / 8 % (bw + 80);
+        int a = p - 80 < 0 ? 0 : p - 80, b = p > bw ? bw : p;
+        if (b > a) be_fill(x + 20 + a, y + 52, b - a, 10, ACC);
+        strcpy(t, "decoding...");
+    }
+    be_text(x + 20, y + 70, t, DIM, F_SMALL);
+    be_text(x + w - 20 - be_text_w("Esc: cancel", F_SMALL), y + 70, "Esc: cancel", DIM, F_SMALL);
 }
 
 static void draw_img_view(void) {
@@ -1301,7 +1606,8 @@ static void draw_img_view(void) {
     be_fill(0, 0, W, TB_H, BG2);
     be_fill(0, TB_H - 1, W, 1, RULE);
     be_text(14, (TB_H - fh_reg) / 2, v_name, INK, F_BOLD);
-    sprintf(hd, "%dx%d   arrows: next, Esc: back", iv_w, iv_h);
+    if (iv_ow && (iv_ow != iv_w || iv_oh != iv_h)) sprintf(hd, "%dx%d (shown %dx%d)   arrows: next, Esc: back", iv_ow, iv_oh, iv_w, iv_h);
+    else sprintf(hd, "%dx%d   arrows: next, Esc: back", iv_w, iv_h);
     be_text(W - be_text_w(hd, F_SMALL) - 14, (TB_H - fh_small) / 2, hd, DIM, F_SMALL);
 }
 
@@ -1393,6 +1699,7 @@ static void draw_modal(void) {
 static void draw(void) {
     int W = be_w(), H = be_h();
     if (mode == M_TEXT) draw_text_view();
+    else if (mode == M_HEX) draw_hex_view();
     else if (mode == M_IMG) draw_img_view();
     else {
         be_fill(0, 0, W, H, BG);
@@ -1403,6 +1710,7 @@ static void draw(void) {
     }
     if (menu_on) draw_menu();
     if (modal) draw_modal();
+    if (job) draw_job();
 }
 
 /* ---------- input ---------- */
@@ -1601,22 +1909,38 @@ static void key_browse(FmEv *e) {
 }
 
 static void key_text(FmEv *e) {
-    int rows = (be_h() - TB_H - ST_H - 8) / fh_mono;
+    int rows = (be_h() - TB_H - ST_H - 8) / fh_mono, i, hex = mode == M_HEX;
+    long long last = hex ? (v_size ? (v_size - 1) & ~15LL : 0) : v_size;
     switch (e->a) {
     case FK_ESC: case FK_BACK: case 'q': close_viewer(); return;
-    case FK_UP: tv_top--; break;
-    case FK_DOWN: tv_top++; break;
-    case FK_PGUP: tv_top -= rows - 1; break;
-    case FK_PGDN: case ' ': tv_top += rows - 1; break;
+    case FK_UP: if (hex) tv_top -= 16; else tv_top = ln_prev(tv_top); break;
+    case FK_DOWN: if (hex) tv_top += 16; else if (ln_next(tv_top) < v_size) tv_top = ln_next(tv_top); break;
+    case FK_PGUP:
+        if (hex) tv_top -= (rows - 1) * 16;
+        else for (i = 0; i < rows - 1; i++) tv_top = ln_prev(tv_top);
+        break;
+    case FK_PGDN: case ' ':
+        if (hex) tv_top += (rows - 1) * 16;
+        else for (i = 0; i < rows - 1 && ln_next(tv_top) < v_size; i++) tv_top = ln_next(tv_top);
+        break;
     case FK_HOME: tv_top = 0; break;
-    case FK_END: tv_top = tv_n; break;
+    case FK_END:
+        if (hex) tv_top = last - (rows - 1) * 16;
+        else { tv_top = v_size; for (i = 0; i < rows - 1; i++) tv_top = ln_prev(tv_top); }
+        break;
+    case 'h': case 'x': if (!hex && (e->mods & MOD_CTRL) == 0) { mode = M_HEX; tv_top &= ~15LL; } break;
+    case 't': if (hex) { mode = M_TEXT; tv_top = ln_prev(ln_next(tv_top)); } break;
     }
-    if (tv_top > tv_n - rows) tv_top = tv_n - rows;
+    if (hex && tv_top > last) tv_top = last;
     if (tv_top < 0) tv_top = 0;
     dirty = 1;
 }
 
 static void on_key(FmEv *e) {
+    if (job) {
+        if (e->a == FK_ESC) { job_cancel(); say("cancelled"); dirty = 1; }
+        return;
+    }
     if (modal) {
         if (modal == MD_INPUT) {
             int r = edit_key(&ed, e);
@@ -1649,7 +1973,7 @@ static void on_key(FmEv *e) {
         dirty = 1;
         return;
     }
-    if (mode == M_TEXT) { key_text(e); return; }
+    if (mode == M_TEXT || mode == M_HEX) { key_text(e); return; }
     if (mode == M_IMG) {
         if (e->a == FK_ESC || e->a == FK_BACK || e->a == 'q') close_viewer();
         else if (e->a == FK_LEFT || e->a == FK_UP) img_step(-1);
@@ -1680,6 +2004,7 @@ static void on_down(FmEv *e) {
     int px = e->a, py = e->b, m = e->mods, i;
     uint32_t t = now_ms();
     mx = px; my = py;
+    if (job) return;
     dirty = 1;
     if (modal) {
         if (modal == MD_PROG) return;
@@ -1811,9 +2136,13 @@ static void on_move(FmEv *e) {
 
 static void on_wheel(int d) {
     if (modal || menu_on) return;
+    if (job) return;
     if (mode == M_TEXT) {
-        tv_top += d * 3;
-        if (tv_top > tv_n - 1) tv_top = tv_n - 1;
+        for (; d > 0 && ln_next(tv_top) < v_size; d--) tv_top = ln_next(tv_top);
+        for (; d < 0; d++) tv_top = ln_prev(tv_top);
+    } else if (mode == M_HEX) {
+        tv_top += d * 48;
+        if (tv_top > ((v_size - 1) & ~15LL)) tv_top = (v_size - 1) & ~15LL;
         if (tv_top < 0) tv_top = 0;
     } else if (mode == M_BROWSE) {
         scroll += d * (grid ? 40 : ROW_H * 2);
@@ -1825,6 +2154,7 @@ static void on_wheel(int d) {
 
 static void tick(void) {
     uint32_t t = now_ms();
+    if (job) { job_poll(); dirty = 1; }
     static int had_msg;
     while (waitpid(-1, 0, WNOHANG) > 0) {}
     if (had_msg && t >= msg_until) { had_msg = 0; dirty = 1; }
@@ -1858,7 +2188,7 @@ int main(int argc, char **argv) {
     enter_dir(argc > 1 ? argv[1] : home, 1);
     if (!cwd[0]) enter_dir("/", 1);
     while (!quit) {
-        r = be_wait(&e, 250);
+        r = be_wait(&e, job ? 40 : 250);
         if (r < 0) break;
         while (r > 0) {
             switch (e.type) {

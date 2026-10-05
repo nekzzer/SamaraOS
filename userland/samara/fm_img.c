@@ -6,7 +6,9 @@
 #define kmalloc_big(n) malloc(n)
 #define kfree(p) free(p)
 
-#define IMG_MAX 4096               /* either side */
+#define IMG_MAX 4096               /* either side, png/gif */
+#define JPG_MAX 16384
+#define JPG_FULL 16000000          /* above this only the dc coefs are decoded, 1/8 size */
 
 /* ---------- inflate ---------- */
 typedef struct { const uint8_t* p; int n, pos; uint32_t bit, cnt; } bits_t;
@@ -289,7 +291,7 @@ static int jrecv(jpg_t* j, int s) {
     return v < (1 << (s - 1)) ? v - (1 << s) + 1 : v;
 }
 
-static bool jblock(jpg_t* j, int ci, uint8_t* out, int stride) {
+static bool jblock(jpg_t* j, int ci, uint8_t* out, int stride, int dc_only) {
     int co[64];
     memset(co, 0, sizeof co);
     int t = jdec(j, &j->hd[j->c[ci].td]);
@@ -306,6 +308,11 @@ static bool jblock(jpg_t* j, int ci, uint8_t* out, int stride) {
         if (k > 63) break;
         co[zz[k]] = jrecv(j, s) * q[k];
         k++;
+    }
+    if (dc_only) {
+        int s = ((co[0] + 4) >> 3) + 128;
+        *out = (uint8_t)(s < 0 ? 0 : s > 255 ? 255 : s);
+        return true;
     }
     int tmp[64];
     for (int v = 0; v < 8; v++)                   /* rows */
@@ -358,7 +365,7 @@ static uint32_t* jpeg_decode(const uint8_t* d, int n, int* ow, int* oh) {
         } else if (m == 0xC0 || m == 0xC1) {
             j->h = s[1] << 8 | s[2]; j->w = s[3] << 8 | s[4]; j->nc = s[5];
             if (j->nc != 1 && j->nc != 3) goto bad;
-            if (j->w <= 0 || j->h <= 0 || j->w > IMG_MAX || j->h > IMG_MAX) goto bad;
+            if (j->w <= 0 || j->h <= 0 || j->w > JPG_MAX || j->h > JPG_MAX) goto bad;
             for (int i = 0; i < j->nc; i++) {
                 j->c[i].id = s[6 + i * 3];
                 j->c[i].hs = s[7 + i * 3] >> 4; j->c[i].vs = s[7 + i * 3] & 15;
@@ -378,12 +385,13 @@ static uint32_t* jpeg_decode(const uint8_t* d, int n, int* ow, int* oh) {
                 for (int k = 0; k < j->nc; k++)
                     if (j->c[k].id == s[1 + i * 2]) { j->c[k].td = s[2 + i * 2] >> 4 & 3; j->c[k].ta = s[2 + i * 2] & 3; }
             j->pos += len;
+            int sm = (long)j->w * j->h > JPG_FULL;        /* dc only */
             int mw = 8 * j->hmax, mh = 8 * j->vmax;
             int mx = (j->w + mw - 1) / mw, my = (j->h + mh - 1) / mh;
             for (int k = 0; k < j->nc; k++) {
                 j->c[k].bw = mx * j->c[k].hs * 8;
                 j->c[k].bh = my * j->c[k].vs * 8;
-                j->c[k].buf = kmalloc_big((uint32_t)(j->c[k].bw * j->c[k].bh));
+                j->c[k].buf = kmalloc_big(sm ? (uint32_t)(j->c[k].bw * j->c[k].bh / 64) : (uint32_t)(j->c[k].bw * j->c[k].bh));
                 if (!j->c[k].buf) goto bad;
             }
             int todo = j->rst;
@@ -400,21 +408,25 @@ static uint32_t* jpeg_decode(const uint8_t* d, int n, int* ow, int* oh) {
                         for (int by = 0; by < j->c[k].vs; by++)
                             for (int bx = 0; bx < j->c[k].hs; bx++) {
                                 int ox = (xx * j->c[k].hs + bx) * 8, oy = (yy * j->c[k].vs + by) * 8;
-                                if (!jblock(j, k, j->c[k].buf + oy * j->c[k].bw + ox, j->c[k].bw)) goto bad;
+                                uint8_t* o = sm ? j->c[k].buf + (oy >> 3) * (j->c[k].bw >> 3) + (ox >> 3) : j->c[k].buf + oy * j->c[k].bw + ox;
+                                if (!jblock(j, k, o, j->c[k].bw, sm)) goto bad;
                             }
                 }
-            px = kmalloc_big((uint32_t)(j->w * j->h * 4));
+            int sw = sm ? (j->w + 7) >> 3 : j->w, sh = sm ? (j->h + 7) >> 3 : j->h;
+            int b0 = sm ? j->c[0].bw >> 3 : j->c[0].bw, b1 = sm ? j->c[1].bw >> 3 : j->c[1].bw, b2 = sm ? j->c[2].bw >> 3 : j->c[2].bw;
+            px = kmalloc_big((uint32_t)(sw * sh * 4));
             if (!px) goto bad;
-            for (int y = 0; y < j->h; y++)
-                for (int x = 0; x < j->w; x++) {
-                    int Y = j->c[0].buf[(y * j->c[0].vs / j->vmax) * j->c[0].bw + x * j->c[0].hs / j->hmax];
-                    if (j->nc == 1) { px[y * j->w + x] = 0xFF000000u | (uint32_t)Y * 0x010101u; continue; }
-                    int cb = j->c[1].buf[(y * j->c[1].vs / j->vmax) * j->c[1].bw + x * j->c[1].hs / j->hmax] - 128;
-                    int cr = j->c[2].buf[(y * j->c[2].vs / j->vmax) * j->c[2].bw + x * j->c[2].hs / j->hmax] - 128;
+            for (int y = 0; y < sh; y++)
+                for (int x = 0; x < sw; x++) {
+                    int Y = j->c[0].buf[(y * j->c[0].vs / j->vmax) * b0 + x * j->c[0].hs / j->hmax];
+                    if (j->nc == 1) { px[y * sw + x] = 0xFF000000u | (uint32_t)Y * 0x010101u; continue; }
+                    int cb = j->c[1].buf[(y * j->c[1].vs / j->vmax) * b1 + x * j->c[1].hs / j->hmax] - 128;
+                    int cr = j->c[2].buf[(y * j->c[2].vs / j->vmax) * b2 + x * j->c[2].hs / j->hmax] - 128;
                     int r = Y + ((91881 * cr) >> 16), g = Y - ((22554 * cb + 46802 * cr) >> 16), b = Y + ((116130 * cb) >> 16);
                     r = r < 0 ? 0 : r > 255 ? 255 : r; g = g < 0 ? 0 : g > 255 ? 255 : g; b = b < 0 ? 0 : b > 255 ? 255 : b;
-                    px[y * j->w + x] = 0xFF000000u | (uint32_t)r << 16 | (uint32_t)g << 8 | (uint32_t)b;
+                    px[y * sw + x] = 0xFF000000u | (uint32_t)r << 16 | (uint32_t)g << 8 | (uint32_t)b;
                 }
+            if (sm) { j->w = sw; j->h = sh; }
             break;
         }
         j->pos += len;
@@ -520,4 +532,31 @@ uint32_t *img_decode(const uint8_t* d, int n, int* w, int* h) {
     if (n > 4 && d[0] == 0xFF && d[1] == 0xD8) return jpeg_decode(d, n, w, h);
     if (n > 6 && d[0] == 'G' && d[1] == 'I' && d[2] == 'F') return gif_decode(d, n, w, h);
     return NULL;
+}
+
+/* dimensions without decoding, 0 = not one of ours */
+int img_peek(const uint8_t* d, int n, int* w, int* h) {
+    if (n > 24 && d[0] == 0x89 && d[1] == 'P' && d[2] == 'N' && d[3] == 'G') {
+        *w = d[16] << 24 | d[17] << 16 | d[18] << 8 | d[19];
+        *h = d[20] << 24 | d[21] << 16 | d[22] << 8 | d[23];
+        return 1;
+    }
+    if (n > 10 && d[0] == 'G' && d[1] == 'I' && d[2] == 'F') {
+        *w = d[6] | d[7] << 8; *h = d[8] | d[9] << 8;
+        return 1;
+    }
+    if (n > 4 && d[0] == 0xFF && d[1] == 0xD8) {
+        int pos = 2;
+        while (pos + 9 < n) {
+            if (d[pos] != 0xFF) { pos++; continue; }
+            int m = d[pos + 1];
+            if (m == 0xFF || m == 0 || m == 0xD8 || (m >= 0xD0 && m <= 0xD7) || m == 1) { pos += (m == 0xFF) ? 1 : 2; continue; }
+            if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+                *h = d[pos + 5] << 8 | d[pos + 6]; *w = d[pos + 7] << 8 | d[pos + 8];
+                return 1;
+            }
+            pos += 2 + (d[pos + 2] << 8 | d[pos + 3]);
+        }
+    }
+    return 0;
 }
