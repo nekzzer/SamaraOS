@@ -678,7 +678,7 @@ static int send_sig(proc_t* p, int sig, bool exact) {
         proc_t* d = p->is_thread || exact ? p : pick_thread(p, sig);
         if (h > 1 || (d->sig_mask & SIGBIT(sig))) {         /* caught or blocked (signalfd): stays pending */
             d->sig_pending |= SIGBIT(sig);
-            if (d->in_futex) ready_task_of(d);
+            ready_task_of(d);                               /* sleeping in a wait queue or a nap: look at it now */
             return 0;
         }
         if (sig_default_ignored(sig)) return 0;

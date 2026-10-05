@@ -44,8 +44,7 @@ int     sock_take_error(sock_t* s);           /* SO_ERROR */
 bool    sock_readable(sock_t* s);
 bool    sock_writable(sock_t* s);
 bool    sock_hup(sock_t* s);
-struct wq;
-struct wq* sock_wq(sock_t* s);               /* wakes on any readiness change */
-void    sock_arm(sock_t* s);                   /* call after queueing a waiter */
+struct wq_w; struct wq_ent;
+struct wq_ent* sock_wq_add(sock_t* s, struct wq_w* w);   /* wakes on any readiness change */
 
 #endif

@@ -21,6 +21,11 @@ void      wq_del(wq_ent_t* e);
 void      wq_wake(wq_t* q);
 void      wq_sleep(wq_w_t* w, uint32_t ms);         /* 0 = until woken (rechecks every 500 ms anyway) */
 void      wq_drain(wq_t* q);
+/* one turn of a wait loop (start with *wp = NULL, declare it with WQ_W): the first call
+   only queues the waiter so the caller rechecks, later ones sleep */
+void      wq_wait(wq_t* q, wq_w_t** wp, uint32_t ms);
+void      wq_wfree(wq_w_t** wp);
+#define WQ_W(n) wq_w_t* n __attribute__((cleanup(wq_wfree))) = NULL
 bool      wq_waiting(wq_t* q);
 
 #endif

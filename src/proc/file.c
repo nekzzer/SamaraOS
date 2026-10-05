@@ -109,16 +109,18 @@ void file_close(file_t* f) {
     if (f->type == F_PTM) pty_master_close(f->pty);
     if (f->type == F_PTS) pty_slave_close(f->pty);
     if (f->type == F_USOCK || f->type == F_ULISTEN) ux_release(f);
+    if (f->type == F_EVENTFD) wq_drain(&f->wq);
     if (f->type == F_EPOLL && f->ep) kfree(f->ep);
     if (f->type == F_URING && f->ur) uring_release(f->ur);
     if (f->type == F_SPAIR) {
         spair_shutdown(f, 2);
-        if (f->pipe->readers <= 0 && f->pipe->writers <= 0) kfree(f->pipe);
-        if (f->pipe2->readers <= 0 && f->pipe2->writers <= 0) kfree(f->pipe2);
+        if (f->pipe->readers <= 0 && f->pipe->writers <= 0) { wq_drain(&f->pipe->wq); kfree(f->pipe); }
+        if (f->pipe2->readers <= 0 && f->pipe2->writers <= 0) { wq_drain(&f->pipe2->wq); kfree(f->pipe2); }
     } else if (f->pipe) {
         if (f->type == F_PIPE_R) f->pipe->readers--;
         else                     f->pipe->writers--;
-        if (f->pipe->readers <= 0 && f->pipe->writers <= 0) kfree(f->pipe);
+        wq_wake(&f->pipe->wq);                   /* hup / epipe for whoever polls */
+        if (f->pipe->readers <= 0 && f->pipe->writers <= 0) { wq_drain(&f->pipe->wq); kfree(f->pipe); }
     }
     kfree(f);
 }
@@ -162,6 +164,7 @@ int spair_shutdown(file_t* f, int how) {
     if (how < 0 || how > 2) return -22;             /* EINVAL */
     if ((how == 0 || how == 2) && !(f->shut & 1)) { f->shut |= 1; f->pipe->readers--; }
     if ((how == 1 || how == 2) && !(f->shut & 2)) { f->shut |= 2; f->pipe2->writers--; }
+    wq_wake(&f->pipe->wq); wq_wake(&f->pipe2->wq);
     return 0;
 }
 
@@ -291,11 +294,12 @@ bool file_writable(file_t* f) {
 }
 
 static int pipe_read(file_t* f, pipe_t* p, char* buf, uint32_t n) {
+    WQ_W(w);
     while (p->count == 0) {
         if (p->writers <= 0) return 0;
         if (f->flags & O_NONBLOCK) return -EAGAIN;
         if (proc_interrupted()) return -EINTR;
-        task_yield();
+        wq_wait(&p->wq, &w, 0);
     }
     uint32_t got = 0;
     while (got < n && p->count > 0) {                /* at most two runs around the ring */
@@ -307,11 +311,13 @@ static int pipe_read(file_t* f, pipe_t* p, char* buf, uint32_t n) {
         p->tail = (p->tail + (int)k) % PIPE_SZ;
         p->count -= (int)k;
     }
+    wq_wake(&p->wq);
     return (int)got;
 }
 
 static int pipe_write(file_t* f, pipe_t* p, const char* buf, uint32_t n) {
     uint32_t put = 0;
+    WQ_W(w);
     while (put < n) {
         if (p->readers <= 0) {
             proc_t* me = proc_current();
@@ -321,7 +327,7 @@ static int pipe_write(file_t* f, pipe_t* p, const char* buf, uint32_t n) {
         if (p->count == PIPE_SZ) {
             if (f->flags & O_NONBLOCK) return put ? (int)put : -EAGAIN;
             if (proc_interrupted()) return put ? (int)put : -EINTR;
-            task_yield();
+            wq_wait(&p->wq, &w, 0);
             continue;
         }
         uint32_t k = PIPE_SZ - (uint32_t)p->head, room = PIPE_SZ - (uint32_t)p->count;
@@ -332,6 +338,7 @@ static int pipe_write(file_t* f, pipe_t* p, const char* buf, uint32_t n) {
         p->head = (p->head + (int)k) % PIPE_SZ;
         p->count += (int)k;
         p->wgen++;
+        wq_wake(&p->wq);
     }
     return (int)put;
 }
@@ -349,6 +356,7 @@ int file_read(file_t* f, char* buf, uint32_t n) {
         case F_EVENTFD: case F_TIMERFD: {               /* both hand out a u64 */
             if (n < 8) return -22;
             uint64_t v;
+            WQ_W(w);
             for (;;) {
                 if (f->type == F_EVENTFD && f->cnt) {
                     v = (f->flags & 0x10000000) ? 1 : f->cnt;  /* EFD_SEMAPHORE, kept in a spare flag bit */
@@ -363,8 +371,10 @@ int file_read(file_t* f, char* buf, uint32_t n) {
                 }
                 if (f->flags & O_NONBLOCK) return -11;
                 if (proc_interrupted()) return -4;
-                task_sleep_ms(1);
+                if (f->type == F_EVENTFD) wq_wait(&f->wq, &w, 0);
+                else task_sleep_ms(1);
             }
+            if (f->type == F_EVENTFD) wq_wake(&f->wq);
             memcpy(buf, &v, 8);
             return 8;
         }
@@ -431,6 +441,7 @@ int file_write(file_t* f, const char* buf, uint32_t n) {
             memcpy(&v, buf, 8);
             if (v == ~0ull) return -22;
             f->cnt += v;
+            wq_wake(&f->wq);
             return 8;
         }
         case F_TIMERFD: case F_SIGNALFD: return -22;

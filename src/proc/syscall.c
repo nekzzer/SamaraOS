@@ -1059,10 +1059,30 @@ static int poll_once(pollfd_t* fds, uint64_t n) {
     return ready;
 }
 
+int file_wqs(file_t* f, wq_t** v);
+
+/* queue the waiter on whatever wakes us for f. 1 = nothing to wait on, tick along */
+static int wait_arm(file_t* f, wq_w_t* w) {
+    if (f->type == F_SOCKET) return sock_wq_add(f->sock, w) ? 0 : 1;
+    wq_t* v[2];
+    int n = file_wqs(f, v);
+    if (n < 0) return 1;
+    for (int i = 0; i < n; i++) if (!wq_add(v[i], w)) return 1;
+    return 0;
+}
+
+/* ms until an armed timerfd fires, 0 = not one. timers don't have a queue */
+static uint32_t timer_ms(file_t* f) {
+    if (f->type != F_TIMERFD || !f->t_next) return 0;
+    int32_t d = (int32_t)(f->t_next - pit_uptime_ms());
+    return d > 0 ? (uint32_t)d : 1;
+}
+
 /* epoll on top of the same readiness checks, level triggered (EPOLLET is
    taken as level, good enough so far). xorg's ospoll has no poll fallback */
 typedef struct ep {
     int n, cap;
+    uint32_t gen;
     struct { int fd; file_t* f; uint32_t ev; uint32_t d0, d1; } it[];
 } ep_t;
 
@@ -1094,6 +1114,8 @@ static int do_epoll_ctl(int epfd, int op, int fd, uint32_t* uev) {
     ep_t* e = f->ep;
     int i = 0;
     while (i < e->n && !(e->it[i].fd == fd && e->it[i].f == x)) i++;
+    e->gen++;
+    wq_wake(&f->wq);
     if (op == 2) {                                                /* DEL */
         if (i == e->n) return -ENOENT;
         e->it[i] = e->it[--e->n];
@@ -1126,8 +1148,12 @@ static int do_epoll_wait(int epfd, uint32_t* out, int max, int timeout_ms) {
     if (f->type != F_EPOLL || max <= 0) return -EINVAL;
     UCHK(out, (uint32_t)max * 12);
     uint32_t start = pit_uptime_ms();
+    WQ_W(w);
+    bool armed = false;
+    int unk = 0;
+    uint32_t gen = 0;
     for (;;) {
-        net_poll();
+        sock_pump();
         ep_t* e = f->ep;
         int got = 0;
         for (int i = 0; i < e->n && got < max; i++) {
@@ -1144,9 +1170,30 @@ static int do_epoll_wait(int epfd, uint32_t* out, int max, int timeout_ms) {
             if (want & (1u << 30)) e->it[i].ev = 1u << 30;        /* EPOLLONESHOT: off until MOD */
         }
         if (got || timeout_ms == 0) return got;
-        if (timeout_ms > 0 && pit_uptime_ms() - start >= (uint32_t)timeout_ms) return 0;
+        uint32_t el = pit_uptime_ms() - start;
+        if (timeout_ms > 0 && el >= (uint32_t)timeout_ms) return 0;
         if (proc_interrupted()) return -EINTR;
-        task_sleep_ms(1);
+        if (armed && gen != e->gen) { wq_waiter_free(w); w = NULL; armed = false; }
+        if (!armed) {
+            armed = true;
+            gen = e->gen;
+            unk = 0;
+            w = wq_waiter();
+            if (!w) unk = 1;
+            else {
+                if (!wq_add(&f->wq, w)) unk = 1;
+                for (int i = 0; i < e->n; i++) unk |= wait_arm(e->it[i].f, w);
+            }
+            continue;
+        }
+        uint32_t ms = timeout_ms > 0 ? (uint32_t)timeout_ms - el : 0;
+        for (int i = 0; i < e->n; i++) {
+            uint32_t t = timer_ms(e->it[i].f);
+            if (t && (!ms || t < ms)) ms = t;
+        }
+        if (unk) ms = 1;
+        if (w) wq_sleep(w, ms);
+        else task_sleep_ms(1);
     }
 }
 
@@ -1154,13 +1201,35 @@ static int do_poll(pollfd_t* fds, uint64_t n, int timeout_ms) {
     if (n > MAX_FDS * 2) return -EINVAL;
     UCHK(fds, n * sizeof(pollfd_t));
     uint32_t start = pit_uptime_ms();
+    WQ_W(w);
+    bool armed = false;
+    int unk = 0;
     for (;;) {
-        net_poll();
+        sock_pump();
         int r = poll_once(fds, n);
         if (r || timeout_ms == 0) return r;
-        if (timeout_ms > 0 && pit_uptime_ms() - start >= (uint32_t)timeout_ms) return 0;
+        uint32_t el = pit_uptime_ms() - start;
+        if (timeout_ms > 0 && el >= (uint32_t)timeout_ms) return 0;
         if (proc_interrupted()) return -EINTR;
-        task_sleep_ms(1);
+        if (!armed) {
+            armed = true;
+            w = wq_waiter();
+            if (!w) unk = 1;
+            else for (uint64_t i = 0; i < n; i++) {
+                file_t* f = fds[i].fd < 0 ? NULL : getf(fds[i].fd);
+                if (f) unk |= wait_arm(f, w);
+            }
+            continue;
+        }
+        uint32_t ms = timeout_ms > 0 ? (uint32_t)timeout_ms - el : 0;
+        for (uint64_t i = 0; i < n; i++) {
+            file_t* f = fds[i].fd < 0 ? NULL : getf(fds[i].fd);
+            uint32_t t = f ? timer_ms(f) : 0;
+            if (t && (!ms || t < ms)) ms = t;
+        }
+        if (unk) ms = 1;
+        if (w) wq_sleep(w, ms);
+        else task_sleep_ms(1);
     }
 }
 
@@ -1178,8 +1247,11 @@ static int do_select(int n, uint32_t* rd, uint32_t* wr, uint32_t* ex, int timeou
         if (wr) want_w[i] = wr[i];
     }
     uint32_t start = pit_uptime_ms();
+    WQ_W(w);
+    bool armed = false;
+    int unk = 0;
     for (;;) {
-        net_poll();
+        sock_pump();
         int ready = 0;
         uint32_t got_r[FDW] = {0}, got_w[FDW] = {0};
         for (int fd = 0; fd < n; fd++) {
@@ -1201,7 +1273,28 @@ static int do_select(int n, uint32_t* rd, uint32_t* wr, uint32_t* ex, int timeou
             return ready;
         }
         if (proc_interrupted()) return -EINTR;
-        task_sleep_ms(1);
+        uint32_t el = pit_uptime_ms() - start;
+        uint32_t ms = timeout_ms > 0 ? (uint32_t)timeout_ms - el : 0;
+        if (!armed) {
+            armed = true;
+            w = wq_waiter();
+            if (!w) unk = 1;
+            for (int fd = 0; w && fd < n; fd++) {
+                if (!((want_r[fd >> 5] | want_w[fd >> 5]) & (1u << (fd & 31)))) continue;
+                file_t* f = getf(fd);
+                if (f) unk |= wait_arm(f, w);
+            }
+            continue;
+        }
+        for (int fd = 0; fd < n; fd++) {
+            if (!((want_r[fd >> 5] | want_w[fd >> 5]) & (1u << (fd & 31)))) continue;
+            file_t* f = getf(fd);
+            uint32_t t = f ? timer_ms(f) : 0;
+            if (t && (!ms || t < ms)) ms = t;
+        }
+        if (unk) ms = 1;
+        if (w) wq_sleep(w, ms);
+        else task_sleep_ms(1);
     }
 }
 
@@ -1593,6 +1686,7 @@ typedef struct ux {
     bool bound, listening;
     file_t* q[16];
     int  nq;
+    wq_t wq;
 } ux_t;
 
 static ux_t* ureg[32];
@@ -1635,11 +1729,28 @@ static ux_t* ux_find(const char* name, int nlen) {
 
 bool ux_pending(file_t* f) { return f->ux && f->ux->nq > 0; }
 
+extern wq_t tty_wq;
+
+/* what to sleep on for f: 0..2 queues, -1 = no idea, poll it with ticks. no queue + always ready is 0 */
+int file_wqs(file_t* f, wq_t** v) {
+    switch (f->type) {
+        case F_PIPE_R: case F_PIPE_W: v[0] = &f->pipe->wq; return 1;
+        case F_SPAIR: v[0] = &f->pipe->wq; v[1] = &f->pipe2->wq; return 2;
+        case F_EVENTFD: v[0] = &f->wq; return 1;
+        case F_TTY: v[0] = &tty_wq; return 1;
+        case F_PTM: case F_PTS: v[0] = pty_wq(f->pty); return v[0] ? 1 : 0;
+        case F_ULISTEN: v[0] = &f->ux->wq; return 1;
+        case F_NODE: case F_NULL: case F_ZERO: case F_RANDOM: case F_DISK: case F_FB: case F_NETLINK: return 0;
+        default: return -1;
+    }
+}
+
 void ux_release(file_t* f) {
     ux_t* u = f->ux;
     if (!u) return;
     for (int i = 0; i < 32; i++) if (ureg[i] == u) ureg[i] = NULL;
     for (int i = 0; i < u->nq; i++) file_close(u->q[i]);
+    wq_drain(&u->wq);
     kfree(u);
     f->ux = NULL;
 }
@@ -1692,14 +1803,16 @@ static int ux_call(int call, file_t* f, int fd, uint64_t b, uint64_t c, uint64_t
             f->shut = 0;
             kfree(x);
             l->q[l->nq++] = y;
+            wq_wake(&l->wq);
             return 0;
         }
         case 5: case 18: {                                            /* accept(4) */
             if (f->type != F_ULISTEN) return -EINVAL;
+            WQ_W(w);
             while (!u->nq) {
                 if (f->flags & O_NONBLOCK) return -EAGAIN;
                 if (proc_interrupted()) return -EINTR;
-                task_yield();
+                wq_wait(&u->wq, &w, 0);
             }
             file_t* y = u->q[0];
             for (int i = 1; i < u->nq; i++) u->q[i - 1] = u->q[i];

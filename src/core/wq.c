@@ -161,3 +161,18 @@ void wq_sleep(wq_w_t* w, uint32_t ms) {
     w->fired = 0;
     irq_restore(f);
 }
+
+void wq_wfree(wq_w_t** wp) { if (*wp) wq_waiter_free(*wp); }
+
+void wq_wait(wq_t* q, wq_w_t** wp, uint32_t ms) {
+    if (!*wp) {
+        *wp = wq_waiter();
+        if (*wp) {
+            if (wq_add(q, *wp)) return;
+            wq_waiter_free(*wp);
+            *wp = NULL;
+        }
+    }
+    if (*wp) wq_sleep(*wp, ms);
+    else task_yield();
+}

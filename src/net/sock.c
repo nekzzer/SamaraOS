@@ -645,7 +645,7 @@ static int wstep(sock_t* s, wq_w_t** wp, uint32_t* t0, uint32_t tmo) {
     if (!*wp) {
         *wp = wq_waiter();
         if (*wp) {
-            if (wq_add(&s->wq, *wp)) { s->rdy = smask(s); return 0; }
+            if (sock_wq_add(s, *wp)) return 0;
             wq_waiter_free(*wp);
             *wp = NULL;
         }
@@ -992,5 +992,11 @@ int sock_cmsg(sock_t* s, uint8_t* out, int cap) {
     return n;
 }
 
-struct wq* sock_wq(sock_t* s) { return &s->wq; }
-void sock_arm(sock_t* s) { s->rdy = smask(s); }
+/* queue a waiter; the first one sets the baseline, later ones wake the others if something changed meanwhile */
+wq_ent_t* sock_wq_add(sock_t* s, wq_w_t* w) {
+    bool first = !s->wq.head;
+    wq_ent_t* e = wq_add(&s->wq, w);
+    uint32_t m = smask(s);
+    if (e && m != s->rdy) { s->rdy = m; if (!first) wq_wake(&s->wq); }
+    return e;
+}

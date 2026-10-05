@@ -2,6 +2,7 @@
 #define SAMARA_FILE_H
 #include "core/types.h"
 #include "fs/fs.h"
+#include "core/wq.h"
 
 /* Open file descriptions, shared between fds after dup()/fork(). */
 
@@ -22,6 +23,7 @@ typedef struct pipe {
     int  readers, writers;
     struct file* fds[8];    /* SCM_RIGHTS in flight (unix sockets) */
     int  nfds;
+    wq_t wq;
     uint32_t wgen;          /* bumped on every write, io_uring multishot poll looks at it */
 } pipe_t;
 
@@ -42,6 +44,7 @@ typedef struct file {
     struct ep* ep;          /* F_EPOLL */
     struct uring* ur;       /* F_URING */
     uint64_t   cnt;         /* F_EVENTFD counter */
+    wq_t       wq;          /* F_EVENTFD */
     uint32_t   t_next, t_int;   /* F_TIMERFD: uptime ms of the next expiry (0 = off), interval */
 } file_t;
 
