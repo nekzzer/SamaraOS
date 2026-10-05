@@ -4,6 +4,7 @@
 #include "boot/pic.h"
 #include "core/io.h"
 #include "core/vmm.h"
+#include "core/string.h"
 #include "drivers/vga.h"
 
 int apic_on;
@@ -63,18 +64,65 @@ void ioapic_irq(int irq, bool mask) {
     }
 }
 
+int hpet_on;
+static volatile uint64_t* hpet;
+static uint32_t hpet_khz;
+static uint64_t hpet0;
+
+static uint64_t hpet_cnt(void) { return hpet[0xF0 / 8]; }
+
+static void hpet_init(void) {
+    if (!acpi.hpet_pa || acpi.hpet_pa >= 0x100000000ull) return;
+    boot_pd[acpi.hpet_pa >> 21] |= 0x18;
+    vmm_flush();
+    hpet = (volatile uint64_t*)P2V(acpi.hpet_pa);
+    uint64_t cap = hpet[0];
+    uint32_t fs = cap >> 32;
+    if (!fs || fs > 100000000 || !(cap & (1 << 13))) { hpet = NULL; return; }   // 64 bit counters only, 32 bit wraps in minutes
+    hpet_khz = (uint32_t)(1000000000000ull / fs);
+    hpet[0x10 / 8] |= 1;                      /* enable counting */
+    hpet0 = hpet_cnt();
+    hpet_on = 1;
+}
+
 uint64_t tsc_us(void) {
-    if (!tsc_khz) return 0;
+    if (!tsc_khz) return hpet_on ? (hpet_cnt() - hpet0) * 1000 / hpet_khz : 0;
     return (rdtsc() - tsc0) * 1000 / tsc_khz;
 }
 
 uint64_t tsc_ms(void) {
-    if (!tsc_khz) return 0;
+    if (!tsc_khz) return hpet_on ? (hpet_cnt() - hpet0) / hpet_khz : 0;
     return (rdtsc() - tsc0) / tsc_khz;
+}
+
+/* hpet as the stopwatch: 30ms, much nicer than the pit */
+static void vga_snprintf_clk(char* b) {
+    char t[12]; b[0] = 0;
+    strcat(b, "[clk] tsc "); utoa(tsc_khz, t, 10); strcat(b, t);
+    strcat(b, " hpet "); utoa(hpet_on ? hpet_khz : 0, t, 10); strcat(b, t); strcat(b, "\r\n");
+}
+
+static void calibrate_hpet(void) {
+    uint64_t want = (uint64_t)hpet_khz * 30;
+    lwr(0x3E0, 3);
+    lwr(0x320, 0x10000);
+    lwr(0x380, 0xFFFFFFFF);
+    uint64_t h0 = hpet_cnt();
+    uint64_t t0 = rdtsc();
+    while (hpet_cnt() - h0 < want) {}
+    uint64_t t1 = rdtsc();
+    uint64_t h1 = hpet_cnt();
+    uint32_t left = lrd(0x390);
+    lwr(0x380, 0);
+    uint64_t el = h1 - h0;
+    tsc_khz = (uint32_t)((t1 - t0) * hpet_khz / el);
+    lapic_khz = (uint32_t)((0xFFFFFFFFu - left) * (uint64_t)hpet_khz / el);
+    tsc0 = t0;
 }
 
 /* pit ch2 as a stopwatch, 30ms. lapic timer and tsc counted meanwhile */
 static void calibrate(void) {
+    if (hpet_on) { calibrate_hpet(); return; }
     uint32_t cnt = 35795;
     outb(0x61, (inb(0x61) & 0xFC) | 1);
     outb(0x43, 0xB0);
@@ -115,8 +163,10 @@ void apic_init(void) {
     outb(PIC2_DATA, 0xFF);
     lwr(0xF0, 0x100 | VEC_SPUR);
     apic_on = 1;
+    hpet_init();
     calibrate();
-    vga_printf("apic: %d cpu, %d ioapic, tsc %u kHz, lapic %u kHz\n", acpi.ncpu, acpi.nioapic, tsc_khz, lapic_khz * 16);
+    { char b[64]; vga_snprintf_clk(b); for (char* q = b; *q; q++) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, *q); } }
+    vga_printf("apic: %d cpu, %d ioapic, tsc %u kHz, lapic %u kHz, hpet %u kHz\n", acpi.ncpu, acpi.nioapic, tsc_khz, lapic_khz * 16, hpet_on ? hpet_khz : 0);
 }
 
 void apic_cpu_init(void) {

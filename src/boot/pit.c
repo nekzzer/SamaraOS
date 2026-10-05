@@ -42,7 +42,7 @@ static uint32_t hz_ = 100;
 /* Milliseconds accumulate per tick instead of ticks*1000/hz, which overflows
    32 bits after ~71 minutes at 1 kHz. */
 uint32_t pit_ticks(void) { return ticks_; }
-uint32_t pit_uptime_ms(void) { return tsc_khz ? (uint32_t)tsc_ms() : ms_; }   // tsc, the lapic tick drifts under kvm
+uint32_t pit_uptime_ms(void) { return tsc_khz || hpet_on ? (uint32_t)tsc_ms() : ms_; }   // tsc, the lapic tick drifts under kvm
 void     pit_tick_inc(void) {                /* called from scheduler ISR */
     ticks_++;
     ms_frac_ += 1000U;

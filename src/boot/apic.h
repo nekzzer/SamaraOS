@@ -9,6 +9,7 @@
 
 extern int apic_on;
 extern uint32_t tsc_khz;
+extern int hpet_on;
 
 void apic_init(void);                  /* bsp: lapic, ioapic, pic off */
 void apic_cpu_init(void);              /* every cpu, after its gdt/idt */
