@@ -71,7 +71,8 @@
 #define S_IFREG  0100000
 
 bool g_strace;                          /* `strace on` in the kernel shell */
-int  g_strace_pid;                      /* only this pid ("strace=N" on the cmdline), 0 = all */
+int  g_strace_pid;
+bool g_ftrace;                         /* "ftrace": failed syscalls with the path, to COM1 */                      /* only this pid ("strace=N" on the cmdline), 0 = all */
 
 /* ---------------- serial ---------------- */
 
@@ -2515,11 +2516,17 @@ static int64_t dispatch(regs_t* r) {
         case 132: case 235: case 280: {                              /* utime(s)/utimensat */
             const char* path = (const char*)(r->rax == 280 ? b : a);
             int dfd = r->rax == 280 ? (int)a : AT_FDCWD;
-            if (!path) { file_t* fl = getf(dfd); if (fl && fl->type == F_NODE) fl->node->mtime = fs_now(); return 0; }
+            uint32_t mt = fs_now();
+            const int64_t* ts = (const int64_t*)(r->rax == 280 ? c : r->rax == 235 ? b : 0);
+            if (ts && uok(ts, 32)) {
+                if (r->rax == 280 && ts[3] == ((1 << 30) - 2)) return 0;          /* UTIME_OMIT */
+                if (!(r->rax == 280 && ts[3] == ((1 << 30) - 1))) mt = (uint32_t)ts[2];
+            } else if (r->rax == 132 && b && uok((void*)b, 16)) mt = (uint32_t)((int64_t*)b)[1];
+            if (!path) { file_t* fl = getf(dfd); if (fl && fl->type == F_NODE) fl->node->mtime = mt; return 0; }
             UCHK(path, 1);
-            n = lookup_peek(dfd, path, &err, true);
+            n = lookup_peek(dfd, path, &err, !(r->rax == 280 && (d & 0x100)));
             if (!n) return err;
-            n->mtime = fs_now();
+            n->mtime = mt;
             return 0;
         }
         case 318: {                                                  /* getrandom */
@@ -2724,6 +2731,19 @@ void syscall_dispatch(regs_t* r) {
         klog(" "); klog_num(nr);
         klog("("); klog_num(r->rdi); klog(", "); klog_num(r->rsi);
         klog(", "); klog_num(r->rdx); klog(") = "); klog_num(ret); klog("\r\n");
+    }
+    if (g_ftrace && ret < 0 && ret != -11 && proc_current()) {
+        const char* ps = NULL;
+        switch (nr) {
+            case 2: case 4: case 6: case 21: case 76: case 80: case 82: case 83: case 84: case 85: case 87: case 88: case 89: case 90: case 92: case 59:
+                ps = (const char*)r->rdi; break;
+            case 257: case 258: case 259: case 262: case 263: case 264: case 265: case 266: case 267: case 268: case 269: case 280: case 316: case 332:
+                ps = (const char*)r->rsi; break;
+        }
+        klog("[f] "); klog_num(proc_current()->pid); klog(" "); klog(proc_current()->name);
+        klog(" nr="); klog_num(nr); klog(" ret="); klog_num(ret);
+        if (ps && ustr_ok(ps)) { klog(" "); klog(ps); }
+        klog("\r\n");
     }
     /* execve and sigreturn have already installed the registers to return with. */
     bool keep = (nr == 59 && ret >= 0) || (nr == 15 && ret == 0);

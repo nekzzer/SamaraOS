@@ -207,6 +207,7 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
     }
 
     { extern bool g_wm_stats; g_wm_stats = strstr(boot_cmdline, "wmstats") != NULL; }
+    { extern bool g_ftrace; g_ftrace = strstr(boot_cmdline, "ftrace") != NULL; }
     {   /* syscalls -> COM1: "strace" (all) or "strace=PID" */
         extern bool g_strace; extern int g_strace_pid;
         const char* k = strstr(boot_cmdline, "strace");
