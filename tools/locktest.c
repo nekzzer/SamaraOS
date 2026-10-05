@@ -107,8 +107,21 @@ static void runp(const char* name, int kind) {
     for (int i = 0; i < n; i++) { close(pp[i].fd[0]); close(pp[i].fd[1]); close(pp[i].fd[2]); close(pp[i].fd[3]); }
 }
 
+// jitter <ms>: spin on getppid (still takes the big lock) and report the worst gap
+static void jitter(int ms) {
+    long t0 = now_ms(), last = t0, worst = 0, n = 0;
+    while (now_ms() - t0 < ms) {
+        getppid();
+        long t = now_ms();
+        if (t - last > worst) worst = t - last;
+        last = t; n++;
+    }
+    printf("jitter %ld calls, worst gap %ld ms\n", n, worst);
+}
+
 int main(int argc, char** argv) {
     const char* w = argc > 1 ? argv[1] : "all";
+    if (!strcmp(w, "jitter")) { jitter(argc > 2 ? atoi(argv[2]) : 3000); return 0; }
     if (argc > 2) nt = atoi(argv[2]);
     if (argc > 3) iters = atoi(argv[3]);
     if (!strcmp(w, "mm") || !strcmp(w, "all")) run("mm", t_mm, iters);
