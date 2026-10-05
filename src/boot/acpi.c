@@ -25,6 +25,8 @@ static struct sdt* map_sdt(uint64_t pa) {
 }
 
 static uint8_t* find_rsdp(void) {
+    extern uint8_t mb2_rsdp[]; extern int mb2_have_rsdp;
+    if (mb2_have_rsdp) return mb2_rsdp;
     uint8_t* r[2];
     int n = 0;
     uint32_t ebda = *(uint16_t*)P2V(0x40E) << 4;

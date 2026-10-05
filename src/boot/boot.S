@@ -5,6 +5,22 @@
 .align 4
 .long 0x1BADB002, 3, -(0x1BADB002 + 3)
 
+/* multiboot2 too: grub on uefi gives us rsdp and gop framebuffer only this way */
+.align 8
+mb2_hdr:
+    .long 0xE85250D6, 0, mb2_end - mb2_hdr, -(0xE85250D6 + (mb2_end - mb2_hdr))
+    .align 8
+    .short 6, 0
+    .long 8
+    .align 8
+    .short 5, 0
+    .long 20
+    .long 0, 0, 32
+    .align 8
+    .short 0, 0
+    .long 8
+mb2_end:
+
 .section .boot.data, "aw"
 .align 16
 gdt64:

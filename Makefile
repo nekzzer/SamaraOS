@@ -62,6 +62,7 @@ KERN_SRC := \
     src/core/string.c \
     src/drivers/vga.c \
     src/boot/acpi.c \
+    src/boot/mb2.c \
     src/boot/apic.c \
     src/boot/gdt.c \
     src/core/smp.c \
@@ -451,6 +452,18 @@ run-iso: $(ISO)
 	$(QEMU) -cdrom $(ISO) -boot d -m 256 -vga std -serial stdio $(AUDIO) \
 	    -drive file=fat:$(MUSIC_DIR),format=raw,if=ide,index=3,snapshot=on $(NET_DRIVE)
 
+# same iso through OVMF (uefi): grub-efi -> multiboot2, framebuffer from gop.
+# OVMF_VARS is a scratch copy, nvram lives there
+OVMF_CODE ?= /usr/share/qemu/edk2-x86_64-code.fd
+OVMF_VARS ?= build/ovmf-vars.fd
+$(OVMF_VARS): | build
+	cp /usr/share/qemu/edk2-i386-vars.fd $@
+
+run-uefi: $(ISO) $(OVMF_VARS)
+	$(QEMU) $(ACCEL) -smp $(SMP) -m 1024 -vga std $(QDISPLAY) -serial stdio $(USB) $(NET_DRIVE) \
+	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) -drive if=pflash,format=raw,file=$(OVMF_VARS) \
+	    -cdrom $(ISO)
+
 # Installer test: ISO + an empty 512 MB ide disk (build/hd.img), then
 # `make run-hd` boots what got installed, no CD.
 HD_IMG := build/hd.img
@@ -483,6 +496,7 @@ clean:
 	rm -rf build
 
 .PHONY: run-internet fm
+.PHONY: run-uefi
 .PHONY: all run run-doom run-sata run-debug iso run-iso run-install run-hd clean build compile_commands.json
 
 # header dependencies (gcc -MMD): editing a .h rebuilds who includes it
