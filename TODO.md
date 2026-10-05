@@ -144,3 +144,6 @@ over-engineering. Talk to the user in Russian, informally.
 - perf: page cache для .so (общие страницы файлов между процессами) не сделан, ext2 читает файл целиком в память, так что readahead не нужен
 - perf: fc-cache/xkb-каталог добавлены в build-x64root.sh, образ не пересобирали, эффект не замерен (TCG до/после xterm не мерили)
 - perf: прогреть xkb-кэш Xwayland при сборке образа (сейчас кэш появится после первого старта)
+- wl: GL via mesa swrast (es2gears_wayland / glxgears) not tried yet
+- wl: X11 PRIMARY and wl primary selection, clipboard bridge to pterm/fm, INCR for big selections
+- wl: ctrl+click xterm menu, xdg_toplevel/X11 resize and gtk3 not tested in qemu

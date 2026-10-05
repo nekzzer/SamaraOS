@@ -146,7 +146,8 @@ What X needed from the kernel: named AF_UNIX sockets with `SCM_RIGHTS`,
 toplevel is a uwin window. Wayland clients (`foot`) connect to
 `$XDG_RUNTIME_DIR/wayland-0`, X11 apps (`xterm`) go through a rootless
 Xwayland that samara-wl manages as its WM. Menu has XTerm and Foot entries.
-Known gaps: shm only, no dmabuf/GL, no clipboard, no popups positioning
+Clipboard: wl_data_device plus a bridge to X11 CLIPBOARD (UTF8_STRING, no INCR).
+Known gaps: shm only, no dmabuf/GL, no primary selection, no popups positioning
 beyond the basics.
 
 ## Kernel
