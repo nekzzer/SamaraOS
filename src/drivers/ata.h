@@ -11,7 +11,10 @@
 #define ATA_DRIVES 4                 /* legacy IDE channels */
 #define DISK_AHCI_BASE 4             /* indices 4..7: SATA disks behind AHCI */
 #define DISK_VIRTIO_BASE 8           /* 8..11: virtio-blk, /dev/vda.. */
-#define DISK_MAX 12
+#define DISK_USB_BASE 12             /* 12..15: usb mass storage */
+#define DISK_MAX 16                  /* whole disks */
+#define DISK_PART_BASE 16            /* 16..47: partitions (mbr/gpt), sda1 and friends */
+#define DISK_ALL 48
 #define ATA_DRIVE_PRIMARY_MASTER     0
 #define ATA_DRIVE_PRIMARY_SLAVE      1
 #define ATA_DRIVE_SECONDARY_MASTER   2
@@ -30,6 +33,9 @@ uint32_t ata_drive_sectors(int idx);
 int      ata_read(int idx, uint32_t lba, int count, void* buf);
 int      ata_write(int idx, uint32_t lba, int count, const void* buf);
 int      ata_primary(void);                                         /* -1 if none */
+uint32_t ata_rdev(int idx);                                         /* st_rdev for the /dev node */
+void     ata_usb_added(int i);                                      /* usb disk i is up: partitions, /dev nodes */
+void        part_scan(int disk);
 const char* ata_drive_name(int idx);                                /* "hda", "sda", ... */
 
 #endif

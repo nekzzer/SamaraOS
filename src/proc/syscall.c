@@ -265,9 +265,7 @@ static void fill_stat_node(kstat64_t* st, fs_node_t* n) {
     if (FS_DEV_IS_DISK(n->dev)) {
         int idx = n->dev - FS_DEV_DISK;
         st->st_mode = 0060000 | (n->mode & 07777);            /* S_IFBLK */
-        st->st_rdev = idx >= DISK_VIRTIO_BASE ? ((253u << 8) | (uint32_t)(idx - DISK_VIRTIO_BASE) * 16) :
-                      idx >= DISK_AHCI_BASE ? ((8u << 8) | (uint32_t)(idx - DISK_AHCI_BASE) * 16)
-                                            : ((3u << 8) | (uint32_t)idx * 64);
+        st->st_rdev = ata_rdev(idx);
         st->st_size = (int64_t)ata_drive_sectors(idx) * 512;
     } else if (n->dev == FS_DEV_SOCK) {
         st->st_mode = 0140000 | (n->mode & 07777);                 /* S_IFSOCK */
@@ -277,6 +275,7 @@ static void fill_stat_node(kstat64_t* st, fs_node_t* n) {
                       n->dev == FS_DEV_PTMX ? ((5u << 8) | 2) :
                       n->dev == FS_DEV_SNDC ? (116u << 8) : n->dev == FS_DEV_SNDP ? ((116u << 8) | 16) :
                       n->dev == FS_DEV_DRM ? (226u << 8) : n->dev == FS_DEV_DRMR ? ((226u << 8) | 128) :
+                      FS_DEV_IS_EVENT(n->dev) ? ((13u << 8) | (uint32_t)(64 + n->dev - FS_DEV_EVENT)) :
                       FS_DEV_IS_PTS(n->dev) ? ((136u << 8) | (uint32_t)(n->dev - FS_DEV_PTS)) :
                                               ((1u << 8) | n->dev);
     } else if (n->type == FS_DIR) {
@@ -311,7 +310,7 @@ static void fill_stat_file(kstat64_t* st, file_t* f) {
         st->st_mode = S_IFCHR | 0666;
         /* input: major 13, minor 64+n like /dev/input/eventN. evdev compares
            st_rdev and threw the mouse out as a duplicate of the keyboard */
-        st->st_rdev = f->type == F_SND ? (116u << 8) | (f->disk ? 16u : 0) : f->type == F_DRM ? (226u << 8) | (f->disk ? 128u : 0) : f->type == F_TTY ? (5u << 8) : f->type == F_INPUT ? (13u << 8) | (64u + (uint32_t)f->disk)
+        st->st_rdev = f->type == F_SND ? (116u << 8) | (f->disk ? 16u : 0) : f->type == F_DRM ? (226u << 8) | (f->disk ? 128u : 0) : f->type == F_TTY ? (5u << 8) : f->type == F_INPUT ? (13u << 8) | (f->disk >= 3 ? 61u + (uint32_t)f->disk : 96u + (uint32_t)f->disk)
                                                                        : (1u << 8) | 3;
     }
     st->st_atime = st->st_mtime = st->st_ctime = clock_epoch();
@@ -2511,13 +2510,15 @@ static int64_t dispatch(regs_t* r) {
             return fatfs_sync_all();
         case 165: {                                                  /* mount */
             UCHK((void*)b, 1);
+            int ext = 0;
             if (e & 32) return 0;                                    /* MS_REMOUNT */
             if (d) {
                 UCHK((void*)d, 1);
                 const char* t = (const char*)d;
                 if (!strcmp(t, "proc") || !strcmp(t, "ramfs") || !strcmp(t, "tmpfs") ||
                     !strcmp(t, "sysfs") || !strcmp(t, "devtmpfs")) return 0;
-                if (strcmp(t, "vfat") && strcmp(t, "msdos") && strcmp(t, "fat")) return -19;  /* ENODEV */
+                if (!strncmp(t, "ext", 3)) ext = 1;
+                else if (strcmp(t, "vfat") && strcmp(t, "msdos") && strcmp(t, "fat")) return -19;  /* ENODEV */
             }
             UCHK((void*)a, 1);
             fs_node_t* src = lookup(AT_FDCWD, (const char*)a, &err);
@@ -2525,6 +2526,7 @@ static int64_t dispatch(regs_t* r) {
             if (!FS_DEV_IS_DISK(src->dev)) return -15;                  /* ENOTBLK */
             fs_node_t* dst = lookup(AT_FDCWD, (const char*)b, &err);
             if (!dst) return err;
+            if (ext) { int r = ext2_mount(src->dev - FS_DEV_DISK, dst); return r < 0 ? r : 0; }
             return fatfs_mount(src->dev - FS_DEV_DISK, dst);
         }
         case 166: {                                                  /* umount2 */
