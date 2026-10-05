@@ -120,6 +120,7 @@ static uint8_t* inode_ptr(ev_t* v, uint32_t ino, uint8_t* blkbuf) {
 
 /* logical -> physical block, 0 = hole. cache the last indirect blocks */
 static uint32_t ind_blk[3], *ind_buf[3];
+static ev_t* ind_v;      // second mounted volume shares the cache, block numbers clash
 static uint32_t bmap(ev_t* v, const uint8_t* ino, uint32_t lb) {
     uint32_t flags = rd32(ino + 32);
     const uint8_t* ib = ino + 40;
@@ -154,6 +155,7 @@ static uint32_t bmap(ev_t* v, const uint8_t* ino, uint32_t lb) {
     else if ((lb -= per) < per * per) { lev = 2; top = rd32(ib + 52); idx[0] = lb / per; idx[1] = lb % per; }
     else { lb -= per * per; lev = 3; top = rd32(ib + 56); idx[0] = lb / (per * per); idx[1] = lb / per % per; idx[2] = lb % per; }
     uint32_t b = top;
+    if (ind_v != v) { ind_blk[0] = ind_blk[1] = ind_blk[2] = 0; ind_v = v; }
     for (uint32_t k = 0; k < lev && b; k++) {
         if (!ind_buf[k]) ind_buf[k] = kmalloc(4096);
         if (ind_blk[k] != b) { if (rblk(v, b, ind_buf[k]) < 0) return 0; ind_blk[k] = b; }
