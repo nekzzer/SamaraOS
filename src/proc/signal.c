@@ -42,6 +42,7 @@ typedef struct {
 #define UNBLOCKABLE (SIGBIT(9) | SIGBIT(19))
 
 bool proc_signal_deliverable(proc_t* p) {
+    if (p->pt_intr || (p->pt_isr_stop && p->pt_state)) return true;
     return (p->sig_pending & ~(p->sig_mask & ~UNBLOCKABLE)) != 0;
 }
 
@@ -74,15 +75,51 @@ static void save_context(sigcontext_t* sc, const regs_t* r, uint64_t fx, uint64_
 void proc_deliver_signal(regs_t* r, int nr, int32_t ret) {
     proc_t* p = proc_current();
     if (!p || p->state != P_ALIVE || (r->cs & 3) != 3) return;
+    if (p->pt_state == 1) return;                    /* still stopped, the scheduler parks us */
+    int sig = 0;
+    if (p->pt_isr_stop && p->pt_state == 2) {        /* tracer let us go on */
+        p->pt_isr_stop = false;
+        p->pt_state = 0;
+        if (p->pt_kind != 1) return;
+        sig = p->pt_inj;
+        if (!sig) goto suppressed;
+        goto have;
+    }
+    if (p->pt_intr) {
+        p->pt_intr = false;
+        if (!pt_stop(p, r, 5, 128, 2)) return;
+    }
     uint64_t ready = p->sig_pending & ~(p->sig_mask & ~UNBLOCKABLE);
     if (!ready) return;
-    int sig = 1;
+    sig = 1;
     while (!(ready & SIGBIT(sig))) sig++;
     p->sig_pending &= ~SIGBIT(sig);
-
+    if (p->tracer) {
+        uint32_t* si = (uint32_t*)p->pt_si;
+        memset(si, 0, 128);
+        si[0] = (uint32_t)sig;
+        if (sig == 5 && p->fault_sig == 5) si[2] = p->fault_trap == 3 ? 0x80 : (p->dr[6] & 15) ? 4 : 2;
+        else if (sig == p->fault_sig) si[2] = p->fault_trap == 14 ? ((p->fault_err & 1) ? 2 : 1) : 1;
+        if (sig == p->fault_sig && p->fault_trap == 14) *(uint64_t*)(si + 4) = p->fault_addr;
+        p->pt_sival = true;
+        p->pt_orig = nr >= 0 ? (uint64_t)nr : (uint64_t)-1;
+        if (!pt_stop(p, r, sig, 0, 1)) return;
+        sig = p->pt_inj;
+        if (!sig) goto suppressed;
+    }
+have:;
     uint64_t handler = p->sh->sa[sig].handler;
+    if (handler == 1) return;
+    if (handler == 0) {                              /* default action, only gets here when traced or stopping */
+        if (sig == 19) {
+            if (!p->tracer) pt_stop(p, r, 19, 0, 3);
+            return;
+        }
+        if (sig == 17 || sig == 18 || sig == 23 || sig == 28 || (sig >= 20 && sig <= 22)) return;
+        p->fault_sig = 0;
+        proc_exit(sig & 0x7F);
+    }
     uint32_t flags = p->sh->sa[sig].flags;
-    if (handler <= 1) return;                        /* reset to DFL/IGN meanwhile */
 
     /* Interrupted syscall: restart it transparently, or report EINTR. */
     if (nr >= 0 && ret == -EINTR && (flags & SA_RESTART) && nr != 130 && nr != 34) {
@@ -135,6 +172,13 @@ void proc_deliver_signal(regs_t* r, int nr, int32_t ret) {
     r->rax = 0;
     r->rflags &= ~0x400ul;                           /* DF=0 on entry per ABI */
     r->cs = GDT_UCODE; r->ss = GDT_UDATA;
+    return;
+
+suppressed:                                          /* the tracer ate the signal: a sleeping syscall goes on */
+    if (nr >= 0 && ret == -EINTR && nr != 130 && nr != 34) {
+        r->rax = (uint64_t)nr;
+        r->rip -= 2;
+    }
 }
 
 /* hotspot lives on this: implicit null checks, safepoint polls and stack
@@ -143,6 +187,14 @@ void proc_deliver_signal(regs_t* r, int nr, int32_t ret) {
 bool proc_fault_signal(regs_t* r, int sig, uint64_t trap, uint64_t err, uint64_t addr) {
     proc_t* p = proc_current();
     if (!p || p->state != P_ALIVE) return false;
+    if (p->tracer) {                                 /* delivery-stop first, the tracer decides */
+        p->fault_sig = sig; p->fault_trap = trap; p->fault_err = err; p->fault_addr = addr;
+        p->sig_pending |= SIGBIT(sig);
+        p->sig_mask &= ~SIGBIT(sig);
+        proc_deliver_signal(r, -1, 0);
+        p->fault_sig = 0;
+        return true;
+    }
     if (p->sh->sa[sig].handler <= 1 || (p->sig_mask & SIGBIT(sig))) return false;   /* DFL/IGN/blocked: die */
     p->fault_sig = sig; p->fault_trap = trap; p->fault_err = err; p->fault_addr = addr;
     uint64_t other = p->sig_pending;                 /* this one first, the rest stays queued */

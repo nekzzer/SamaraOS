@@ -100,6 +100,7 @@ static void dump(const char* tag, uint64_t err, uint64_t rip,
 /* #PF #GP #UD #DE #DF come here with a full frame, so a ring 3 fault can
    become a signal with a context the handler may edit - java needs that */
 extern void longjmp(void* env, int val) __attribute__((noreturn));
+extern void pt_trap(regs_t* r);
 static void fault_c(regs_t* r) {
     uint64_t vec = r->vec, err = r->err, cr2 = 0;
     if (vec == 14) {
@@ -150,6 +151,9 @@ void paging_init(uint64_t ram_top) {
     idt_set_handler(8, fault_c);
     idt_set_handler(13, fault_c);
     idt_set_handler(14, fault_c);
+    idt_set_handler(1, pt_trap);
+    idt_set_handler(3, pt_trap);
+    idt_set_dpl(3, 3);
 }
 
 uint64_t paging_cr0(void) { uint64_t r; __asm__ volatile ("mov %%cr0, %0":"=r"(r)); return r; }

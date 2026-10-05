@@ -2306,11 +2306,17 @@ static int64_t dispatch(regs_t* r) {
     int err;
     fs_node_t* n;
     switch (r->rax) {
-        case 60:  proc_thread_exit((int)((a & 0xFF) << 8));
-        case 231: proc_exit((int)((a & 0xFF) << 8));
-        case 57:  return proc_fork(r);
-        case 58:  return proc_vfork(r);
-        case 56:  return proc_clone(r);
+        case 60:  pt_exit_event(p, (int)((a & 0xFF) << 8)); proc_thread_exit((int)((a & 0xFF) << 8));
+        case 231: pt_exit_event(p, (int)((a & 0xFF) << 8)); proc_exit((int)((a & 0xFF) << 8));
+        case 57: case 58: case 56: {
+            int64_t ret = r->rax == 57 ? proc_fork(r) : r->rax == 58 ? proc_vfork(r) : proc_clone(r);
+            if (ret > 0 && p->tracer) {
+                int ev = r->rax == 57 ? 1 : r->rax == 58 ? 2 : (a & 0x10000) ? 3 : 1;
+                int fl = ev == 1 ? 2 : ev == 2 ? 4 : 8;
+                if (p->pt_opts & fl) { r->rax = (uint64_t)ret; pt_event(p, r, ev, (uint64_t)ret); }
+            }
+            return ret;
+        }
         case 0:   return do_read((int)a, (char*)b, c);
         case 1:   return do_write((int)a, (const char*)b, c);
         case 19:  return do_rwv((int)a, (iovec_t*)b, (int)c, false);
@@ -2371,7 +2377,9 @@ static int64_t dispatch(regs_t* r) {
             UCHK((void*)a, 1);
             if (b) UCHK((void*)b, 8);
             if (c) UCHK((void*)c, 8);
-            return proc_execve(r, (const char*)a, (char* const*)b, (char* const*)c);
+            int ret = proc_execve(r, (const char*)a, (char* const*)b, (char* const*)c);
+            if (ret >= 0 && p->tracer) pt_exec(p, r);
+            return ret;
         }
         case 80:
             UCHK((void*)a, 1);
@@ -2834,7 +2842,8 @@ static int64_t dispatch(regs_t* r) {
         case 48:  return sys_socket_call(13, a, b, 0, 0, 0, 0);       /* shutdown */
         case 40:  return do_copy((int)b, (uint64_t*)c, (int)a, NULL, d);
         case 326: return do_copy((int)a, (uint64_t*)b, (int)c, (uint64_t*)d, e);
-        case 101: case 103: return -EPERM;
+        case 101: return sys_ptrace(a, b, c, d);
+        case 103: return -EPERM;
         case 425: return uring_setup(a, (void*)b);
         case 426: return uring_enter((int)a, b, c, d, (const void*)e, f6);
         case 427: return uring_register((int)a, b, (void*)c, d);
@@ -2986,6 +2995,11 @@ static bool changes_fs(uint64_t nr, uint64_t a) {
 }
 
 void syscall_dispatch(regs_t* r) {
+    proc_t* tp = proc_current();
+    if (tp && tp->tracer) {
+        tp->pt_orig = r->rax;
+        if (tp->pt_sys) { pt_syscall_stop(tp, r, false); tp->pt_orig = r->rax; }
+    }
     uint64_t nr = r->rax;
     proc_check_alarm(proc_current(), false);
     bool mut = changes_fs(nr, r->rdi);
@@ -3050,6 +3064,10 @@ void syscall_dispatch(regs_t* r) {
     /* execve and sigreturn have already installed the registers to return with. */
     bool keep = (nr == 59 && ret >= 0) || (nr == 15 && ret == 0);
     if (!keep) r->rax = (uint64_t)ret;
+    if (tp && tp->tracer && tp->pt_sys && tp == proc_current()) {
+        pt_syscall_stop(tp, r, true);
+        if (!keep) ret = (int64_t)r->rax;
+    }
     proc_deliver_signal(r, keep ? -1 : (int)nr, keep ? 0 : (int32_t)ret);
 }
 
@@ -3060,7 +3078,7 @@ uint8_t nobkl_tab[512];
 int64_t syscall_nobkl(regs_t* r) {
     uint64_t nr = r->rax, a = r->rdi, b = r->rsi, c = r->rdx;
     proc_t* p = proc_current();
-    if (!p || g_strace || g_ftrace || p->alarm_at) return NB_SLOW;
+    if (!p || g_strace || g_ftrace || p->alarm_at || p->tracer) return NB_SLOW;
     int64_t ret;
     if (setjmp((void*)p->ujb)) {
         proc_current()->ujb_on = false;

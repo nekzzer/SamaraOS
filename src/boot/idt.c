@@ -117,6 +117,10 @@ void isr_leave(regs_t* f) {
         __atomic_store_n(&c->prev->on_cpu, 0, __ATOMIC_RELEASE);
         c->prev = NULL;
     }
+    if (c->prev2) {
+        __atomic_store_n(&c->prev2->on_cpu, 0, __ATOMIC_RELEASE);
+        c->prev2 = NULL;
+    }
     if (c->bkl && ((f->cs & 3) || (c->idle && c->cur == c->idle) || c->cur->nobkl)) bkl_drop(c);
 }
 
