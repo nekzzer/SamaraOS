@@ -96,6 +96,11 @@ file_t* file_open_node(fs_node_t* n, int flags) {
         if (me && me->ctty > 0) return open_pty_slave(me->ctty - 1, flags | 0x100);
         if (me && me->ctty < 0) return NULL;                  /* no terminal (setsid, daemons) */
     }
+    if (n->dev == FS_DEV_PMEM) {
+        file_t* f = file_new(F_PMEM, flags);
+        if (f) f->cnt = atoi(n->parent->name) ? atoi(n->parent->name) : proc_current()->pid;
+        return f;
+    }
     if (FS_DEV_IS_DISK(n->dev)) {
         file_t* f = file_new(F_DISK, flags);
         if (f) f->disk = n->dev - FS_DEV_DISK;
@@ -272,6 +277,28 @@ uint32_t file_disk_size(file_t* f) {
     return s >= 0x800000u ? 0xFFFFFE00u : s * 512;           /* clamp to 4 GiB */
 }
 
+/* /proc/<pid>/mem: pread/pwrite at a user address of the other process */
+int pt_mem_read(struct proc* p, uint64_t va, void* dst, uint64_t len);
+int pt_mem_write(struct proc* p, uint64_t va, const void* src, uint64_t len);
+static uint32_t pmem_chunk(uint64_t off, uint32_t k) { uint32_t in = 4096 - (off & 4095); return k > in ? in : k; }
+static int pmem_rw(file_t* f, char* buf, uint32_t n, bool write) {
+    proc_t* q = proc_by_pid((int)f->cnt);
+    if (!q || q->state != P_ALIVE) return 0;
+    static uint8_t tmp[4096];
+    uint32_t done = 0;
+    while (done < n) {
+        uint32_t k = n - done > 4096 ? 4096 : n - done;
+        k = pmem_chunk(f->off, k);
+        int r;
+        if (write) { memcpy(tmp, buf + done, k); r = pt_mem_write(q, f->off, tmp, k); }
+        else { r = pt_mem_read(q, f->off, tmp, k); if (!r) memcpy(buf + done, tmp, k); }
+        if (r) break;
+        done += k;
+        f->off += k;
+    }
+    return done || !n ? (int)done : -5;
+}
+
 /* Byte-granular access through a one-sector bounce buffer. */
 static int disk_rw(file_t* f, char* buf, uint32_t n, bool write) {
     uint32_t size = file_disk_size(f);
@@ -340,6 +367,7 @@ bool file_readable(file_t* f) {
         case F_INPUT:  return input_pending(f->disk);
         case F_DRM:    return drm_readable(f->drm);
         case F_SND:    return false;
+        case F_PIDFD: { proc_t* q = proc_by_pid((int)f->cnt); return !q || q->state != P_ALIVE; }
         case F_PTM:    return pty_readable(f->pty, true);
         case F_PTS:    return pty_readable(f->pty, false);
         default:       return true;
@@ -471,7 +499,7 @@ void efd_wake(void) {
 
 int file_read(file_t* f, char* buf, uint32_t n) {
     switch (f->type) {
-        case F_URING: return -22;
+        case F_URING: case F_PIDFD: return -22;
         case F_INOTIFY: return ino_read(f, buf, n);
         case F_NULL: case F_NETLINK: case F_USOCK: case F_ULISTEN: case F_EPOLL: return 0;   // netlink goes through recv
         case F_EVENTFD: case F_TIMERFD: {               /* both hand out a u64 */
@@ -524,6 +552,7 @@ int file_read(file_t* f, char* buf, uint32_t n) {
         case F_PTM: case F_PTS:
             return pty_read(f->pty, f->type == F_PTM, buf, (int)n, (f->flags & O_NONBLOCK) != 0);
         case F_DISK: return disk_rw(f, buf, n, false);
+        case F_PMEM: return pmem_rw(f, buf, n, false);
         case F_FB: case F_SND: return -EBADF;
         case F_DRM:
             while (!drm_readable(f->drm)) {
@@ -569,13 +598,14 @@ int file_write(file_t* f, const char* buf, uint32_t n) {
             wq_wake(&f->wq);
             return 8;
         }
-        case F_TIMERFD: case F_SIGNALFD: case F_INOTIFY: return -22;
+        case F_TIMERFD: case F_SIGNALFD: case F_INOTIFY: case F_PIDFD: return -22;
         case F_USOCK: case F_ULISTEN: return -107;   /* ENOTCONN */
         case F_EPOLL: case F_URING: return -22;
         case F_TTY:  return tty_write(buf, (int)n);
         case F_PTM: case F_PTS:
             return pty_write(f->pty, f->type == F_PTM, buf, (int)n, (f->flags & O_NONBLOCK) != 0);
         case F_DISK: return disk_rw(f, (char*)buf, n, true);
+        case F_PMEM: return pmem_rw(f, (char*)buf, n, true);
         case F_SND: return -EBADF;                    /* ioctl only */
         case F_INPUT: return (int)n;                  /* LED events from xorg: nothing to light */
         case F_FB: {

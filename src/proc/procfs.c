@@ -196,6 +196,7 @@ static void fill_pid_dir(fs_node_t* d, proc_t* p, char* mem, uint32_t cap) {
     sb_puts(&b, " rw-p 00000000 00:00 0          [stack]\n");
 #undef HX
     put(d, "maps", &b);
+    { fs_node_t* m = ensure(d, "mem", FS_FILE, 0600); if (m) m->dev = FS_DEV_PMEM; }
 
     /* task/<tid>/ for every thread of the group, htop reads the main one from there */
     if (strcmp(d->parent->name, "task")) {

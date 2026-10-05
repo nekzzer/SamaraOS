@@ -430,6 +430,9 @@ static int do_write(int fd, const char* buf, uint64_t n) {
 }
 
 typedef struct { uint64_t base, len; } iovec_t;
+int pt_mem_read(proc_t* p, uint64_t va, void* dst, uint64_t len);
+int pt_mem_write(proc_t* p, uint64_t va, const void* src, uint64_t len);
+int sys_close(int fd);
 
 static int do_rwv(int fd, iovec_t* iov, int cnt, bool wr) {
     if (cnt < 0 || cnt > 1024) return -EINVAL;
@@ -456,6 +459,7 @@ static int64_t do_lseek(int fd, int64_t off, int whence) {
         f->off = (uint64_t)(base + off);
         return base + off;
     }
+    if (f->type == F_PMEM) { f->off = whence == 1 ? (int64_t)f->off + off : off; return f->off; }
     if (f->type != F_NODE && f->type != F_DISK) return f->type == F_NULL || f->type == F_ZERO ? 0 : -ESPIPE;
     uint32_t end = f->type == F_DISK ? file_disk_size(f) : f->node->size;
     int64_t base = whence == 0 ? 0 : whence == 1 ? (int64_t)f->off :
@@ -2436,7 +2440,7 @@ static int64_t dispatch(regs_t* r) {
         case 17: case 18: {                                          /* pread64/pwrite64 */
             file_t* fl = getf((int)a);
             if (!fl) return -EBADF;
-            if (fl->type != F_NODE) return -ESPIPE;
+            if (fl->type != F_NODE && fl->type != F_PMEM) return -ESPIPE;
             uint64_t save = fl->off;
             fl->off = d;
             int res = r->rax == 17 ? do_read((int)a, (char*)b, c) : do_write((int)a, (const char*)b, c);
@@ -2895,8 +2899,84 @@ static int64_t dispatch(regs_t* r) {
             f->cnt = m;
             return install_fd(f, 0, (fl & 02000000) != 0);
         }
-        case 324: case 334: case 435:
-            return -ENOSYS;
+        case 324: case 334: case 435: case 428: case 429: case 430: case 431: case 432: case 433: case 442:
+            return -ENOSYS;                                          /* membarrier, rseq, clone3, new mount api: quiet */
+        case 434: {                                                  /* pidfd_open */
+            proc_t* q = proc_by_pid((int)a);
+            if (!q || q->state != P_ALIVE || b) return q ? -EINVAL : -ESRCH;
+            file_t* f = file_new(F_PIDFD, 0);
+            if (!f) return -ENOMEM;
+            f->cnt = q->pid;
+            return install_fd(f, 0, true);
+        }
+        case 424: {                                                  /* pidfd_send_signal */
+            file_t* f = getf((int)a);
+            if (!f) return -EBADF;
+            if (f->type != F_PIDFD) return -EINVAL;
+            proc_t* q = proc_by_pid((int)f->cnt);
+            if (!q || q->state != P_ALIVE) return -ESRCH;
+            if (b >= NSIG_MAX) return -EINVAL;
+            return proc_send_signal(q, (int)b);
+        }
+        case 438: {                                                  /* pidfd_getfd */
+            file_t* f = getf((int)a);
+            if (!f) return -EBADF;
+            if (f->type != F_PIDFD) return -EINVAL;
+            proc_t* q = proc_by_pid((int)f->cnt);
+            if (!q || q->state != P_ALIVE) return -ESRCH;
+            if (b >= MAX_FDS || !q->sh->fds[b]) return -EBADF;
+            file_ref(q->sh->fds[b]);
+            return install_fd(q->sh->fds[b], 0, true);
+        }
+        case 27: {                                                   /* mincore: all resident, whatever */
+            if (a & (PAGE_SIZE - 1)) return -EINVAL;
+            uint64_t np = (b + PAGE_SIZE - 1) / PAGE_SIZE;
+            UCHK((void*)c, np);
+            memset((void*)c, 1, np);
+            return 0;
+        }
+        case 436: {                                                  /* close_range */
+            if (a > b || c & ~6ull) return -EINVAL;
+            if (b >= MAX_FDS) b = MAX_FDS - 1;
+            for (uint64_t i = a; i <= b; i++) {
+                if (!getf((int)i)) continue;
+                if (c & 4) p->sh->cloexec[i] = 1;                    /* CLOSE_RANGE_CLOEXEC */
+                else sys_close((int)i);
+            }
+            return 0;
+        }
+        case 441: return do_epoll_wait((int)a, (uint32_t*)b, (int)c, timeout_ms(d, 1000000));
+        case 310: case 311: {                                        /* process_vm_readv / writev */
+            proc_t* q = proc_by_pid((int)a);
+            if (!q || q->state != P_ALIVE) return -ESRCH;
+            if (e > 1024 || c > 1024) return -EINVAL;
+            UCHK((void*)b, c * 16);
+            UCHK((void*)d, e * 16);
+            iovec_t* li = (iovec_t*)b;
+            iovec_t* ri = (iovec_t*)d;
+            uint64_t lo = 0, ro = 0, tot = 0;
+            uint32_t lk = 0, rk = 0;
+            static uint8_t pvb[4096];
+            while (lk < c && rk < e) {
+                uint64_t n2 = li[lk].len - lo;
+                if (ri[rk].len - ro < n2) n2 = ri[rk].len - ro;
+                if (n2 > sizeof(pvb)) n2 = sizeof(pvb);
+                if (n2) {
+                    UCHK((void*)(li[lk].base + lo), n2);
+                    if (r->rax == 310) {
+                        if (pt_mem_read(q, ri[rk].base + ro, pvb, n2)) return tot ? (int64_t)tot : -EFAULT;
+                        memcpy((void*)(li[lk].base + lo), pvb, n2);
+                    } else {
+                        memcpy(pvb, (void*)(li[lk].base + lo), n2);
+                        if (pt_mem_write(q, ri[rk].base + ro, pvb, n2)) return tot ? (int64_t)tot : -EFAULT;
+                    }
+                    tot += n2; lo += n2; ro += n2;
+                }
+                if (lo >= li[lk].len) { lk++; lo = 0; }
+                if (ro >= ri[rk].len) { rk++; ro = 0; }
+            }
+            return (int64_t)tot;
+        }
         case 253: case 294: {                                        /* inotify_init(1) */
             file_t* f = ino_new(r->rax == 294 ? (int)a : 0);
             if (!f) return -ENOMEM;
