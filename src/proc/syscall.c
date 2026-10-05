@@ -22,6 +22,7 @@
 #include "boot/gdt.h"
 #include "boot/pit.h"
 #include "drivers/ata.h"
+#include "fs/part.h"
 #include "net/sock.h"
 #include "fs/fatfs.h"
 #include "fs/ext2.h"
@@ -312,7 +313,11 @@ static void fill_stat_file(kstat64_t* st, file_t* f) {
     st->st_blksize = 4096;
     if (f->type == F_PIPE_R || f->type == F_PIPE_W) st->st_mode = S_IFIFO | 0600;
     else if (f->type == F_SOCKET || f->type == F_SPAIR || f->type == F_NETLINK || f->type == F_USOCK || f->type == F_ULISTEN) st->st_mode = 0140000 | 0777;          /* S_IFSOCK */
-    else {
+    else if (f->type == F_DISK) {
+        st->st_mode = 0060660;
+        st->st_rdev = (uint32_t)ata_rdev(f->disk);
+        st->st_size = (int64_t)ata_drive_sectors(f->disk) * 512;
+    } else {
         st->st_mode = S_IFCHR | 0666;
         /* input: major 13, minor 64+n like /dev/input/eventN. evdev compares
            st_rdev and threw the mouse out as a duplicate of the keyboard */
@@ -793,10 +798,20 @@ static int do_ioctl(int fd, uint32_t req, uint64_t arg) {
         return -ENOTTY;
     }
     if (f->type == F_DISK) {
-        if (req == 0x1260) {                                  /* BLKGETSIZE (sectors) */
-            UCHK((void*)arg, 4); *(uint32_t*)arg = ata_drive_sectors(f->disk); return 0;
+        if (req == 0x125F) {                                  /* BLKRRPART, installer wrote a new table */
+            if (f->disk >= DISK_PART_BASE) return -EINVAL;
+            ata_part_clear(f->disk);
+            part_scan(f->disk);
+            fs_add_disk_nodes();
+            return 0;
         }
-        if (req == 0x80041272) {                              /* BLKGETSIZE64 */
+        if (req == 0x1260) {                                  /* BLKGETSIZE (sectors) */
+            UCHK((void*)arg, 8); *(uint64_t*)arg = ata_drive_sectors(f->disk); return 0;      // unsigned long
+        }
+        if (req == 0x125E || req == 0x1261) return 0;         /* BLKROGET, BLKFLSBUF */
+        if (req == 0x127B) { UCHK((void*)arg, 4); *(int*)arg = 512; return 0; }   /* BLKPBSZGET */
+        if (req == 0x1278 || req == 0x1279 || req == 0x127A) { UCHK((void*)arg, 4); *(int*)arg = 0; return 0; }   /* io min/opt, align */
+        if (req == 0x80041272 || req == 0x80081272) {                              /* BLKGETSIZE64 */
             UCHK((void*)arg, 8);
             uint64_t b = (uint64_t)ata_drive_sectors(f->disk) * 512;
             memcpy((void*)arg, &b, 8);
@@ -2443,7 +2458,7 @@ static int64_t dispatch(regs_t* r) {
         case 17: case 18: {                                          /* pread64/pwrite64 */
             file_t* fl = getf((int)a);
             if (!fl) return -EBADF;
-            if (fl->type != F_NODE) return -ESPIPE;
+            if (fl->type != F_NODE && fl->type != F_DISK) return -ESPIPE;
             uint64_t save = fl->off;
             fl->off = d;
             int res = r->rax == 17 ? do_read((int)a, (char*)b, c) : do_write((int)a, (const char*)b, c);
@@ -2455,7 +2470,7 @@ static int64_t dispatch(regs_t* r) {
             if (!fl) return -EBADF;
             bool w = r->rax == 296 || r->rax == 328;
             if (r->rax > 300 && (int64_t)d == -1) return do_rwv((int)a, (iovec_t*)b, (int)c, w);
-            if (fl->type != F_NODE) return -ESPIPE;
+            if (fl->type != F_NODE && fl->type != F_DISK) return -ESPIPE;
             uint64_t save = fl->off;
             fl->off = d;
             int64_t res = do_rwv((int)a, (iovec_t*)b, (int)c, w);
