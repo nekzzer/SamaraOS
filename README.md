@@ -35,7 +35,7 @@ xsamara        # X11 + Mesa, once the X packages are in (see "X11")
   rebuild its own kernel
 * FAT32 and ext2 with write support, ext3/ext4 read only, virtio-blk disks
 * any number of terminal windows, stacked into one taskbar button
-* USB mouse (UHCI), SoundBlaster 16, Intel HDA (ALSA uapi on /dev/snd, alsa-lib works)
+* USB (UHCI mouse, xHCI keyboard/mouse/tablet/storage), virtio-input, MBR/GPT partitions, evdev eventN, SoundBlaster 16, Intel HDA (ALSA uapi on /dev/snd, alsa-lib works)
 * DOOM, Tetris, Snake, Breakout, Paint, a music player
 
 ## Quick start
@@ -210,7 +210,7 @@ the disk.
 
 * PS/2 keyboard with EN and RU layouts (Alt+Shift to switch)
 * PS/2 mouse with scroll wheel
-* USB: UHCI host controller (polled) with a USB HID mouse
+* USB: xHCI (polled, qemu-xhci) with HID keyboard/mouse/tablet and bulk-only mass storage (/dev/sdX, sdX1), UHCI with a HID mouse; virtio-input; /dev/input/eventN
 * VGA text mode, VBE framebuffer up to 1920x1080x32, `/dev/fb0`
 * ATA PIO, AHCI (SATA with DMA), virtio-blk
 * network: RTL8139, Intel e1000 (82540EM, 82545EM, 82574L), virtio-net
@@ -432,7 +432,7 @@ Pass them with `make run APPEND="..."`.
 |---|---|
 | `src/boot` | GDT, IDT, paging, FPU and SSE, PIC, PIT |
 | `src/core` | `kmain`, heap, tasks, vmm, strings |
-| `src/drivers` | keyboard, mouse, USB (UHCI), VGA, ATA, AHCI, PCI, RTL8139, e1000, virtio, SB16, HDA + ALSA (snd.c), fbdev, input |
+| `src/drivers` | keyboard, mouse, USB (xHCI, UHCI, HID, storage), partitions, VGA, ATA, AHCI, PCI, RTL8139, e1000, virtio, SB16, HDA + ALSA (snd.c), fbdev, input |
 | `src/fs` | ramfs, FAT12/16, FAT32, ext2 |
 | `src/proc` | processes, threads, syscalls, signals, tty, pty, procfs, ELF loader |
 | `src/net` | TCP/IP stack, DHCP, sockets |
