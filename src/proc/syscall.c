@@ -97,6 +97,7 @@ static bool uok(const void* p, uint64_t len) {
     return true;
 }
 bool user_ok(const void* p, uint32_t len) { return uok(p, len); }
+#define UCHK2(p, n) do { if (!uok((p), (n))) { proc_current()->ujb_on = false; return -EFAULT; } } while (0)
 #define UCHK(p, n) do { if (!uok((p), (n))) return -EFAULT; } while (0)
 
 /* user string: walk it page by page till the NUL */
@@ -2833,6 +2834,65 @@ void syscall_dispatch(regs_t* r) {
     proc_deliver_signal(r, keep ? -1 : (int)nr, keep ? 0 : (int32_t)ret);
 }
 
+/* syscalls that run without the big lock (see syscall_enter). everything in here
+   must be fine with other cpus running in the kernel at the same time */
+uint8_t nobkl_tab[512];
+
+int64_t syscall_nobkl(regs_t* r) {
+    uint64_t nr = r->rax, a = r->rdi, b = r->rsi, c = r->rdx;
+    proc_t* p = proc_current();
+    if (!p || g_strace || g_ftrace || p->alarm_at) return NB_SLOW;
+    int64_t ret;
+    if (setjmp((void*)p->ujb)) {
+        proc_current()->ujb_on = false;
+        return -EFAULT;
+    }
+    p->ujb_on = true;
+    switch (nr) {
+        case 39: ret = p->tgid; break;
+        case 186: ret = p->pid; break;
+        case 102: case 104: case 107: case 108: ret = 0; break;
+        case 96:
+            ret = 0;
+            if (a) {
+                UCHK2((void*)a, 16);
+                uint32_t s, ns; clock_now(&s, &ns);
+                ((int64_t*)a)[0] = s; ((int64_t*)a)[1] = ns / 1000;
+            }
+            if (b) { UCHK2((void*)b, 8); memset((void*)b, 0, 8); }
+            break;
+        case 228: ret = do_clock_gettime((int)a, (int64_t*)b); break;
+        case 229:
+            if (b) { UCHK2((void*)b, 16); memset((void*)b, 0, 16); ((int64_t*)b)[1] = 1000000; }
+            ret = 0;
+            break;
+        case 24: task_yield_fast(); ret = 0; break;
+        case 35: case 230: {
+            const int64_t* ts = (const int64_t*)(nr == 35 ? a : c);
+            UCHK2(ts, 16);
+            uint32_t ms;
+            if (nr == 230 && (b & 1)) {
+                uint32_t s, ns; clock_now(&s, &ns);
+                ms = ts[0] > s ? (ts[0] - s) * 1000 : 0;
+            } else ms = ts[0] * 1000 + ts[1] / 1000000;
+            uint32_t end = pit_uptime_ms() + ms;
+            ret = 0;
+            while ((int32_t)(pit_uptime_ms() - end) < 0) {
+                if (proc_signal_deliverable(p)) { ret = -EINTR; break; }
+                uint32_t left = end - pit_uptime_ms();
+                task_sleep_ms(left > 20 ? 20 : left);
+            }
+            break;
+        }
+        case 202: ret = do_futex(a, (uint32_t)b, (uint32_t)c, r->r10, r->r8, (uint32_t)r->r9); break;
+        default: ret = NB_SLOW;
+    }
+    proc_current()->ujb_on = false;
+    return ret;
+}
+
 void syscall_init(void) {
     fs_free_hook = shm_drop;
+    static const uint16_t nb[] = { 39, 186, 102, 104, 107, 108, 96, 228, 229, 24, 35, 230, 202 };
+    for (unsigned i = 0; i < sizeof(nb) / sizeof(nb[0]); i++) nobkl_tab[nb[i]] = 1;
 }

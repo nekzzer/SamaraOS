@@ -7,6 +7,7 @@
 #include "boot/gdt.h"
 #include "drivers/vga.h"
 #include "proc/proc.h"
+#include "core/vmm.h"
 
 struct idt_entry {
     uint16_t off_lo;
@@ -72,6 +73,14 @@ static void exc_default(regs_t* f) {
     for (;;) __asm__ volatile ("hlt");
 }
 
+extern bool proc_handle_fault(uint64_t addr, uint64_t err);
+static bool pf_fast(regs_t* r) {
+    uint64_t cr2;
+    __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+    if (cr2 < USER_BASE || cr2 >= USER_TOP || !this_cpu()->cur->proc) return false;
+    return proc_handle_fault(cr2, r->err);
+}
+
 int last_vec;
 regs_t* isr_dispatch(regs_t* r) {
     int v = (int)r->vec;
@@ -83,6 +92,10 @@ regs_t* isr_dispatch(regs_t* r) {
         return r;
     }
     if (v == VEC_SPUR) return r;
+    if (v == 14 && !c->bkl && pf_fast(r)) {          // anon / cow faults need no bkl, mm lock is enough
+        if ((r->cs & 3) && c->cur->state == T_DEAD) { bkl_take(c); r = task_reap(r); }
+        return r;
+    }
     if (!c->bkl) bkl_take(c);
     if (v != 14) last_vec = v;
     if (sched_h[v]) return sched_h[v](r);
@@ -101,7 +114,7 @@ void isr_leave(regs_t* f) {
         __atomic_store_n(&c->prev->on_cpu, 0, __ATOMIC_RELEASE);
         c->prev = NULL;
     }
-    if (c->bkl && ((f->cs & 3) || (c->idle && c->cur == c->idle))) bkl_drop(c);
+    if (c->bkl && ((f->cs & 3) || (c->idle && c->cur == c->idle) || c->cur->nobkl)) bkl_drop(c);
 }
 
 void idt_init(void) {
