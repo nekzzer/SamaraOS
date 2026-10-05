@@ -378,6 +378,14 @@ static void orphan(ev_t* v, uint32_t ino, int depth) {
     kfree(d);
 }
 
+/* boot made /bin, void has /bin -> usr/bin: the boot dir goes away */
+static void drop(fs_node_t* n) {
+    while (n->child) { fs_node_t* c = n->child; drop(c); }
+    fs_detach(n);
+    fs_data_free(n);
+    kfree(n);
+}
+
 static int load_dir(ev_t* v, fs_node_t* dir, uint32_t dino, int depth) {
     static uint8_t ib[4096];
     uint8_t raw[256];
@@ -413,6 +421,7 @@ static int load_dir(ev_t* v, fs_node_t* dir, uint32_t dino, int depth) {
            the disk wins, except over mounts, devices and type clashes */
         fs_node_t* old = fs_child(dir, name);
         if (old && (old->mount_id || old->dev)) { orphan(v, ino, depth + 1); continue; }
+        if (old && old->type == FS_DIR && (mode & 0xF000) == 0xA000 && dir == fs_root()) { drop(old); old = NULL; }
         fs_node_t* n = NULL;
         uint8_t ty = 0;
         uint32_t want = (mode & 0xF000) == 0x4000 ? FS_DIR : (mode & 0xF000) == 0x8000 ? FS_FILE : (mode & 0xF000) == 0xA000 ? FS_LINK : 0;
