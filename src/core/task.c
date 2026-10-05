@@ -172,14 +172,47 @@ int task_spawn_frame(const char* name, uint8_t* stack, uint32_t stack_size,
     return r;
 }
 
-/* next ready task after the one this cpu took last, nobody else may be on it */
+static const uint32_t nice_w[40] = {
+    88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916,
+    9548, 7620, 6100, 4904, 3906, 3121, 2501, 1991, 1586, 1277,
+    1024, 820, 655, 526, 423, 335, 272, 215, 172, 137,
+    110, 87, 70, 56, 45, 36, 29, 23, 18, 15 };
+
+void task_set_sched(int id, int policy, int rtprio, int nice) {
+    if (id < 0 || id >= MAX_TASKS) return;
+    task_t* t = &tasks[id];
+    if (nice < -20) nice = -20;
+    if (nice > 19) nice = 19;
+    t->policy = policy;
+    t->rtprio = (policy == 1 || policy == 2) ? rtprio : 0;
+    t->weight = policy == 5 ? 3 : nice_w[nice + 20];
+}
+
+// is a better to run than b. rt first, then least virtual runtime
+static int better(task_t* a, task_t* b) {
+    if (a->rtprio != b->rtprio) return a->rtprio > b->rtprio;
+    return a->vrt < b->vrt;
+}
+
+static uint64_t vmin;
+
+/* best ready task, nobody else may be on it. ties go round-robin from where this cpu stopped */
 static task_t* pick(struct cpu* c) {
+    task_t* best = NULL;
+    int bi = 0;
     for (int i = 1; i <= n_tasks; i++) {
         int idx = (c->rr + i) % n_tasks;
         task_t* t = &tasks[idx];
-        if (t->state == T_READY && !t->on_cpu) { c->rr = idx; return t; }
+        if (t->state != T_READY || t->on_cpu) continue;
+        if (!best || better(t, best)) { best = t; bi = idx; }
     }
-    return NULL;
+    if (best) {
+        c->rr = bi;
+        // slept for ages: don't let it hog the cpu until it catches up
+        if (best->vrt + 30000 < vmin) best->vrt = vmin - 30000;
+        if (best->vrt > vmin) vmin = best->vrt;
+    }
+    return best;
 }
 
 static regs_t* switch_to(struct cpu* c, task_t* next, regs_t* saved) {
@@ -245,6 +278,7 @@ static regs_t* schedule(regs_t* saved) {
 
     task_t* cur = c->cur;
     cur->ticks++;
+    if (cur != c->idle) cur->vrt += 1048576 / (cur->weight ? cur->weight : 1024);
     {
         static uint32_t wake_done;
         uint32_t now = pit_uptime_ms();
@@ -279,6 +313,11 @@ static regs_t* schedule(regs_t* saved) {
     } else if (cur->state != T_READY || ++c->slice >= 10) {
         c->slice = 0;
         task_t* n = pick(c);
+        if (n && cur->state == T_READY) {
+            bool keep = cur->policy == 1 ? n->rtprio <= cur->rtprio :
+                        !better(n, cur) && !(cur->policy == 2 && n->rtprio == cur->rtprio);
+            if (keep) n = NULL;
+        }
         if (n) next = n;
         else if (cur->state != T_READY) next = c->idle;
     }

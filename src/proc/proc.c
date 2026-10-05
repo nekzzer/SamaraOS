@@ -420,6 +420,9 @@ static int start_task(proc_t* p, const regs_t* frame) {
     int t = task_spawn_frame(p->name, ks, KSTACK_SZ, (uint64_t)r, p->pd, p);
     if (t < 0) { kfree(ks); return -EAGAIN; }
     p->task = t;
+    proc_t* cur = proc_current();
+    if (cur && cur != p) { p->nice = cur->nice; p->policy = cur->policy; p->rtprio = cur->rtprio; }
+    if (p->nice || p->policy) task_set_sched(t, p->policy, p->rtprio, p->nice);
     return 0;
 }
 

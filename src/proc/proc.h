@@ -90,6 +90,7 @@ typedef struct proc {
     bool     pt_rep, pt_sys, pt_isr, pt_isr_stop, pt_intr, pt_seize, pt_job, pt_entry, pt_tf, pt_sival;
     uint8_t  pt_si[128];
     uint64_t dr[8];
+    int      nice, policy, rtprio;     /* setpriority, sched_setscheduler */
 } proc_t;
 
 void    proc_init(void);

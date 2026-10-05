@@ -2539,6 +2539,45 @@ static int64_t dispatch(regs_t* r) {
             }
             return fatfs_umount(n);
         }
+        case 140: {                                                  /* getpriority */
+            proc_t* t = b ? proc_by_pid((int)b) : p;
+            return t ? 20 - t->nice : -ESRCH;
+        }
+        case 141: {                                                  /* setpriority(which, who, prio) */
+            proc_t* t = b ? proc_by_pid((int)b) : p;
+            if (!t) return -ESRCH;
+            int nv = (int)c;
+            t->nice = nv < -20 ? -20 : nv > 19 ? 19 : nv;
+            if (t->task >= 0) task_set_sched(t->task, t->policy, t->rtprio, t->nice);
+            return 0;
+        }
+        case 142: case 144: {                                        /* sched_setparam / sched_setscheduler(pid, policy, param) */
+            proc_t* t = a ? proc_by_pid((int)a) : p;
+            if (!t) return -ESRCH;
+            int pol = r->rax == 144 ? (int)b : t->policy, pr;
+            UCHK((void*)(r->rax == 144 ? c : b), 4);
+            pr = *(int*)(r->rax == 144 ? c : b);
+            if (pol & 0x40000000) pol &= ~0x40000000;                /* RESET_ON_FORK */
+            if (pol < 0 || pol > 5 || pol == 4) return -EINVAL;
+            if ((pol == 1 || pol == 2) ? (pr < 1 || pr > 99) : pr != 0) return -EINVAL;
+            t->policy = pol; t->rtprio = pr;
+            if (t->task >= 0) task_set_sched(t->task, pol, pr, t->nice);
+            return 0;
+        }
+        case 143: {                                                  /* sched_getparam */
+            proc_t* t = a ? proc_by_pid((int)a) : p;
+            if (!t) return -ESRCH;
+            UCHK((void*)b, 4);
+            *(int*)b = t->rtprio;
+            return 0;
+        }
+        case 145: { proc_t* t = a ? proc_by_pid((int)a) : p; return t ? t->policy : -ESRCH; }
+        case 146: return (a == 1 || a == 2) ? 99 : 0;                /* sched_get_priority_max */
+        case 147: return (a == 1 || a == 2) ? 1 : 0;
+        case 148:                                                    /* sched_rr_get_interval: 10 ms */
+            UCHK((void*)b, 16);
+            ((uint64_t*)b)[0] = 0; ((uint64_t*)b)[1] = 10000000;
+            return 0;
         case 92: case 93: case 94: case 260:                         /* chown & co */
         case 105: case 106: case 113: case 114: case 117: case 119: case 116:
         case 157: case 203: case 28: case 26: case 149: case 150: case 151: case 152:

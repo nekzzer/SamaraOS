@@ -34,6 +34,10 @@ typedef struct task {
     int           ysw;         /* last yield went to somebody else */
     int           nobkl;       /* in a syscall that runs without the big lock */
     volatile int  io_wait;     /* blocked in task_wait_io, io_wake lets it go early */
+    uint32_t      weight;      /* 0 = 1024 (nice 0) */
+    uint64_t      vrt;         /* virtual runtime, lowest goes first */
+    uint8_t       policy;      /* 0 other, 1 fifo, 2 rr, 3 batch, 5 idle */
+    uint8_t       rtprio;      /* fifo/rr priority 1..99 */
 } task_t;
 
 /* Frame built by every entry path (isr stubs, syscall_entry, see boot/entry.S),
@@ -54,6 +58,7 @@ int   task_spawn_sz(const char* name, void (*entry)(void), uint32_t sz);   /* bi
 int   task_spawn_frame(const char* name, uint8_t* stack, uint32_t stack_size,
                        uint64_t rsp, uint64_t cr3, struct proc* p);
 void  task_exit(void);
+void  task_set_sched(int id, int policy, int rtprio, int nice);
 void  task_yield(void);
 void  task_yield_fast(void);        /* yield, never hlt when nobody else is ready */
 void  task_sleep_ms(uint32_t ms);   /* kernel tasks: give up the CPU for a while */
