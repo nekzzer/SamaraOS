@@ -1149,7 +1149,7 @@ static int do_epoll_wait(int epfd, uint32_t* out, int max, int timeout_ms) {
         if (got || timeout_ms == 0) return got;
         if (timeout_ms > 0 && pit_uptime_ms() - start >= (uint32_t)timeout_ms) return 0;
         if (proc_interrupted()) return -EINTR;
-        task_sleep_ms(1);
+        task_wait_io(2);
     }
 }
 
@@ -1162,7 +1162,7 @@ static int do_poll(pollfd_t* fds, uint64_t n, int timeout_ms) {
         int r = poll_once(fds, n);
         if (r || timeout_ms == 0) return r;
         if (timeout_ms > 0 && pit_uptime_ms() - start >= (uint32_t)timeout_ms) return 0;
-        task_sleep_ms(1);
+        task_wait_io(2);
     }
 }
 
@@ -1202,7 +1202,7 @@ static int do_select(int n, uint32_t* rd, uint32_t* wr, uint32_t* ex, int timeou
             }
             return ready;
         }
-        task_sleep_ms(1);
+        task_wait_io(2);
     }
 }
 
@@ -2802,6 +2802,10 @@ void syscall_dispatch(regs_t* r) {
     } else ret = dispatch(r);
     if (mut) fs_write_end();
     prof_sys((int)nr, prof_tsc() - t0);
+    switch (nr) {      // io that can make a waiter in poll/read/write ready
+        case 0: case 1: case 3: case 17: case 18: case 19: case 20: case 42: case 43: case 44: case 45:
+        case 46: case 47: case 48: case 53: case 299: case 307: io_wake();
+    }
     if (g_strace && g_strace_pid && proc_current() && proc_current()->pid == g_strace_pid) {
         /* buffered: record now, print when the process exits (timing stays intact) */
         static struct { int32_t nr, a, b, c, ret; } rec[4096];
@@ -2817,7 +2821,7 @@ void syscall_dispatch(regs_t* r) {
         }
     } else if (g_strace && !g_strace_pid) {
         proc_t* p = proc_current();
-        klog("[strace] "); klog_num(p ? p->pid : 0);
+        klog("[strace] "); klog_num(pit_uptime_ms()); klog(" "); klog_num(p ? p->pid : 0);
         klog(" "); klog_num(nr);
         klog("("); klog_num(r->rdi); klog(", "); klog_num(r->rsi);
         klog(", "); klog_num(r->rdx); klog(") = "); klog_num(ret); klog("\r\n");
