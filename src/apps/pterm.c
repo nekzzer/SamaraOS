@@ -15,6 +15,8 @@
 #include "drivers/keyboard.h"
 #include "proc/proc.h"
 #include "proc/pty.h"
+#include "drivers/mouse.h"
+#include "gui/uwin.h"
 
 #define PT_MAX 8
 #define MAXC 200
@@ -45,6 +47,9 @@ typedef struct {
     bool dirty;
     uint32_t rowh[MAXR];          /* what each row looked like when last drawn */
     int lcx, lcy;
+    int sa, sb;                   /* selection, cell indexes y*MAXC+x */
+    bool sel, drag;
+    uint8_t pbtn;
 } pt_t;
 
 static pt_t pts[PT_MAX];
@@ -303,6 +308,10 @@ static void pt_paint(window_t* w) {
             pcell_t* c = &C(t, x, y);
             uint32_t fg = c->fg, bg = c->bg;
             if (c->at & AT_INV) { uint32_t s = fg; fg = bg; bg = s; }
+            if (t->sel) {
+                int lo = t->sa < t->sb ? t->sa : t->sb, hi = t->sa < t->sb ? t->sb : t->sa, ix = y * MAXC + x;
+                if (ix >= lo && ix <= hi) { uint32_t s = fg; fg = bg; bg = s; if (fg == bg) fg = dbg(); }
+            }
             bool cur = t->cur_on && x == t->cx && y == t->cy && wm_focused() == w;
             if (cur) { uint32_t s = fg; fg = bg == dbg() ? dbg() : bg; bg = s == dbg() ? dfg() : s; if (fg == bg) fg = dbg(); }
             int px = ox + x * CW, py = oy + y * CH;
@@ -312,11 +321,44 @@ static void pt_paint(window_t* w) {
         }
 }
 
+static void sel_changed(pt_t* t) {
+    int x0, y0, cw, ch;
+    wm_client_rect(t->win, &x0, &y0, &cw, &ch);
+    wm_damage(t->win, x0, y0, cw, ch);
+}
+
+static void sel_copy(pt_t* t) {
+    static char out[MAXC * MAXR * 3];
+    int lo = t->sa < t->sb ? t->sa : t->sb, hi = t->sa < t->sb ? t->sb : t->sa, n = 0;
+    for (int y = lo / MAXC; y <= hi / MAXC && y < t->rows; y++) {
+        int a = y == lo / MAXC ? lo % MAXC : 0, b = y == hi / MAXC ? hi % MAXC : t->cols - 1;
+        if (b >= t->cols) b = t->cols - 1;
+        while (b >= a && C(t, b, y).ch == ' ') b--;      // trailing blanks
+        for (int x = a; x <= b; x++) {
+            uint8_t c = C(t, x, y).ch;
+            if (c < 0x80) out[n++] = c ? c : ' ';
+            else { uint32_t cp = cp866_to_uni(c); out[n++] = 0xC0 | (cp >> 6); out[n++] = 0x80 | (cp & 0x3F); }
+        }
+        if (y < hi / MAXC) out[n++] = '\n';
+    }
+    if (n) clip_set(out, n);
+}
+
+static void pt_paste(pt_t* t) {
+    static char b[4096];
+    int n = clip_get(b, sizeof b);
+    for (int i = 0; i < n; i++) if (b[i] == '\n') b[i] = '\r';
+    if (n > 0) pty_write(t->pty, true, b, n, true);
+}
+
 static void send(pt_t* t, const char* s, int n) { pty_write(t->pty, true, s, n, true); }
 
 static void pt_key(window_t* w, char ch) {
     pt_t* t = (pt_t*)w->user;
     uint8_t c = (uint8_t)ch;
+    if (c == 0x16 && kbd_shift_held()) { pt_paste(t); return; }          // ctrl+shift+v
+    if (c == 3 && kbd_shift_held() && t->sel) { sel_copy(t); return; }   // ctrl+shift+c
+    if (t->sel) { t->sel = false; sel_changed(t); }
     bool ru = kbd_is_ru() && ((c >= 0x80 && c <= 0xAF) || (c >= 0xE0 && c <= 0xF1));
     const char* seq = NULL;
     if (!ru) switch (c) {
@@ -377,6 +419,30 @@ static void pt_tick(window_t* w, uint32_t now) {
     pt_t* t = (pt_t*)w->user;
     (void)now;
     pt_fit(t);
+    if (wm_focused() == w) {
+        int mx, my, x0, y0, cw, ch;
+        uint8_t b;
+        mouse_get(&mx, &my, &b);
+        wm_client_rect(w, &x0, &y0, &cw, &ch);
+        int cx = (mx - x0 - PADX) / CW, cy = (my - y0 - 2) / CH;
+        if (cx < 0) cx = 0;
+        if (cx >= t->cols) cx = t->cols - 1;
+        if (cy < 0) cy = 0;
+        if (cy >= t->rows) cy = t->rows - 1;
+        bool in = mx >= x0 && mx < x0 + cw && my >= y0 && my < y0 + ch;
+        if ((b & 1) && !(t->pbtn & 1) && in) { t->drag = true; t->sa = t->sb = cy * MAXC + cx; if (t->sel) { t->sel = false; sel_changed(t); } }
+        else if ((b & 1) && t->drag && cy * MAXC + cx != t->sb) {
+            t->sb = cy * MAXC + cx;
+            t->sel = t->sa != t->sb;
+            sel_changed(t);
+        }
+        if (!(b & 1) && (t->pbtn & 1) && t->drag) {
+            t->drag = false;
+            if (t->sel) sel_copy(t);
+        }
+        if ((b & 2) && !(t->pbtn & 2) && in) pt_paste(t);
+        t->pbtn = b;
+    }
     static char buf[2048];
     for (int k = 0; k < 16; k++) {
         int n = pty_read(t->pty, true, buf, sizeof buf, true);
