@@ -191,6 +191,17 @@ static int load_entry(vol_t* v, fs_node_t* dir, const char* name, const uint8_t*
         n->data = (char*)kmalloc_big(size + 1);
         if (!n->data) { kfree(d); return -ENOMEM; }
         memcpy(n->data, d, size < len ? size : len);
+        /* remember what is on disk, else the first sync rewrites every file (polled, irqs off) */
+        uint8_t* sc = (uint8_t*)kmalloc(v->csize);
+        uint32_t c = first;
+        for (uint32_t i = 0; sc && i * v->csize < len && c >= 2 && c < v->nclus + 2; i++, c = fat_get(v, c)) {
+            uint32_t off = i * v->csize, k = size > off ? size - off : 0;
+            if (k > v->csize) k = v->csize;
+            memset(sc, 0, v->csize);
+            memcpy(sc, d + off, k);
+            v->clus_hash[c] = fnv(sc, v->csize);
+        }
+        if (sc) kfree(sc);
         kfree(d);
         n->size = size < len ? size : len;
         n->cap = size + 1;
@@ -347,8 +358,18 @@ static void assign(layout_t* L, fs_node_t* n, bool is_root) {
     L->next_clus += count;
     for (uint32_t h = hash_ptr(n, L->mapcap);; h = (h + 1) & (L->mapcap - 1))
         if (!L->map[h]) { L->map[h] = L->npl; break; }
-    if (n->type == FS_DIR)
-        for (fs_node_t* c = n->child; c; c = c->next) if (!c->dev) assign(L, c, false);
+    if (n->type == FS_DIR) {
+        /* child list is newest first, walk it oldest first = disk order, so
+           files that stay don't move (and aren't rewritten) when something new shows up */
+        uint32_t k = 0;
+        for (fs_node_t* c = n->child; c; c = c->next) k++;
+        fs_node_t** a = (fs_node_t**)kmalloc((k + 1) * sizeof(fs_node_t*));
+        if (!a) { L->err = -ENOMEM; return; }
+        k = 0;
+        for (fs_node_t* c = n->child; c; c = c->next) a[k++] = c;
+        while (k--) if (!a[k]->dev) assign(L, a[k], false);
+        kfree(a);
+    }
 }
 
 /* ---------------- writing: output ---------------- */
