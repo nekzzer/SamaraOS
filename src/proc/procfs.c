@@ -8,6 +8,7 @@
    of exited processes are unlinked (open descriptors keep them alive). */
 
 #include "proc/proc.h"
+#include "proc/file.h"
 #include "core/heap.h"
 #include "core/string.h"
 #include "core/vmm.h"
@@ -243,6 +244,10 @@ static void fill_globals(char* mem, uint32_t cap) {
     sb_puts(&b, "0.00 0.00 0.00 "); sb_int(&b, running ? running : 1); sb_putc(&b, '/');
     sb_int(&b, nproc); sb_putc(&b, ' '); sb_int(&b, last); sb_putc(&b, '\n');
     put(proc_root, "loadavg", &b);
+
+    b = (sb_t){ mem, 0, cap };
+    b.len = (uint32_t)flk_text(mem, (int)cap);
+    put(proc_root, "locks", &b);
 
     uint32_t us = 0, sy = 0, id = 0;
     for (int i = 0; i < ncpu; i++) { us += cpus[i].t_user; sy += cpus[i].t_sys; id += cpus[i].t_idle; }

@@ -106,6 +106,7 @@ static void boot_autorun(void) {
     if (strstr(boot_cmdline, "autogfx")) console_gfx_start();
     char* argv[] = { "sh", "-c", (char*)key + 7, NULL };
     shell_exec_program("/bin/sh", 3, argv);
+    ext2_sync_all(); fatfs_sync_all();   /* last writes were lost on poweroff */
     const char* bye = "\r\n[autosh done]\r\n";
     while (*bye) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, *bye++); }
     outw(0x604, 0x2000);                 /* QEMU ACPI power off */

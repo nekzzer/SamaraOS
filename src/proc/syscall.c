@@ -40,6 +40,7 @@
 #define EBUSY 16
 #define EEXIST 17
 #define EXDEV 18
+#define EMLINK 31
 #define ENOTDIR 20
 #define EISDIR 21
 #define EINVAL 22
@@ -181,6 +182,19 @@ static fs_node_t* lookup_peek(int dirfd, const char* path, int* err, bool follow
     return n;
 }
 
+/* the name itself: a hard link name is not followed to its node */
+static fs_node_t* lookup_dent(int dirfd, const char* path, int* err) {
+    *err = -ENOENT;
+    if (!ustr_ok(path)) { *err = -EFAULT; return NULL; }
+    if (!path[0]) return NULL;
+    fs_node_t* base = dir_base(dirfd, path, err);
+    if (!base) return NULL;
+    maybe_refresh_proc(base, path);
+    fs_node_t* n = fs_peek_d(base, path);
+    if (!n) *err = -ENOENT;
+    return n;
+}
+
 /* Split "a/b/c/" into parent node of "c" and the name "c". */
 static fs_node_t* lookup_parent(int dirfd, const char* path, char* name, int* err) {
     char tmp[256];
@@ -222,7 +236,7 @@ static void fill_stat_node(kstat64_t* st, fs_node_t* n) {
     int vol = fatfs_owner(n);
     st->st_dev = vol ? (8u << 8) | (uint32_t)vol : 1;            /* distinct per volume (df) */
     st->st_ino = ((uint64_t)n >> 4) & 0x0FFFFFFF;
-    st->st_nlink = n->type == FS_DIR ? 2 : 1;
+    st->st_nlink = n->type == FS_DIR ? 2 : n->unlinked ? 0 : 1 + n->xl;
     if (FS_DEV_IS_DISK(n->dev)) {
         int idx = n->dev - FS_DEV_DISK;
         st->st_mode = 0060000 | (n->mode & 07777);            /* S_IFBLK */
@@ -461,7 +475,7 @@ static int do_getdents64(int fd, uint8_t* buf, uint64_t n) {
         else if (idx == 1) { name = ".."; node = dir->parent ? dir->parent : dir; }
         else {
             if (!c) break;
-            name = c->name; node = c; c = c->next;
+            name = c->name; node = c->hl ? c->hl : c; c = c->next;
         }
         if (idx < f->off) continue;
         uint32_t nl = strlen(name);
@@ -488,7 +502,7 @@ static void shm_drop(fs_node_t* n);
 static int do_unlink(int dirfd, const char* path, int flags) {
     UCHK(path, 1);
     int err;
-    fs_node_t* n = lookup_peek(dirfd, path, &err, false);
+    fs_node_t* n = lookup_dent(dirfd, path, &err);
     if (!n) return err;
     if (flags & AT_REMOVEDIR) {
         if (n->type != FS_DIR) return -ENOTDIR;
@@ -503,10 +517,8 @@ static int do_unlink(int dirfd, const char* path, int flags) {
     }
     fs_node_t* parent = n->parent;
     if (!parent) return -EBUSY;
-    if (is_shm(n)) shm_drop(n);       // mappings keep their own refs
-    fs_detach(n);
-    if (n->refs > 0) n->unlinked = true;
-    else { fs_data_free(n); kfree(n); }
+    if (is_shm(n) && !n->xl && !n->hl) shm_drop(n);       // mappings keep their own refs
+    fs_drop_name(n);
     return 0;
 }
 
@@ -531,16 +543,18 @@ static bool is_ancestor(fs_node_t* a, fs_node_t* n) {
 static int do_rename(int ofd, const char* from, int nfd, const char* to) {
     UCHK(from, 1); UCHK(to, 1);
     int err;
-    fs_node_t* src = lookup_peek(ofd, from, &err, false);
+    fs_node_t* src = lookup_dent(ofd, from, &err);
     if (!src) return err;
     char name[FS_NAME_MAX];
     fs_node_t* parent = lookup_parent(nfd, to, name, &err);
     if (!parent) return err;
+    if ((src->hl || src->xl) && fs_owner(src->parent) != fs_owner(parent)) return -EXDEV;
     // to another volume: lazy ext2 files have to come along in memory, fat sync reads ->data
     if (fs_owner(src->parent) != fs_owner(parent)) fs_need_tree(src);
     if (src->type == FS_DIR && is_ancestor(src, parent)) return -EINVAL;
     fs_node_t* dst = fs_child(parent, name);
     if (dst == src) return 0;
+    if (dst && (dst->hl ? dst->hl : dst) == (src->hl ? src->hl : src)) return 0;   /* two names of one file */
     if (dst) {
         if (dst->type == FS_DIR && src->type != FS_DIR) return -EISDIR;
         if (dst->type != FS_DIR && src->type == FS_DIR) return -ENOTDIR;
@@ -556,25 +570,28 @@ static int do_rename(int ofd, const char* from, int nfd, const char* to) {
     return 0;
 }
 
-/* no real hard links, a node has one parent. so link = copy. apk wants it for
-   terminfo (vt220 -> vt220-am and co), nobody here cares the inode differs */
 static int do_link(int ofd, const char* from, int nfd, const char* to, int flags) {
     UCHK(from, 1); UCHK(to, 1);
     int err;
-    fs_node_t* src = lookup_ex(ofd, from, &err, (flags & 0x400) != 0);   /* AT_SYMLINK_FOLLOW */
+    fs_node_t* src;
+    if ((flags & 0x1000) && !from[0]) {                        /* AT_EMPTY_PATH: the fd itself */
+        file_t* f = getf(ofd);
+        if (!f) return -EBADF;
+        if (f->type != F_NODE) return -ENOENT;
+        src = f->node;
+    } else src = lookup_peek(ofd, from, &err, (flags & 0x400) != 0);   /* AT_SYMLINK_FOLLOW */
     if (!src) return err;
     if (src->type == FS_DIR) return -EPERM;
+    if (src->dev || src->unlinked) return src->unlinked ? -ENOENT : -EPERM;
     char name[FS_NAME_MAX];
     fs_node_t* par = lookup_parent(nfd, to, name, &err);
     if (!par) return err;
     if (fs_child(par, name)) return -EEXIST;
-    if (src->type == FS_LINK) return fs_symlink(par, name, src->data) ? 0 : -ENOMEM;
-    fs_node_t* n = fs_create(par, name, FS_FILE);
-    if (!n) return -ENOMEM;
-    if (src->size && fs_write(n, src->data, src->size) < 0) return -ENOMEM;
-    n->mode = src->mode;
-    n->dev = src->dev;
-    return 0;
+    fs_node_t* ow = fs_owner(src);
+    if (ow != fs_owner(par)) return -EXDEV;
+    if (ow->mount_id && ow->mount_id < 8) return -EPERM;       /* fat */
+    if (src->xl > 60000) return -EMLINK;
+    return fs_hlink(src, par, name) < 0 ? -ENOMEM : 0;
 }
 
 static int do_access(int dirfd, const char* path) {
@@ -595,7 +612,7 @@ static int do_dup2(int fd, int nfd, bool cloexec) {
     if (!f) return -EBADF;
     if (nfd < 0 || nfd >= MAX_FDS) return -EBADF;
     if (fd == nfd) return nfd;
-    if (me()->sh->fds[nfd]) file_close(me()->sh->fds[nfd]);
+    if (me()->sh->fds[nfd]) { flk_close(me()->sh, me()->sh->fds[nfd]); file_close(me()->sh->fds[nfd]); }
     file_ref(f);
     me()->sh->fds[nfd] = f;
     me()->sh->cloexec[nfd] = cloexec;
@@ -612,8 +629,9 @@ static int do_fcntl(int fd, int cmd, uint64_t arg) {
         case 2:    me()->sh->cloexec[fd] = arg & 1; return 0;       /* F_SETFD */
         case 3:    return f->flags;                              /* F_GETFL */
         case 4:    f->flags = (f->flags & O_ACCMODE) | (int)(arg & (O_APPEND | O_NONBLOCK)); return 0;
-        case 5: case 6: case 7: case 12: case 13: case 14:       /* locks: always granted */
-            return 0;
+        case 5: case 6: case 7: case 12: case 13: case 14: case 36: case 37: case 38:   /* record locks, ofd */
+            UCHK((void*)arg, 32);
+            return flk_fcntl(f, cmd, (uint8_t*)arg);
     }
     return -EINVAL;
 }
@@ -2282,6 +2300,18 @@ static int64_t dispatch(regs_t* r) {
             fl->off = save;
             return res;
         }
+        case 295: case 296: case 327: case 328: {                    /* preadv/pwritev (+v2) */
+            file_t* fl = getf((int)a);
+            if (!fl) return -EBADF;
+            bool w = r->rax == 296 || r->rax == 328;
+            if (r->rax > 300 && (int64_t)d == -1) return do_rwv((int)a, (iovec_t*)b, (int)c, w);
+            if (fl->type != F_NODE) return -ESPIPE;
+            uint64_t save = fl->off;
+            fl->off = d;
+            int64_t res = do_rwv((int)a, (iovec_t*)b, (int)c, w);
+            fl->off = save;
+            return res;
+        }
         case 2:   return do_open(AT_FDCWD, (const char*)a, (int)b, (int)c);
         case 85:  return do_open(AT_FDCWD, (const char*)a, O_CREAT | O_WRONLY | O_TRUNC, (int)b);
         case 257: return do_open((int)a, (const char*)b, (int)c, (int)d);
@@ -2289,6 +2319,7 @@ static int64_t dispatch(regs_t* r) {
             file_t* fl = getf((int)a);
             if (!fl) return -EBADF;
             p->sh->fds[a] = NULL;
+            flk_close(p->sh, fl);
             file_close(fl);
             return 0;
         }
@@ -2349,8 +2380,19 @@ static int64_t dispatch(regs_t* r) {
             if (b) UCHK((void*)b, 24);
             return proc_sigaltstack((const uint64_t*)a, (uint64_t*)b, r->rsp);
         case 122: case 123: return 0;                                /* setfsuid/gid: zsh. we're root anyway */
-        case 73: return 0;                                           /* flock, apk wants it. nobody fights for locks here */
-        case 162: case 74: case 75: case 306:                        /* sync, fsync, fdatasync, syncfs */
+        case 73: {                                                   /* flock */
+            file_t* fl = getf((int)a);
+            return fl ? flk_flock(fl, (int)b) : -EBADF;
+        }
+        case 74: case 75: case 306: case 277: {                      /* fsync, fdatasync, syncfs, sync_file_range */
+            file_t* fl = getf((int)a);
+            if (!fl) return -EBADF;
+            if (r->rax == 277 && (d & ~7ull)) return -EINVAL;
+            if (r->rax != 306 && fl->type != F_NODE && fl->type != F_DISK) return -EINVAL;
+            ext2_sync_all();
+            return fatfs_sync_all();
+        }
+        case 162:                                                    /* sync */
             ext2_sync_all();
             return fatfs_sync_all();
         case 165: {                                                  /* mount */
@@ -2608,7 +2650,24 @@ static int64_t dispatch(regs_t* r) {
                 if (c + d > fl->node->size && node_truncate(fl->node, c + d) < 0) return -ENOMEM;
                 return 0;
             }
-            return -95;                                              /* apk asks. EOPNOTSUPP and it just writes */
+            if (!fl) return -EBADF;
+            if (fl->type != F_NODE) return -19;
+            fs_node_t* n = fl->node;
+            if (n->type == FS_DIR) return -EISDIR;
+            if (n->type != FS_FILE || n->dev) return -19;
+            if ((fl->flags & 3) == 0) return -EBADF;
+            if ((int64_t)c < 0 || (int64_t)d <= 0) return -EINVAL;
+            if (b & ~(uint64_t)(1 | 2 | 16)) return -95;                 /* EOPNOTSUPP: collapse, insert */
+            if ((b & 2) && !(b & 1)) return -95;                     /* punch hole needs keep size */
+            uint64_t end = c + d;
+            if (end > 0x7FFFFFFF) return -27;                        /* EFBIG, 32 bit sizes in the ramfs */
+            fs_need(n);
+            if (b & (2 | 16)) {                                      /* hole = zeros, the fs has no holes in memory */
+                uint64_t z = c < n->size ? c : n->size, ze = end < n->size ? end : n->size;
+                if (ze > z && n->data) { memset(n->data + z, 0, ze - z); n->mtime = fs_now(); fs_touch(n); }
+            }
+            if (!(b & 1) && end > n->size && node_truncate(n, (uint32_t)end) < 0) return -ENOMEM;
+            return 0;
         }
         // membarrier, rseq: not here yet. glib/qemu fall back
         // to pipes and poll on ENOSYS, so just say no without spamming the log

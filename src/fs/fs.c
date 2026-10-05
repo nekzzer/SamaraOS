@@ -101,7 +101,7 @@ static fs_node_t* find_child(fs_node_t* dir, const char* name) {
 
 /* walks path; a symlink in the middle (or at the end with follow) is
    replaced by its target + the rest, 8 levels deep at most */
-static fs_node_t* resolve(fs_node_t* cwd, const char* path, bool follow, int depth) {
+static fs_node_t* resolve(fs_node_t* cwd, const char* path, bool follow, int depth, bool dent) {
     if (!path || !*path) return cwd;
     fs_node_t* cur = (path[0] == '/') ? root_ : cwd;
     char part[FS_NAME_MAX];
@@ -116,6 +116,7 @@ static fs_node_t* resolve(fs_node_t* cwd, const char* path, bool follow, int dep
                 pi = 0;
                 const char* rest = p;
                 while (*rest == '/') rest++;
+                if (cur->hl && (*rest || follow || !dent)) cur = cur->hl;
                 if (cur->type == FS_LINK && (*rest || follow)) {
                     if (depth > 8 || !cur->data) return NULL;
                     static char buf[1024];                       /* target + "/" + rest */
@@ -126,7 +127,7 @@ static fs_node_t* resolve(fs_node_t* cwd, const char* path, bool follow, int dep
                     for (; *rest && k < 1022; rest++) tmp[k++] = *rest;
                     tmp[k] = 0;
                     memcpy(buf, tmp, (size_t)k + 1);
-                    return resolve(dir, tmp, follow, depth + 1);
+                    return resolve(dir, tmp, follow, depth + 1, false);
                 }
             }
             if (*p == 0) break;
@@ -168,9 +169,10 @@ fs_node_t* fs_owner(fs_node_t* n) {
     return root_;
 }
 
-fs_node_t* fs_resolve(fs_node_t* cwd, const char* path)    { fs_node_t* n = resolve(cwd, path, true, 0); fs_need(n); return n; }
-fs_node_t* fs_resolve_nf(fs_node_t* cwd, const char* path) { fs_node_t* n = resolve(cwd, path, false, 0); fs_need(n); return n; }
-fs_node_t* fs_peek(fs_node_t* cwd, const char* path, bool follow) { return resolve(cwd, path, follow, 0); }
+fs_node_t* fs_resolve(fs_node_t* cwd, const char* path)    { fs_node_t* n = resolve(cwd, path, true, 0, false); fs_need(n); return n; }
+fs_node_t* fs_resolve_nf(fs_node_t* cwd, const char* path) { fs_node_t* n = resolve(cwd, path, false, 0, false); fs_need(n); return n; }
+fs_node_t* fs_peek(fs_node_t* cwd, const char* path, bool follow) { return resolve(cwd, path, follow, 0, false); }
+fs_node_t* fs_peek_d(fs_node_t* cwd, const char* path) { return resolve(cwd, path, false, 0, true); }
 
 fs_node_t* fs_symlink(fs_node_t* dir, const char* name, const char* target) {
     if (!dir || dir->type != FS_DIR || find_child(dir, name)) return NULL;
@@ -212,14 +214,55 @@ fs_node_t* fs_create(fs_node_t* cwd, const char* path, fs_type_t type) {
 }
 
 int fs_unlink(fs_node_t* cwd, const char* path) {
-    fs_node_t* n = resolve(cwd, path, false, 0);   /* no point reading it in to delete it */
+    fs_node_t* n = resolve(cwd, path, false, 0, true);   /* no point reading it in to delete it */
     if (!n || n == root_) return -1;
     if (n->type == FS_DIR && n->child) return -1;
+    fs_drop_name(n);
+    return 0;
+}
+
+int fs_hlink(fs_node_t* t, fs_node_t* dir, const char* name) {
+    fs_node_t* a = node_new(name, t->type, dir);
+    if (!a) return -1;
+    a->hl = t;
+    a->hn = t->hn;
+    t->hn = a;
+    t->xl++;
+    link_child(dir, a);
+    dir->mtime = t->mtime = fs_now();
+    fs_touch(dir);
+    return 0;
+}
+
+void fs_drop_name(fs_node_t* n) {
+    fs_node_t* t = n->hl;
+    if (t) {                                   /* only a name */
+        fs_node_t** pp = &t->hn;
+        while (*pp && *pp != n) pp = &(*pp)->hn;
+        if (*pp) *pp = n->hn;
+        t->xl--;
+        fs_detach(n);
+        kfree(n);
+        return;
+    }
+    fs_node_t* a = n->hn;
+    if (a) {                                   /* the node moves into the place of another name */
+        char nm[FS_NAME_MAX];
+        fs_node_t* dir = a->parent;
+        strcpy(nm, a->name);
+        n->hn = a->hn;
+        n->xl--;
+        fs_detach(a);
+        kfree(a);
+        fs_detach(n);
+        strcpy(n->name, nm);
+        fs_attach(dir, n);
+        return;
+    }
     fs_detach(n);
-    if (n->refs > 0) { n->unlinked = true; return 0; }   /* still open */
+    if (n->refs > 0) { n->unlinked = true; return; }   /* still open */
     fs_data_free(n);
     kfree(n);
-    return 0;
 }
 
 void fs_detach(fs_node_t* n) {

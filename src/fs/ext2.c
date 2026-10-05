@@ -27,6 +27,7 @@ typedef struct {
     uint32_t ib[15];                      /* i_block as on disk (or inline link) */
     uint32_t sz, mt, h, isig;             /* what we wrote last time */
     const char* dp;
+    uint16_t lc;                          /* names in the tree, counted at sync */
     uint8_t type, seen;
 } ent_t;
 
@@ -369,6 +370,7 @@ static void orphan(ev_t* v, uint32_t ino, int depth) {
     uint8_t raw[256];
     uint8_t* p = inode_ptr(v, ino, ob);
     if (!p || !v->E || depth > 40) return;
+    for (uint32_t i = 0; i < v->ne; i++) if (v->E[i].ino == ino) return;   /* a hard link of something we have */
     memcpy(raw, p, v->isize < 256 ? v->isize : 256);
     int ei = ent_new(v, NULL, ino, 0);
     if (ei < 0 || ent_load(v, ei, raw) < 0) { v->ro = true; return; }
@@ -431,6 +433,12 @@ static int load_dir(ev_t* v, fs_node_t* dir, uint32_t dino, int depth) {
            the disk wins, except over mounts, devices and type clashes */
         fs_node_t* old = fs_child(dir, name);
         if (old && (old->mount_id || old->dev)) { orphan(v, ino, depth + 1); continue; }
+        if (v->E && rd16(craw + 26) > 1 && ((mode & 0xF000) == 0x8000 || (mode & 0xF000) == 0xA000)) {
+            fs_node_t* first = NULL;                          /* second name of an inode we already have */
+            for (uint32_t i = 0; i < v->ne; i++) if (v->E[i].ino == ino && v->E[i].n) { first = v->E[i].n; break; }
+            if (first && first->type != FS_DIR && !old) { fs_hlink(first, dir, name); continue; }
+            if (first && first->type != FS_DIR && old->type == first->type && !old->child) { drop(old); fs_hlink(first, dir, name); continue; }
+        }
         if (old && old->type == FS_DIR && (mode & 0xF000) == 0xA000 && dir == fs_root()) { drop(old); old = NULL; }
         fs_node_t* n = NULL;
         uint8_t ty = 0;
@@ -581,7 +589,7 @@ static bool skip(ev_t* v, fs_node_t* d, fs_node_t* c) {
 
 static void walk(ev_t* v, fs_node_t* d) {
     for (fs_node_t* c = d->child; c; c = c->next) {
-        if (skip(v, d, c)) continue;
+        if (skip(v, d, c) || c->hl) continue;
         int ei = t_find(v, c);
         if (ei >= 0 && (v->E[ei].type != c->type || v->E[ei].seen)) { t_del(v, c); v->E[ei].n = NULL; ei = -1; }
         if (ei < 0) {
@@ -595,6 +603,15 @@ static void walk(ev_t* v, fs_node_t* d) {
     }
 }
 
+static void walk_lc(ev_t* v, fs_node_t* d) {
+    for (fs_node_t* c = d->child; c; c = c->next) {
+        if (skip(v, d, c)) continue;
+        if (c->type == FS_DIR) { walk_lc(v, c); continue; }
+        int ei = t_find(v, c->hl ? c->hl : c);
+        if (ei >= 0) v->E[ei].lc++;
+    }
+}
+
 static int sync_vol(ev_t* v) {
     uint32_t now = fs_now();
     uint8_t* dib = kmalloc(v->ninodes / 8 + 1);              /* inodes to write this time */
@@ -603,12 +620,13 @@ static int sync_vol(ev_t* v) {
     memset(dib, 0, v->ninodes / 8 + 1);
     for (uint32_t i = 0; i <= v->ninodes; i++) i2e[i] = -1;
 
-    for (uint32_t i = 0; i < v->ne; i++) v->E[i].seen = 0;
+    for (uint32_t i = 0; i < v->ne; i++) { v->E[i].seen = 0; v->E[i].lc = 0; }
     if (t_rebuild(v) < 0) { kfree(dib); kfree(i2e); return -1; }    /* nothing written yet */
     int ri = t_find(v, v->root);
     if (ri < 0) ri = ent_new(v, v->root, 2, FS_DIR);
     v->E[ri].seen = 1;
     walk(v, v->root);
+    walk_lc(v, v->root);
 
     /* gone from the tree: free the blocks, zero the inode */
     uint32_t w = 0;
@@ -648,7 +666,7 @@ static int sync_vol(ev_t* v) {
             links = 2;
             while (cnt--) {
                 fs_node_t* c = arr[cnt];
-                int ce = t_find(v, c);
+                int ce = t_find(v, c->hl ? c->hl : c);
                 if (ce < 0 || skip(v, n, c)) continue;
                 uint8_t t = c->type == FS_DIR ? 2 : c->type == FS_LINK ? 7 : 1;
                 dir_add(v, &db, v->E[ce].ino, c->name, ft ? t : 0);
@@ -694,6 +712,7 @@ static int sync_vol(ev_t* v) {
             }
         }
         e = &v->E[i];
+        if (n->type != FS_DIR) links = e->lc ? e->lc : 1;
         uint32_t ty = n->type == FS_DIR ? 0x4000 : n->type == FS_LINK ? 0xA000 : 0x8000;
         uint32_t used = e->nm;
         for (uint32_t k = 0; k < e->nb; k++) if (e->bl[k]) used++;
@@ -745,7 +764,7 @@ static int sync_vol(ev_t* v) {
         wr32(p + 4, size);
         wr32(p + 8, n->mtime); wr32(p + 12, n->mtime); wr32(p + 16, n->mtime);
         wr32(p + 20, 0);
-        uint32_t links = 1;
+        uint32_t links = e->lc ? e->lc : 1;
         if (n->type == FS_DIR) { links = 2; for (fs_node_t* c = n->child; c; c = c->next) if (c->type == FS_DIR && !skip(v, n, c) && t_find(v, c) >= 0) links++; }
         wr16(p + 26, (uint16_t)links);
         uint32_t used = e->nm;

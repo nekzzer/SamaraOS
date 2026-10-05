@@ -24,6 +24,9 @@ typedef struct fs_node {
     uint8_t  mount_id;         /* nonzero on the root of a mounted volume */
     uint8_t  lazy_vol;
     uint32_t lazy;             /* ext2 ino whose bytes aren't read yet: data NULL, size is right */
+    struct fs_node* hl;        /* extra hard link name: the real node. everything else is empty */
+    struct fs_node* hn;        /* real node: first extra name; extra name: the next one */
+    uint16_t xl;               /* real node: how many extra names */
 } fs_node_t;
 
 enum { FS_DEV_NONE = 0, FS_DEV_NULL, FS_DEV_ZERO, FS_DEV_TTY, FS_DEV_RANDOM, FS_DEV_FB, FS_DEV_INPUT,
@@ -56,6 +59,9 @@ void        fs_wait_room(uint32_t need);
 void        fs_need_room(uint32_t need);     /* sync + drop clean files, from anywhere that may sleep */     /* writer out of file memory: wait for a sync */
 fs_node_t*  fs_symlink(fs_node_t* dir, const char* name, const char* target);
 fs_node_t*  fs_create(fs_node_t* cwd, const char* path, fs_type_t type);
+fs_node_t*  fs_peek_d(fs_node_t* cwd, const char* path);   /* the name itself, hard link names are not followed */
+int         fs_hlink(fs_node_t* t, fs_node_t* dir, const char* name);
+void        fs_drop_name(fs_node_t* n);       /* unlink: a name, or the node with its last name */
 int         fs_unlink(fs_node_t* cwd, const char* path);
 int         fs_write(fs_node_t* file, const char* data, size_t len);  /* replaces */
 void        fs_data_free(fs_node_t* n);       /* drop contents (owned ones are freed) */

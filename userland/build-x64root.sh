@@ -44,9 +44,6 @@ printf 'SamaraOS\n' > etc/issue
 # wayland side of the desktop (userland/samara-wl/build.sh)
 [ -x $ROOT/build/samara-wl ] && install -m755 $ROOT/build/samara-wl usr/bin/samara-wl
 
-# the kernel fs has no hard links: every link becomes its own file
-find . -type f -links +1 | while read f; do cp -p "$f" "$f.hl" && mv "$f.hl" "$f"; done
-
 rm -f $IMG
 truncate -s $SIZE $IMG
 mke2fs -q -t ext2 -b 4096 -O ^dir_index,^resize_inode -L / -d $D $IMG

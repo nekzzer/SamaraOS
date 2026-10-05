@@ -567,8 +567,9 @@ static void teardown(proc_t* p, int status) {
     futex_forget(p);
     uwin_proc_exit(p->pid);
     for (int i = 0; i < MAX_FDS; i++) {
-        if (p->sh->fds[i]) { file_close(p->sh->fds[i]); p->sh->fds[i] = NULL; }
+        if (p->sh->fds[i]) { flk_close(p->sh, p->sh->fds[i]); file_close(p->sh->fds[i]); p->sh->fds[i] = NULL; }
     }
+    flk_exit(p->sh);
     task_t* t = task_at(p->task);
     if (t && t->proc == p) {
         t->proc = NULL;
@@ -975,7 +976,7 @@ int proc_execve(regs_t* r, const char* path, char* const argv[], char* const env
     p->sig_pending = 0;
     p->ss_sp = p->ss_size = 0;
     for (int i = 0; i < MAX_FDS; i++) {
-        if (p->sh->fds[i] && p->sh->cloexec[i]) { file_close(p->sh->fds[i]); p->sh->fds[i] = NULL; }
+        if (p->sh->fds[i] && p->sh->cloexec[i]) { flk_close(p->sh, p->sh->fds[i]); file_close(p->sh->fds[i]); p->sh->fds[i] = NULL; }
         p->sh->cloexec[i] = 0;
     }
     *r = frame;

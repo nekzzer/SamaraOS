@@ -101,7 +101,7 @@ void file_ref(file_t* f) { if (f) f->refs++; }
 
 void file_close(file_t* f) {
     if (!f || --f->refs > 0) return;
-    if (f->type == F_NODE && f->node) fs_release(f->node);
+    if (f->type == F_NODE && f->node) { flk_release(f); fs_release(f->node); }
     if (f->type == F_SOCKET && f->sock) sock_close(f->sock);
     if (f->type == F_FB) fbdev_close();
     if (f->type == F_DRM) drm_close(f->drm);

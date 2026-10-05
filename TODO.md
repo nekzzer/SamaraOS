@@ -42,8 +42,20 @@ make run SELF=0 NICS=3                      # + virtio-net cards eth1, eth2
   (syscall 332 is still ENOSYS)
 * void userland: `build/root-x64.img` (userland/build-x64root.sh, 97 void x86_64-musl packages, ext2 root), xbps-install/remove
   work (gcc, xterm, nano installs checked, e2fsck clean), gcc compiles and runs. sysroot.tar is x86_64 now (samara apps + sources).
-  fork is COW, kernel faults on user addresses return EFAULT. no hard links in the fs (the image build copies them),
-  fallocate/flock are stubs, mremap grow often ENOMEM (musl copes)
+  fork is COW, kernel faults on user addresses return EFAULT. mremap grow often ENOMEM (musl copes)
+* ag/fs: hard links. an extra name is a small dentry node (fs_node_t.hl -> the real node, chain in hn, count in xl), resolve
+  follows it, unlink of the real node's name moves the node into another name's place (fs_drop_name). link/linkat
+  (AT_SYMLINK_FOLLOW, AT_EMPTY_PATH), st_nlink/st_ino, unlink of an open file lives till close, rename over a name atomic,
+  rename of two names of one file is a no-op. ext2 reads several dirents -> one inode and writes them back with
+  the right i_links_count (ent.lc counted per sync), e2fsck clean. build-x64root.sh keeps the links (cross volume
+  or fat link = EXDEV/EPERM, a link whose real node sits in a dir that isn't written back (/tmp) is not saved)
+* ag/fs: locks in src/proc/flock.c: flock (per open file description), fcntl F_SETLK/W/GETLK (per fd table, dropped on any
+  close of the file / exec cloexec / exit), F_OFD_*, ranges split/cut, blocking = sleep loop (2 ms), EINTR, simple EDEADLK
+  for posix locks, /proc/locks. fallocate: mode 0, KEEP_SIZE, PUNCH_HOLE|KEEP_SIZE, ZERO_RANGE (holes are zeros in the
+  ram copy, no real holes on disk). fsync/fdatasync/sync_file_range check the fd, then sync every dirty volume
+* tested ag/fs: own tests (link/unlink/open deleted/rename, flock fork, ranges, SETLKW wake, OFD, EINTR, EDEADLK, fallocate),
+  `ln a b; echo x >> b; cat a`, util-linux flock, sqlite3 3 writers x 40 inserts (120/120, integrity ok), xbps-install
+  git perl + remove + reboot, e2fsck -fn clean after each
 * merged ag/smp + ag/xbps: live pte changes in vmm.c (pte_put/tlb_inval) shoot down the other cpus (IPI 0xF1), range
   loops and fork's cow marking batch it (sd_defer). EFAULT longjmp keeps the BKL (kernel fault, lock stays held).
   tested -smp 4 kvm + -smp 2 tcg: nproc, xbps-install/remove nano, cow, fork+threads cow (pthreads write the heap while
