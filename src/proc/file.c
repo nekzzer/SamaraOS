@@ -267,6 +267,22 @@ static int disk_rw(file_t* f, char* buf, uint32_t n, bool write) {
     uint32_t done = 0;
     while (done < n) {
         uint32_t lba = f->off / 512, in = f->off % 512;
+        if (!in && n - done >= 512) {                    /* whole sectors in one go */
+            uint32_t cnt = (n - done) / 512;
+            if (cnt > 128) cnt = 128;
+            char* big = kmalloc(cnt * 512);
+            if (!big) cnt = 1;
+            else {
+                int r;
+                if (write) { memcpy(big, buf + done, cnt * 512); r = ata_write(f->disk, lba, (int)cnt, big); }
+                else { r = ata_read(f->disk, lba, (int)cnt, big); if (!r) memcpy(buf + done, big, cnt * 512); }
+                kfree(big);
+                if (r < 0) break;
+                done += cnt * 512;
+                f->off += cnt * 512;
+                continue;
+            }
+        }
         uint32_t k = 512 - in;
         if (k > n - done) k = n - done;
         if (ata_read(f->disk, lba, 1, sec) < 0) break;
