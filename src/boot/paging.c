@@ -99,6 +99,7 @@ static void dump(const char* tag, uint64_t err, uint64_t rip,
 
 /* #PF #GP #UD #DE #DF come here with a full frame, so a ring 3 fault can
    become a signal with a context the handler may edit - java needs that */
+extern void longjmp(void* env, int val) __attribute__((noreturn));
 static void fault_c(regs_t* r) {
     uint64_t vec = r->vec, err = r->err, cr2 = 0;
     if (vec == 14) {
@@ -114,8 +115,13 @@ static void fault_c(regs_t* r) {
         if (vec == 14) proc_fault_stack(r->rsp);
         proc_fault_kill(what, sig, r->rip, vec == 14 ? cr2 : err);
     }
-    /* kernel tripped over a bad pointer from a syscall: kill the process,
-       not the whole box. TODO proper copy_from_user + EFAULT */
+    /* kernel tripped over a bad pointer from a syscall: -EFAULT via longjmp
+       back into syscall_dispatch */
+    if (vec == 14 && cr2 >= USER_BASE && cr2 < USER_TOP && proc_current() && proc_current()->ujb_on) {
+        proc_current()->ujb_on = false;
+        if (r->rflags & 0x200) __asm__ volatile ("sti");
+        longjmp((void*)proc_current()->ujb, 1);
+    }
     if (vec == 14 && cr2 >= USER_BASE && cr2 < USER_TOP && proc_current())
         proc_fault_kill("bad user ptr", 11, r->rip, cr2);
     {   // poor man's backtrace

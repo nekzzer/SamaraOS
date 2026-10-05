@@ -76,6 +76,7 @@ bool g_ftrace;                         /* "ftrace": failed syscalls with the pat
 
 /* ---------------- serial ---------------- */
 
+extern int setjmp(void* env);
 static void com_putc(char c) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, c); }
 static void klog(const char* s) { while (*s) com_putc(*s++); }
 static void klog_num(int64_t v) { char b[24]; itoa((int)v, b, 10); klog(b); }
@@ -2711,7 +2712,17 @@ void syscall_dispatch(regs_t* r) {
         ext2_throttle();                      /* before: the sync waits for writers */
         fs_write_begin();
     }
-    int64_t ret = dispatch(r);
+    int64_t ret;
+    proc_t* pc = proc_current();
+    if (pc && !setjmp((void*)pc->ujb)) {
+        pc->ujb_on = true;
+        ret = dispatch(r);
+        pc->ujb_on = false;
+    } else if (pc) {
+        pc = proc_current();
+        pc->ujb_on = false;
+        ret = -EFAULT;
+    } else ret = dispatch(r);
     if (mut) fs_write_end();
     if (g_strace && g_strace_pid && proc_current() && proc_current()->pid == g_strace_pid) {
         /* buffered: record now, print when the process exits (timing stays intact) */

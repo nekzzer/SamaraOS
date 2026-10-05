@@ -40,6 +40,8 @@ typedef struct proc {
     bool     is_thread;            /* made by clone(CLONE_THREAD), not waitable */
     bool     zleader;              /* leader called exit() while threads still run */
     bool     in_futex;
+    bool     ujb_on;               /* a kernel fault on a user address longjmps to ujb (-EFAULT) */
+    uint64_t ujb[8];
     int      task;                 /* task slot running this process */
     uint64_t pd;                   /* top level page table (physical) */
     uint64_t tls_base;             /* fs base */
