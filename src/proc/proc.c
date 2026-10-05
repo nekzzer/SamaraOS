@@ -727,6 +727,8 @@ bool proc_handle_fault(uint64_t addr, uint64_t err) {
     /* lazy anon page: frame now. PROT_NONE (no US) and writes to read-only
        ones stay faults, java counts on those SIGSEGVs */
     uint64_t pte = vmm_pte(p->pd, addr & ~(PAGE_SIZE - 1));
+    /* another thread faulted the same page in a moment ago, just retry (llvmpipe threads die without it) */
+    if ((pte & PTE_P) && (pte & PTE_US) && (!(err & 2) || (pte & PTE_RW))) return true;
     if (pte & PTE_LAZY) {
         if (!(pte & PTE_US) || ((err & 2) && !(pte & PTE_RW))) return false;
         return vmm_fault_in(p->pd, addr);
@@ -756,6 +758,7 @@ void proc_fault_kill(const char* what, int sig, uint64_t eip, uint64_t addr) {
     klog(" ("); klog(p ? p->name : "?"); klog("): "); klog(what);
     klog(" rip=0x"); klog_num(eip, 16);
     klog(" addr=0x"); klog_num(addr, 16);
+    if (p) { klog(" pte="); klog_num(vmm_pte(p->pd, addr & ~0xFFFul), 16); }
     klog("\r\n");
     if (!p) { cli(); for (;;) hlt(); }
     proc_exit(sig & 0x7F);

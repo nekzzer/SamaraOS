@@ -239,10 +239,14 @@ int vmm_lazy_range(uint64_t pd, uint64_t va, uint64_t len, bool rw, bool user) {
 
 bool vmm_fault_in(uint64_t pd, uint64_t va) {
     uint64_t* p = pte_slot(pd, va & ~(PAGE_SIZE - 1), false);
-    if (!p || (*p & PTE_P) || !(*p & PTE_LAZY)) return false;
+    if (!p) return false;
+    uint64_t old = *p;
+    if (old & PTE_P) return true;                  /* other thread was faster */
+    if (!(old & PTE_LAZY)) return false;
     uint64_t fr = pmm_alloc();                     /* zeroed */
     if (!fr) return false;
-    pte_put(p, va & ~(PAGE_SIZE - 1), fr | PTE_P | (*p & (PTE_RW | PTE_US)));
+    /* two threads on one fresh page: the loser must not overwrite what the winner already wrote */
+    if (!__sync_bool_compare_and_swap(p, old, fr | PTE_P | (old & (PTE_RW | PTE_US)))) { pmm_unref(fr); return true; }
     return true;
 }
 
