@@ -2,6 +2,9 @@
 #include "core/string.h"
 #include "core/io.h"
 #include "boot/pic.h"
+#include "boot/apic.h"
+#include "core/smp.h"
+#include "boot/gdt.h"
 #include "drivers/vga.h"
 #include "proc/proc.h"
 
@@ -43,6 +46,7 @@ void idt_set_dpl(int vec, int dpl) { idt[vec].flags = 0x8E | (dpl << 5); }
 
 /* IRQs nobody handles: real hardware raises stuff qemu never does */
 static void irq_default(int irq) {
+    if (apic_on) { ioapic_irq(irq, true); lapic_eoi(); return; }
     if (irq == 7 || irq == 15) {                   /* spurious unless in service */
         if (!(pic_isr() & (1u << irq))) {
             if (irq == 15) outb(PIC1_CMD, PIC_EOI);
@@ -71,12 +75,27 @@ static void exc_default(regs_t* f) {
 int last_vec;
 regs_t* isr_dispatch(regs_t* r) {
     int v = (int)r->vec;
+    struct cpu* c = this_cpu();
+    if (v == VEC_TLB) { tlb_service(); lapic_eoi(); return r; }     // no lock, the sender holds it
+    if (v == VEC_SPUR) return r;
+    if (!c->bkl) bkl_take(c);
     if (v != 14) last_vec = v;
     if (sched_h[v]) return sched_h[v](r);
     if (handlers[v]) handlers[v](r);
     else if (v >= 0x20 && v < 0x30) irq_default(v - 0x20);
     else if (v < 32) exc_default(r);
     return r;
+}
+
+/* back on the stack of the frame we return to: the old task is off cpu for
+   good now, and the lock goes unless we stay in the kernel */
+void isr_leave(regs_t* f) {
+    struct cpu* c = this_cpu();
+    if (c->prev) {
+        __atomic_store_n(&c->prev->on_cpu, 0, __ATOMIC_RELEASE);
+        c->prev = NULL;
+    }
+    if (c->bkl && ((f->cs & 3) || (c->idle && c->cur == c->idle))) bkl_drop(c);
 }
 
 void idt_init(void) {
@@ -88,3 +107,5 @@ void idt_init(void) {
     idtp.base  = (uint64_t)&idt;
     __asm__ volatile ("lidt (%0)" : : "r"(&idtp));
 }
+
+void idt_load(void) { __asm__ volatile ("lidt (%0)" : : "r"(&idtp)); }

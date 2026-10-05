@@ -59,7 +59,10 @@ SHELL_CMD_SRC := $(wildcard src/shell/commands/*.c)
 KERN_SRC := \
     src/core/string.c \
     src/drivers/vga.c \
+    src/boot/acpi.c \
+    src/boot/apic.c \
     src/boot/gdt.c \
+    src/core/smp.c \
     src/boot/idt.c \
     src/boot/paging.c \
     src/boot/fpu.c \
@@ -177,7 +180,7 @@ DGEN_SRC := \
     $(DGEN_DIR)/i_input.c $(DGEN_DIR)/i_video.c $(DGEN_DIR)/doomgeneric.c
 
 KERN_OBJ  := $(KERN_SRC:.c=.o)
-BOOT_OBJ  := src/boot/boot.o src/boot/entry.o
+BOOT_OBJ  := src/boot/boot.o src/boot/entry.o src/boot/smp_tramp.o
 
 # Embedded WAVs (objcopy -I binary). Variables only here — rules live below
 # the default target so 'make' without arguments still builds the kernel.

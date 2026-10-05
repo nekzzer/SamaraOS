@@ -1,3 +1,6 @@
+#include "boot/apic.h"
+#include "boot/acpi.h"
+#include "core/smp.h"
 #include "core/types.h"
 #include "core/io.h"
 #include "drivers/vga.h"
@@ -250,6 +253,9 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
     boot_done(!fpu_present() ? "absent" : fpu_sse() ? "ok (x87 + SSE)" : "ok (x87)");
 
     BOOT_OK("pic", pic_remap());
+    acpi_init();
+    apic_init();
+    if (apic_on) vga_puts("apic on\n");
     clock_init();
     BOOT_OK("fs", fs_init());
     BOOT_OK("kbd", kbd_init());
@@ -442,6 +448,7 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
     /* task_spawn("blinker", task_blinker); */  /* disabled — interferes with DOOM */
     (void)task_blinker;
 
+    smp_init();
     sti();
 
     boot_autorun();

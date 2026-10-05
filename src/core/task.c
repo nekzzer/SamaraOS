@@ -3,6 +3,8 @@
 #include "core/string.h"
 #include "boot/idt.h"
 #include "boot/pic.h"
+#include "boot/apic.h"
+#include "core/smp.h"
 #include "boot/gdt.h"
 #include "boot/paging.h"
 #include "core/io.h"
@@ -13,16 +15,12 @@ extern uint32_t pit_uptime_ms(void);
 extern void pit_check_stack_guard(uint64_t cur_rsp);
 
 static task_t tasks[MAX_TASKS];
+static task_t idle_t[MAX_CPUS];
 static int    n_tasks = 0;          /* high-water mark of used slots */
-static int    cur = 0;
 static int    started = 0;
 static uint64_t kernel_cr3;
-static uint64_t loaded_cr3;
-static int    yield_switched;
 
-/* CPU accounting for /proc/stat, in PIT ticks. */
-volatile int  cpu_idle;             /* set while a task sits in hlt */
-uint32_t      cpu_ticks_user, cpu_ticks_sys, cpu_ticks_idle, cpu_ctxt;
+uint32_t      cpu_ctxt;
 
 /* Clean x87 state (after FNINIT + default control word), copied into every
    new task so each one starts from a known FPU configuration. */
@@ -35,28 +33,50 @@ static uint8_t fpu_idle_raw[512 + 16];
 
 static uint8_t* align16(uint8_t* p) { return (uint8_t*)(((uintptr_t)p + 15u) & ~15ul); }
 
-task_t* task_current(void) { return &tasks[cur]; }
+task_t* task_current(void) { return this_cpu()->cur; }
 int     task_count(void)   { return n_tasks; }
 task_t* task_at(int i)     { return (i >= 0 && i < n_tasks) ? &tasks[i] : NULL; }
 uint64_t task_kernel_cr3(void) { return kernel_cr3; }
 
-static void load_cr3(uint64_t cr3) {
-    if (cr3 == loaded_cr3) return;
-    loaded_cr3 = cr3;
+static void load_cr3(struct cpu* c, uint64_t cr3) {
+    if (cr3 == c->cr3) return;
+    c->cr3 = cr3;
     __asm__ volatile ("mov %0, %%cr3" : : "r"(cr3) : "memory");
 }
 
 void task_set_cr3(uint64_t cr3) {
-    uint32_t f = irq_save();
-    tasks[cur].cr3 = cr3;
-    load_cr3(cr3 ? cr3 : kernel_cr3);
+    uint64_t f = irq_save();
+    struct cpu* c = this_cpu();
+    c->cur->cr3 = cr3;
+    load_cr3(c, cr3 ? cr3 : kernel_cr3);
     irq_restore(f);
 }
 
 void task_exit(void) {
     cli();
-    tasks[cur].state = T_DEAD;
+    task_current()->state = T_DEAD;
     for (;;) task_yield();
+}
+
+void task_ready(task_t* t) {
+    if (t->state != T_BLOCKED) return;
+    t->wake_ms = 0;
+    t->state = T_READY;
+    kick_idle();
+}
+
+/* sti; hlt, but the other cpus get the kernel meanwhile. when an irq
+   switched us away and later back we already hold it again */
+void cpu_wait(void) {
+    uint64_t fl = irq_save();
+    struct cpu* c = this_cpu();
+    c->in_idle = 1;
+    if (c->bkl) bkl_drop(c);
+    __asm__ volatile ("sti; hlt; cli" : : : "memory");
+    c = this_cpu();
+    c->in_idle = 0;
+    if (!c->bkl) bkl_take(c);
+    irq_restore(fl);
 }
 
 /* a fresh kernel task: regs_t frame at the top of its stack, iretq into entry */
@@ -77,7 +97,7 @@ static uint64_t build_initial_stack(uint8_t* stack_top, void (*entry)(void)) {
 static int alloc_slot(void) {
     for (int i = 1; i < MAX_TASKS; i++) {
         task_t* t = &tasks[i];
-        if (i == cur) continue;
+        if (t->on_cpu) continue;
         if (t->state == T_FREE || t->state == T_DEAD) {
             if (t->stack) kfree(t->stack);
             if (t->fpu_alloc) kfree(t->fpu_alloc);
@@ -107,6 +127,7 @@ static int finish_spawn(int id, const char* name, uint8_t* stack, uint64_t rsp,
     t->proc = p;
     t->ticks = 0;
     t->state = T_READY;
+    kick_idle();
     return id;
 }
 
@@ -136,9 +157,10 @@ int task_spawn_frame(const char* name, uint8_t* stack, uint32_t stack_size,
     if (id >= 0) {
         /* A forked child inherits the parent's FPU registers. */
         const uint8_t* src = fpu_clean;
-        if (tasks[cur].proc && tasks[cur].fpu) {
-            __asm__ volatile ("fxsave64 (%0)" : : "r"(tasks[cur].fpu) : "memory");
-            src = tasks[cur].fpu;
+        task_t* me = task_current();
+        if (me->proc && me->fpu) {
+            __asm__ volatile ("fxsave64 (%0)" : : "r"(me->fpu) : "memory");
+            src = me->fpu;
         }
         r = finish_spawn(id, name, stack, rsp, cr3, (uint64_t)stack + stack_size, p, src);
     }
@@ -146,77 +168,123 @@ int task_spawn_frame(const char* name, uint8_t* stack, uint32_t stack_size,
     return r;
 }
 
-/* Choose next ready task starting from `cur+1` round-robin */
-static int pick_next(void) {
+/* next ready task after the one this cpu took last, nobody else may be on it */
+static task_t* pick(struct cpu* c) {
     for (int i = 1; i <= n_tasks; i++) {
-        int idx = (cur + i) % n_tasks;
-        if (tasks[idx].state == T_READY) return idx;
+        int idx = (c->rr + i) % n_tasks;
+        task_t* t = &tasks[idx];
+        if (t->state == T_READY && !t->on_cpu) { c->rr = idx; return t; }
     }
-    return cur;     /* nobody else ready -> stay on current */
+    return NULL;
 }
 
-static regs_t* switch_to(int next, regs_t* saved) {
-    tasks[cur].rsp = (uint64_t)saved;
-    if (next == cur) return saved;
+static regs_t* switch_to(struct cpu* c, task_t* next, regs_t* saved) {
+    task_t* prev = c->cur;
+    prev->rsp = (uint64_t)saved;
+    if (next == prev) return saved;
     cpu_ctxt++;
 
-    if (tasks[cur].fpu) __asm__ volatile ("fxsave64 (%0)" : : "r"(tasks[cur].fpu) : "memory");
-    cur = next;
-    task_t* t = &tasks[cur];
-    if (t->fpu) __asm__ volatile ("fxrstor64 (%0)" : : "r"(t->fpu) : "memory");
-    if (t->kstack_top) tss_set_rsp0(t->kstack_top);
-    load_cr3(t->cr3 ? t->cr3 : kernel_cr3);
-    if (t->proc) {
-        wrmsr_fs(proc_tls_base(t->proc));
-        /* Preempted in ring 3 with a caught signal waiting: enter the handler. */
-        regs_t* fr = (regs_t*)t->rsp;
-        if ((fr->cs & 3) == 3) {
-            proc_check_alarm(t->proc, true);
-            if (proc_signal_deliverable(t->proc)) proc_deliver_signal(fr, -1, 0);
-        }
-    }
-    return (regs_t*)t->rsp;
+    if (prev->fpu) __asm__ volatile ("fxsave64 (%0)" : : "r"(prev->fpu) : "memory");
+    c->prev = prev;                 // on_cpu goes away in isr_leave, when we are off its stack
+    c->cur = next;
+    c->in_idle = 0;
+    next->on_cpu = 1;
+    next->cpu = c->id;
+    if (next->fpu) __asm__ volatile ("fxrstor64 (%0)" : : "r"(next->fpu) : "memory");
+    if (next->kstack_top) tss_set_rsp0(next->kstack_top);
+    load_cr3(c, next->cr3 ? next->cr3 : kernel_cr3);
+    if (next->proc) wrmsr_fs(proc_tls_base(next->proc));
+    return (regs_t*)next->rsp;
 }
 
-static uint32_t slice = 0;
+/* last look at the frame we are going back with. a dead task never gets to
+   ring 3 again (it may have been killed from another cpu), a live one takes
+   its alarms and signals now: it could have been running anywhere meanwhile */
+static regs_t* finish(struct cpu* c, regs_t* f) {
+    if ((f->cs & 3) != 3) return f;
+    if (c->cur->state == T_DEAD) {
+        task_t* n = pick(c);
+        f = switch_to(c, n ? n : c->idle, f);
+        if ((f->cs & 3) != 3) return f;
+    }
+    task_t* t = c->cur;
+    if (t->proc) {
+        proc_check_alarm(t->proc, true);
+        if (proc_signal_deliverable(t->proc)) proc_deliver_signal(f, -1, 0);
+    }
+    return f;
+}
 
-/* timer irq: gets the frame of the running task, returns the one to resume */
+/* lapic timer, every cpu */
 static regs_t* schedule(regs_t* saved) {
-    pit_tick_inc();
-    pit_check_stack_guard((uint64_t)saved);
+    struct cpu* c = this_cpu();
     pic_send_eoi(0);
+    if (!c->id) {
+        pit_tick_inc();
+        pit_check_stack_guard((uint64_t)saved);
+    }
+    if (!started) return saved;
 
-    if (!started || n_tasks == 0) return saved;
-
-    tasks[cur].ticks++;
+    task_t* cur = c->cur;
+    cur->ticks++;
     {
+        static uint32_t wake_done;
         uint32_t now = pit_uptime_ms();
-        for (int i = 0; i < n_tasks; i++)
-            if (tasks[i].state == T_BLOCKED && tasks[i].wake_ms &&
-                (int32_t)(now - tasks[i].wake_ms) >= 0) { tasks[i].wake_ms = 0; tasks[i].state = T_READY; }
+        if (now != wake_done) {
+            wake_done = now;
+            int woke = 0;
+            for (int i = 0; i < n_tasks; i++)
+                if (tasks[i].state == T_BLOCKED && tasks[i].wake_ms &&
+                    (int32_t)(now - tasks[i].wake_ms) >= 0) { tasks[i].wake_ms = 0; tasks[i].state = T_READY; woke++; }
+            if (woke) kick_idle();
+        }
     }
     {
         bool user = (saved->cs & 3) == 3;
-        if (cpu_idle) cpu_ticks_idle++;
-        else if (user) cpu_ticks_user++;
-        else cpu_ticks_sys++;
-        if (tasks[cur].proc && !cpu_idle) proc_account_tick(tasks[cur].proc, user);
+        if (c->in_idle || cur == c->idle) c->t_idle++;
+        else if (user) c->t_user++;
+        else c->t_sys++;
+        if (cur->proc && !c->in_idle) proc_account_tick(cur->proc, user);
     }
 
-    /* PIT runs at 1 kHz for timing precision; keep a 10 ms time slice.
-       A task that is no longer runnable gives up the CPU immediately. */
-    if (tasks[cur].state == T_READY && ++slice < 10) return saved;
-    slice = 0;
-    return switch_to(pick_next(), saved);
+    /* 1 kHz tick, 10 ms time slice. A task that is no longer runnable gives
+       up the CPU immediately. */
+    task_t* next = cur;
+    if (cur == c->idle) {
+        task_t* n = pick(c);
+        if (n) next = n;
+    } else if (cur->state != T_READY || ++c->slice >= 10) {
+        c->slice = 0;
+        task_t* n = pick(c);
+        if (n) next = n;
+        else if (cur->state != T_READY) next = c->idle;
+    }
+    return finish(c, switch_to(c, next, saved));
 }
 
 /* int 0x81: voluntary switch. No EOI, no tick. */
 static regs_t* schedule_yield(regs_t* saved) {
-    if (!started) { yield_switched = 0; return saved; }
-    int next = pick_next();
-    yield_switched = (next != cur);
-    slice = 0;
-    return switch_to(next, saved);
+    struct cpu* c = this_cpu();
+    task_t* cur = c->cur;
+    if (!started) { cur->ysw = 0; return saved; }
+    task_t* next = pick(c);
+    if (!next) next = (cur->state == T_READY || cur == c->idle) ? cur : c->idle;
+    cur->ysw = next != cur;
+    c->slice = 0;
+    return finish(c, switch_to(c, next, saved));
+}
+
+/* somebody made work for an idle cpu */
+static regs_t* schedule_kick(regs_t* saved) {
+    struct cpu* c = this_cpu();
+    lapic_eoi();
+    if (!started) return saved;
+    task_t* next = c->cur;
+    if (next == c->idle) {
+        task_t* n = pick(c);
+        if (n) next = n;
+    }
+    return finish(c, switch_to(c, next, saved));
 }
 
 void task_yield(void) {
@@ -224,20 +292,17 @@ void task_yield(void) {
     __asm__ volatile ("int $0x81" : : : "memory");
     /* Nobody else wanted the CPU: sleep until the next interrupt instead of
        spinning. A dead task must never fall through to here and return. */
-    if (!yield_switched) {
-        cpu_idle = 1;
-        __asm__ volatile ("sti; hlt; cli" : : : "memory");
-        cpu_idle = 0;
-    }
+    if (!task_current()->ysw) cpu_wait();
     irq_restore(f);
 }
 
 void task_sleep_ms(uint32_t ms) {
     uint32_t f = irq_save();
-    if (cur != 0) {                          /* the kernel/UI task never blocks */
-        tasks[cur].wake_ms = pit_uptime_ms() + (ms ? ms : 1);
-        tasks[cur].state = T_BLOCKED;
-        while (tasks[cur].state == T_BLOCKED) task_yield();   /* woken by the tick */
+    task_t* t = task_current();
+    if (t->id != 0) {                        /* the kernel/UI task never blocks */
+        t->wake_ms = pit_uptime_ms() + (ms ? ms : 1);
+        t->state = T_BLOCKED;
+        while (t->state == T_BLOCKED) task_yield();   /* woken by the tick */
     } else {
         task_yield();
     }
@@ -245,16 +310,19 @@ void task_sleep_ms(uint32_t ms) {
 }
 
 void task_install_timer(void) {
-    idt_set_sched(0x20, schedule);
+    if (apic_on) idt_set_sched(VEC_TIMER, schedule);
+    else idt_set_sched(0x20, schedule);
     idt_set_sched(0x81, schedule_yield);
+    idt_set_sched(VEC_KICK, schedule_kick);
 }
+
+static void idle_main(void) { for (;;) task_yield(); }
 
 void task_init(void) {
     n_tasks = 0;
-    cur = 0;
     memset(tasks, 0, sizeof(tasks));
     kernel_cr3 = paging_cr3();
-    loaded_cr3 = kernel_cr3;
+    cpus[0].cr3 = kernel_cr3;
 
     fpu_clean = align16(fpu_clean_raw);
     __asm__ volatile ("fninit");
@@ -271,9 +339,49 @@ void task_init(void) {
     t->state = T_READY;
     t->stack = NULL;     /* uses kernel stack already in use */
     t->fpu = align16(fpu_idle_raw);
+    t->on_cpu = 1;
+    cpus[0].cur = t;
     n_tasks = 1;
+
+    /* the bsp needs somewhere to park when the boot task is busy elsewhere */
+    uint8_t* st = (uint8_t*)kmalloc(16384);
+    task_t* id0 = &idle_t[0];
+    strncpy(id0->name, "idle", 31);
+    id0->id = MAX_TASKS;
+    id0->state = T_READY;
+    id0->fpu_alloc = (uint8_t*)kmalloc(512 + 16);
+    id0->fpu = align16(id0->fpu_alloc);
+    memcpy(id0->fpu, fpu_clean, 512);
+    id0->rsp = build_initial_stack(st + 16384, idle_main);
+    cpus[0].idle = id0;
     started = 1;
     task_install_timer();
+}
+
+void task_ap_start(int id) {
+    struct cpu* c = &cpus[id];
+    task_t* t = &idle_t[id];
+    strncpy(t->name, "idle", 31);
+    t->id = MAX_TASKS + id;
+    t->state = T_READY;
+    t->on_cpu = 1;
+    t->cpu = id;
+    t->fpu_alloc = (uint8_t*)kmalloc(512 + 16);
+    t->fpu = align16(t->fpu_alloc);
+    memcpy(t->fpu, fpu_clean, 512);
+    c->cur = c->idle = t;
+    apic_timer_start();
+    c->online = 1;
+    idle_main();
+}
+
+void syscall_dispatch(regs_t* r);
+void syscall_enter(regs_t* r) {
+    struct cpu* c = this_cpu();
+    bkl_take(c);
+    /* killed from another cpu while it was in ring 3: it never does anything again */
+    while (c->cur->state == T_DEAD) { task_yield(); c = this_cpu(); }
+    syscall_dispatch(r);
 }
 
 void task_dump(void (*emit)(const char*)) {

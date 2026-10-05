@@ -1,3 +1,4 @@
+#include "core/smp.h"
 #include "core/vmm.h"
 #include "core/string.h"
 #include "core/task.h"
@@ -88,6 +89,7 @@ void pmm_unref(uint64_t frame) {
 void vmm_flush(void) {
     uint64_t cr3;
     __asm__ volatile ("mov %%cr3, %0; mov %0, %%cr3" : "=r"(cr3) : : "memory");
+    if (ncpu > 1) tlb_shootdown();
 }
 
 uint64_t vmm_new_space(void) {

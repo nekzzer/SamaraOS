@@ -106,7 +106,7 @@ void cmd_sleep(int argc, char **argv) {
   int ms = atoi(argv[1]);
   uint32_t start = pit_uptime_ms();
   while ((int)(pit_uptime_ms() - start) < ms)
-    __asm__ volatile("hlt");
+    cpu_wait();
 }
 
 void cmd_shutdown(int argc, char **argv) {
@@ -149,7 +149,7 @@ void cmd_beep(int argc, char **argv) {
   outb(0x61, tmp | 3);
   uint32_t start = pit_uptime_ms();
   while (pit_uptime_ms() - start < 200)
-    __asm__ volatile("hlt");
+    cpu_wait();
   outb(0x61, tmp & 0xFC);
 }
 

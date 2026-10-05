@@ -2,7 +2,8 @@
 #define SAMARA_GDT_H
 #include "core/types.h"
 
-void gdt_init(void);
+void gdt_init(void);                    /* bsp */
+void gdt_init_ap(int id);               /* gdt, tss, gs, syscall msrs of this cpu */
 
 /* ring0 stack for the next ring3 -> ring0 transition (tss.rsp0 and the
    per-cpu slot syscall_entry loads) */
@@ -13,12 +14,34 @@ void tss_set_rsp0(uint64_t rsp0);
 #define GDT_UDATA 0x23
 #define GDT_UCODE 0x2B
 
-/* per-cpu block, GS base in kernel mode. syscall_entry knows the offsets */
+struct task;
+
+/* per-cpu block, GS base in kernel mode. syscall_entry knows the first offsets */
 struct cpu {
     uint64_t kstack;       /* 0 */
     uint64_t user_rsp;     /* 8 */
+    struct cpu* self;      /* 16 */
     int      id;
+    int      apic_id;
+    volatile int online;
+    int      bkl;          /* this cpu holds the big lock */
+    int      in_idle;      /* parked in hlt */
+    struct task* cur;
+    struct task* idle;
+    struct task* prev;     /* switched away from, on_cpu still set */
+    int      rr;
+    uint32_t slice;
+    uint64_t cr3;          /* what is loaded */
+    volatile uint32_t tlb_req;
+    uint32_t t_user, t_sys, t_idle;
 };
-extern struct cpu cpu0;
+extern struct cpu cpus[MAX_CPUS];
+extern int ncpu;                        /* started */
+
+static inline struct cpu* this_cpu(void) {
+    struct cpu* c;
+    __asm__ volatile ("mov %%gs:16, %0" : "=r"(c));
+    return c;
+}
 
 #endif

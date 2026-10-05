@@ -162,10 +162,7 @@ static char console_getc(int *py) {
     int dz = mouse_wheel_take();
     if (dz && vga_is_gfx())
       gfx_term_view_scroll(-dz * 3);
-    extern volatile int cpu_idle;
-    cpu_idle = 1;
-    __asm__ volatile("sti; hlt");
-    cpu_idle = 0;
+    cpu_wait();
   }
 }
 

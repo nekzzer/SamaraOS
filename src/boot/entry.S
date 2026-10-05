@@ -68,6 +68,8 @@ isr_common:
     cld
     call isr_dispatch
     mov %rax, %rsp
+    mov %rax, %rdi
+    call isr_leave
 isr_exit:
     testb $3, 144(%rsp)
     jz 2f
@@ -91,7 +93,9 @@ syscall_entry:
     push_regs
     mov %rsp, %rdi
     cld
-    call syscall_dispatch
+    call syscall_enter
+    mov %rsp, %rdi
+    call isr_leave
     jmp isr_exit
 
 /* first entry of a fresh task: rdi = frame to restore */

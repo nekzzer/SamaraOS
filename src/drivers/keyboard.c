@@ -1,3 +1,4 @@
+#include "core/task.h"
 #include "drivers/keyboard.h"
 #include "core/io.h"
 #include "boot/pic.h"
@@ -231,8 +232,7 @@ char kbd_trygetc(void) {
 
 char kbd_getc(void) {
     char c = 0;
-    extern volatile int cpu_idle;
-    while (!buf_pop(&c)) { cpu_idle = 1; __asm__ volatile ("sti; hlt"); cpu_idle = 0; }
+    while (!buf_pop(&c)) cpu_wait();
     return c;
 }
 

@@ -77,3 +77,23 @@ void fpu_init(void) {
     idt_set_handler(19, xm_isr);   /* #XM SIMD Floating-Point */
     idt_set_handler(16, mf_isr);   /* #MF x87 FP Error */
 }
+
+/* the same cr0/cr4/mxcsr setup for an ap */
+void fpu_cpu_init(void) {
+    uint64_t cr0;
+    __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+    cr0 &= ~(CR0_EM | CR0_TS);
+    cr0 |=  (CR0_MP | CR0_NE);
+    __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0));
+    __asm__ volatile ("fninit");
+    uint16_t cw = 0x027F;
+    __asm__ volatile ("fldcw %0" : : "m"(cw));
+    if (g_sse) {
+        uint64_t cr4;
+        __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+        cr4 |= (1ul << 9) | (1ul << 10);
+        __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4));
+        uint32_t mxcsr = 0x1F80;
+        __asm__ volatile ("ldmxcsr %0" : : "m"(mxcsr));
+    }
+}

@@ -1,3 +1,4 @@
+#include "boot/gdt.h"
 /* /proc, rebuilt from live kernel state.
 
    The files are ordinary ramfs nodes under /proc that are regenerated on
@@ -222,7 +223,7 @@ static void fill_globals(char* mem, uint32_t cap) {
 
     uint32_t up = pit_uptime_ms() / HZ_DIV;
     b = (sb_t){ mem, 0, cap };
-    sb_frac(&b, up); sb_putc(&b, ' '); sb_frac(&b, cpu_ticks_idle / HZ_DIV); sb_putc(&b, '\n');
+    sb_frac(&b, up); sb_putc(&b, ' '); sb_frac(&b, cpus[0].t_idle / HZ_DIV); sb_putc(&b, '\n');
     put(proc_root, "uptime", &b);
 
     int nproc = 0, running = 0, last = 0;
@@ -238,12 +239,16 @@ static void fill_globals(char* mem, uint32_t cap) {
     sb_int(&b, nproc); sb_putc(&b, ' '); sb_int(&b, last); sb_putc(&b, '\n');
     put(proc_root, "loadavg", &b);
 
-    uint32_t us = cpu_ticks_user / HZ_DIV, sy = cpu_ticks_sys / HZ_DIV, id = cpu_ticks_idle / HZ_DIV;
+    uint32_t us = 0, sy = 0, id = 0;
+    for (int i = 0; i < ncpu; i++) { us += cpus[i].t_user; sy += cpus[i].t_sys; id += cpus[i].t_idle; }
+    us /= HZ_DIV; sy /= HZ_DIV; id /= HZ_DIV;
     b = (sb_t){ mem, 0, cap };
-    for (int k = 0; k < 2; k++) {
-        sb_puts(&b, k ? "cpu0 " : "cpu  ");
-        sb_num(&b, us); sb_puts(&b, " 0 "); sb_num(&b, sy); sb_putc(&b, ' ');
-        sb_num(&b, id); sb_puts(&b, " 0 0 0 0 0 0\n");
+    for (int k = 0; k <= ncpu; k++) {
+        uint32_t u = us, s2 = sy, i2 = id;
+        if (k) { u = cpus[k-1].t_user / HZ_DIV; s2 = cpus[k-1].t_sys / HZ_DIV; i2 = cpus[k-1].t_idle / HZ_DIV; sb_puts(&b, "cpu"); sb_int(&b, k - 1); sb_putc(&b, ' '); }
+        else sb_puts(&b, "cpu  ");
+        sb_num(&b, u); sb_puts(&b, " 0 "); sb_num(&b, s2); sb_putc(&b, ' ');
+        sb_num(&b, i2); sb_puts(&b, " 0 0 0 0 0 0\n");
     }
     sb_puts(&b, "intr "); sb_num(&b, pit_ticks());
     sb_puts(&b, "\nctxt "); sb_num(&b, cpu_ctxt);
@@ -258,8 +263,11 @@ static void fill_globals(char* mem, uint32_t cap) {
     put(proc_root, "version", &b);
 
     b = (sb_t){ mem, 0, cap };
-    sb_puts(&b, "processor\t: 0\nvendor_id\t: SamaraOS\nmodel name\t: x86_64 (QEMU)\n"
-                "cpu MHz\t\t: 1000.000\nflags\t\t: fpu pse tsc fxsr\nbogomips\t: 2000.00\n\n");
+    for (int k = 0; k < ncpu; k++) {
+        sb_puts(&b, "processor\t: "); sb_int(&b, k);
+        sb_puts(&b, "\nvendor_id\t: SamaraOS\nmodel name\t: x86_64 (QEMU)\n"
+                    "cpu MHz\t\t: 1000.000\nflags\t\t: fpu pse tsc fxsr\nbogomips\t: 2000.00\n\n");
+    }
     put(proc_root, "cpuinfo", &b);
 
     b = (sb_t){ mem, 0, cap };

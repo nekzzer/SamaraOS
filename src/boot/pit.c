@@ -1,6 +1,7 @@
 #include "boot/pit.h"
 #include "core/io.h"
 #include "boot/pic.h"
+#include "boot/apic.h"
 
 /* Sentinel guarded at the bottom of the boot stack so we notice an overflow
    before it scribbles over critical .bss / page tables. */
@@ -41,7 +42,7 @@ static uint32_t hz_ = 100;
 /* Milliseconds accumulate per tick instead of ticks*1000/hz, which overflows
    32 bits after ~71 minutes at 1 kHz. */
 uint32_t pit_ticks(void) { return ticks_; }
-uint32_t pit_uptime_ms(void) { return ms_; }
+uint32_t pit_uptime_ms(void) { return tsc_khz ? (uint32_t)tsc_ms() : ms_; }   // tsc, the lapic tick drifts under kvm
 void     pit_tick_inc(void) {                /* called from scheduler ISR */
     ticks_++;
     ms_frac_ += 1000U;
@@ -50,6 +51,7 @@ void     pit_tick_inc(void) {                /* called from scheduler ISR */
 
 void pit_init(uint32_t hz) {
     hz_ = hz;
+    if (apic_on) { apic_timer_start(); return; }
     uint32_t div = PIT_FREQ / hz;
     outb(0x43, 0x36);
     outb(0x40, (uint8_t)(div & 0xFF));

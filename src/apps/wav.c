@@ -1,3 +1,4 @@
+#include "core/task.h"
 #include "apps/wav.h"
 #include "drivers/sb16.h"
 #include "core/string.h"
@@ -130,7 +131,7 @@ int wav_play(const uint8_t* buf, uint32_t len) {
         while (sb16_busy()) {
             char c = kbd_trygetc();
             if (c == 3 || c == 0x1B) { sb16_stop(); return 0; }
-            __asm__ volatile ("hlt");
+            cpu_wait();
         }
     }
     return 0;

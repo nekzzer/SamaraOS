@@ -27,6 +27,9 @@ typedef struct task {
     uint64_t      fs_base;     /* user TLS, written to the MSR on switch */
     uint8_t*      fpu_alloc;
     uint32_t      wake_ms;     /* T_BLOCKED sleeper: ready again at this uptime */
+    volatile int  on_cpu;      /* some cpu runs on this stack (or is still leaving it) */
+    int           cpu;         /* the one that ran it last */
+    int           ysw;         /* last yield went to somebody else */
 } task_t;
 
 /* Frame built by every entry path (isr stubs, syscall_entry, see boot/entry.S),
@@ -50,6 +53,9 @@ void  task_exit(void);
 void  task_yield(void);
 void  task_sleep_ms(uint32_t ms);   /* kernel tasks: give up the CPU for a while */
 task_t* task_current(void);
+void  task_ready(task_t* t);        /* blocked -> ready, wakes a parked cpu */
+void  cpu_wait(void);               /* sti; hlt without holding the big lock */
+void  task_ap_start(int id);        /* an ap becomes its cpu's idle task */
 void  task_dump(void (*emit)(const char*));
 int   task_count(void);
 task_t* task_at(int idx);
