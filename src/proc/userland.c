@@ -249,7 +249,7 @@ int userland_install(void) {
              "    [ -f $C ] || dropbearkey -t ed25519 -f $C >/dev/null 2>&1\n"
              "    for h in /root /home/user; do mkdir -p $h/.ssh; cp $C $h/.ssh/id_dropbear; done\n"
              "fi\n"
-             "dropbear -B -r $K -p 22\n"
+             "dropbear -B -r $K -p 0.0.0.0:22\n"
              "telnetd -l /bin/login -p 23\n");
     fs_node_t* rc = fs_resolve(fs_root(), "/etc/rc");
     if (rc) rc->mode = 0755;

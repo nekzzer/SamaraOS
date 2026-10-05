@@ -373,8 +373,8 @@ static int do_rw(req_t* q, char* buf, uint32_t n, bool wr) {
     if (wr && f->type == F_PIPE_W && f->pipe->readers <= 0) return -32;     // EPIPE, no SIGPIPE from here
     uint64_t off = q->sqe.off;
     if (off == ~0ull || f->type != F_NODE) return wr ? file_write(f, buf, n) : file_read(f, buf, n);
-    uint32_t save = f->off;
-    f->off = (uint32_t)off;
+    uint64_t save = f->off;
+    f->off = off;
     int ret = wr ? file_write(f, buf, n) : file_read(f, buf, n);
     f->off = save;
     return ret;

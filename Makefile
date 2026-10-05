@@ -198,7 +198,7 @@ USERLAND_BINS := userland/busybox userland/busybox.applets userland/sysroot.tar 
 USERLAND_OBJS := $(addsuffix .bin.o,$(USERLAND_BINS))
 # fm is a static x86_64 musl binary, committed like busybox. `make fm` rebuilds it
 # from userland/samara/ against musl-devel from void: XBPS_ARCH=x86_64-musl xbps-install -S -r $(MUSL64) -R <void repo>/current/musl musl-devel
-MUSL64 ?= /tmp/int-x64sdk
+MUSL64 ?= toolchain/x64sdk
 fm:
 	gcc -O2 -s -w -static -nostdinc -isystem $$(gcc -print-file-name=include) -isystem $(MUSL64)/usr/include -nostdlib \
 	    -fno-stack-protector -fno-pie -no-pie -Iuserland/samara -o userland/fm \
@@ -296,7 +296,7 @@ NET_DRIVE := -netdev user,id=n0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,hostf
 # writes changes back, so files there survive reboots. Created on first run;
 # on the host: `mdir -i disk.img ::` / `mcopy -i disk.img ::file .`
 DISK_IMG ?= disk.img
-ROOTDISK ?= build/root.img
+ROOTDISK ?= build/root-x64.img
 DISK_DRIVE := -device ahci,id=ahci -drive id=sata0,file=$(DISK_IMG),format=raw,if=none \
               -device ide-hd,drive=sata0,bus=ahci.0
 
@@ -369,6 +369,8 @@ DISK_DRIVE += $(if $(VDISK),-drive file=$(VDISK)$(comma)format=raw$(comma)if=vir
 # you change in /usr /lib /etc /root survives a reboot. ROOTDISK= to go
 # without it, rm build/root.img to start clean.
 DISK_DRIVE += $(if $(ROOTDISK),-drive file=$(ROOTDISK)$(comma)format=raw$(comma)if=virtio)
+build/root-x64.img:
+	sh userland/build-x64root.sh $@
 build/root.img:
 	@mkdir -p build
 	truncate -s 2G $@

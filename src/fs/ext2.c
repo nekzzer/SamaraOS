@@ -73,6 +73,16 @@ static int wblk(ev_t* v, uint32_t b, const void* buf) {
     return ata_write(v->disk, b * v->spb, (int)v->spb, buf);
 }
 
+/* statfs of the volume n sits on, false if it isn't ext2. free count is from the last sync */
+bool ext2_statfs(fs_node_t* n, uint32_t* bs, uint64_t* tot, uint64_t* fr) {
+    fs_node_t* o = n ? fs_owner(n) : NULL;
+    if (!o || o->mount_id < E2_ID0 || o->mount_id >= E2_ID0 + E2_MAX) return false;
+    ev_t* v = &vols[o->mount_id - E2_ID0];
+    if (!v->used) return false;
+    *bs = v->bs; *tot = v->nblocks; *fr = rd32(v->sb + 12);
+    return true;
+}
+
 /* volume label; we use "/some/path" labels as the mount point */
 void ext2_label(int disk, char* out) {
     uint8_t s[1024];
@@ -378,6 +388,14 @@ static void orphan(ev_t* v, uint32_t ino, int depth) {
     kfree(d);
 }
 
+/* boot made /bin, void has /bin -> usr/bin: the boot dir goes away */
+static void drop(fs_node_t* n) {
+    while (n->child) { fs_node_t* c = n->child; drop(c); }
+    fs_detach(n);
+    fs_data_free(n);
+    kfree(n);
+}
+
 static int load_dir(ev_t* v, fs_node_t* dir, uint32_t dino, int depth) {
     static uint8_t ib[4096];
     uint8_t raw[256];
@@ -413,6 +431,7 @@ static int load_dir(ev_t* v, fs_node_t* dir, uint32_t dino, int depth) {
            the disk wins, except over mounts, devices and type clashes */
         fs_node_t* old = fs_child(dir, name);
         if (old && (old->mount_id || old->dev)) { orphan(v, ino, depth + 1); continue; }
+        if (old && old->type == FS_DIR && (mode & 0xF000) == 0xA000 && dir == fs_root()) { drop(old); old = NULL; }
         fs_node_t* n = NULL;
         uint8_t ty = 0;
         uint32_t want = (mode & 0xF000) == 0x4000 ? FS_DIR : (mode & 0xF000) == 0x8000 ? FS_FILE : (mode & 0xF000) == 0xA000 ? FS_LINK : 0;

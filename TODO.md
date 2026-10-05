@@ -40,8 +40,11 @@ make run SELF=0 NICS=3                      # + virtio-net cards eth1, eth2
   64 bit iovec/addrs, msghdr check 56). liburing static musl: io_uring-test/cp, link-cp (md5 ok), test/ nop probe link
   link-timeout timeout fsync connect accept-link cq-full eventfd poll-many all rc=0. IORING_OP_STATX works only via uring
   (syscall 332 is still ENOSYS)
-* left: userland/sysroot.tar is still the old i386 one (samarafetch, tetris, tcc... don't run), no
-  x86_64 rebuild of it; ping6 prints ttl=-1 (no IPV6_HOPLIMIT cmsg); bochs drm has no hw cursor
+* void userland: `build/root-x64.img` (userland/build-x64root.sh, 97 void x86_64-musl packages, ext2 root), xbps-install/remove
+  work (gcc, xterm, nano installs checked, e2fsck clean), gcc compiles and runs. sysroot.tar is x86_64 now (samara apps + sources).
+  fork is COW, kernel faults on user addresses return EFAULT. no hard links in the fs (the image build copies them),
+  fallocate/flock are stubs, mremap grow often ENOMEM (musl copes)
+* left: ping6 prints ttl=-1 (no IPV6_HOPLIMIT cmsg); bochs drm has no hw cursor
   (ENXIO, expected); fm right click / menus only checked by eye on the first screen, not clicked through
 
 ## Done recently (all committed and pushed)

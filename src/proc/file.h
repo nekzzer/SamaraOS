@@ -29,7 +29,7 @@ typedef struct file {
     ftype_t    type;
     int        refs;
     int        flags;       /* O_* status flags (access mode, O_APPEND, O_NONBLOCK) */
-    uint32_t   off;
+    uint64_t   off;
     fs_node_t* node;
     pipe_t*    pipe;
     pipe_t*    pipe2;       /* F_SPAIR: transmit direction */

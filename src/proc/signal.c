@@ -51,7 +51,7 @@ static bool user_writable(proc_t* p, uint64_t lo, uint64_t len) {
     for (uint64_t a = lo & ~(PAGE_SIZE - 1); a < lo + len; a += PAGE_SIZE) {
         uint64_t pte = vmm_pte(p->pd, a);
         if ((pte & PTE_P) && (pte & PTE_RW)) continue;
-        if (pte & PTE_P) return false;
+        if (pte & PTE_P) { if ((pte & PTE_COW) && vmm_cow(p->pd, a)) continue; return false; }
         if (pte & PTE_LAZY) { if ((pte & PTE_RW) && (pte & PTE_US) && vmm_fault_in(p->pd, a)) continue; return false; }
         if (a < USER_STACK_TOP - USER_STACK_MAX || a >= USER_STACK_TOP) return false;
         if (vmm_alloc_range(p->pd, a, PAGE_SIZE, true) < 0) return false;
