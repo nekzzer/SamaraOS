@@ -136,10 +136,17 @@ void bkl_leave(int taken) {
 }
 
 /* we sit at a yield point: let a waiting cpu in, if any. ticket lock so it gets it */
+/* irqs off in here: gfx_present/ext2 call it from kernel tasks with irqs on, an irq between
+   drop and take took a second ticket on the same cpu and the desktop froze. c is ignored,
+   the caller's this_cpu() may already be stale after a migration */
 void bkl_yield(struct cpu* c) {
-    if (!c->bkl || tk_next - tk_serve < 2) return;
-    bkl_drop(c);
-    bkl_take(c);
+    uint64_t f = irq_save();
+    c = this_cpu();
+    if (c->bkl && tk_next - tk_serve >= 2) {
+        bkl_drop(c);
+        bkl_take(c);
+    }
+    irq_restore(f);
 }
 
 /* pd != 0: only the cpus that have that space loaded. whoever loads it later flushes by
