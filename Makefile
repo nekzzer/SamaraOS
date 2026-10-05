@@ -66,6 +66,7 @@ KERN_SRC := \
     src/boot/gdt.c \
     src/core/smp.c \
     src/core/prof.c \
+    src/core/ksym.c \
     src/boot/idt.c \
     src/boot/paging.c \
     src/boot/fpu.c \
@@ -281,8 +282,19 @@ $(DGEN_DIR)/%.o: $(DGEN_DIR)/%.c | build
 
 # qemu -kernel wants an elf32 multiboot image: the 64 bit one gets its
 # addresses cut down to the low ones (LMA) by objcopy
-$(KERNEL): $(ALL_OBJ) linker.ld | build
-	$(LD) $(LDFLAGS) -o build/samara64.elf $(ALL_OBJ) $(LIBGCC)
+# symbol table for the panic backtrace: link once with an empty one, nm it,
+# link again. the table lives in .rodata, after .text, so nothing moves
+build/ksyms.c: $(ALL_OBJ) linker.ld tools/mkksyms.py | build
+	printf 'const unsigned long ksym_n = 0; const unsigned long ksym_addr[1] = {0}; const unsigned int ksym_size[1] = {0}, ksym_off[1] = {0}; const char ksym_names[1] = {0};\n' > build/ksyms0.c
+	$(CC) $(KCFLAGS) -c build/ksyms0.c -o build/ksyms0.o
+	$(LD) $(LDFLAGS) -o build/pre.elf $(ALL_OBJ) build/ksyms0.o
+	$(CROSS)nm -n -S --defined-only build/pre.elf | python3 tools/mkksyms.py > $@
+
+build/ksyms.o: build/ksyms.c
+	$(CC) $(KCFLAGS) -c $< -o $@
+
+$(KERNEL): $(ALL_OBJ) build/ksyms.o linker.ld | build
+	$(LD) $(LDFLAGS) -o build/samara64.elf $(ALL_OBJ) build/ksyms.o $(LIBGCC)
 	$(OBJCOPY) -O elf32-i386 build/samara64.elf $@
 
 # Music directory served as a read-only virtual FAT16 disk on secondary IDE.

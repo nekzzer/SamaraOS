@@ -101,6 +101,7 @@ static void dump(const char* tag, uint64_t err, uint64_t rip,
    become a signal with a context the handler may edit - java needs that */
 extern void longjmp(void* env, int val) __attribute__((noreturn));
 extern void pt_trap(regs_t* r);
+extern void kpanic_dump(const char* what, regs_t* r);
 static void fault_c(regs_t* r) {
     uint64_t vec = r->vec, err = r->err, cr2 = 0;
     if (vec == 14) {
@@ -125,13 +126,8 @@ static void fault_c(regs_t* r) {
     }
     if (vec == 14 && cr2 >= USER_BASE && cr2 < USER_TOP && proc_current())
         proc_fault_kill("bad user ptr", 11, r->rip, cr2);
-    {   // poor man's backtrace
-        uint64_t* sp = (uint64_t*)r->rsp;
-        extern int last_vec; com_str("last="); com_hex(last_vec); com_str("rsp="); com_hex(r->rsp); com_str(" stk:");
-        for (int i = -60; i < 400; i++) if (sp[i] >= 0xffffffff80100000ul && sp[i] < 0xffffffff801b5000ul) { com_str(" "); com_hex(i); com_str(":"); com_hex(sp[i]); }
-        com_str("\r\n");
-    }
     dump(vec == 14 ? "PF" : vec == 13 ? "GP" : vec == 6 ? "UD" : vec == 8 ? "DF" : "DE", err, r->rip, r->cs, cr2);
+    kpanic_dump("kernel fault", r);
     __asm__ volatile ("cli");
     for (;;) __asm__ volatile ("hlt");
 }
