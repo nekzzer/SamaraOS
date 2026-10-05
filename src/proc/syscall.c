@@ -417,6 +417,34 @@ static int64_t do_lseek(int fd, int64_t off, int whence) {
     return pos;
 }
 
+/* copy_file_range / sendfile: through a kernel buffer, offsets are optional pointers */
+static int64_t do_copy(int ifd, uint64_t* ioff, int ofd, uint64_t* ooff, uint64_t len) {
+    file_t* fi = getf(ifd);
+    file_t* fo = getf(ofd);
+    if (!fi || !fo) return -EBADF;
+    if (ioff) UCHK(ioff, 8);
+    if (ooff) UCHK(ooff, 8);
+    char* kb = kmalloc(65536);
+    if (!kb) return -ENOMEM;
+    uint64_t si = fi->off, so = fo->off;
+    if (ioff) fi->off = *ioff;
+    if (ooff) fo->off = *ooff;
+    int64_t tot = 0;
+    while (len) {
+        int n = len > 65536 ? 65536 : (int)len;
+        int r = file_read(fi, kb, n);
+        if (r <= 0) { if (!tot) tot = r; break; }
+        int w = file_write(fo, kb, r);
+        if (w <= 0) { if (!tot) tot = w; break; }
+        tot += w; len -= w;
+        if (w < r) break;
+    }
+    kfree(kb);
+    if (ioff) { *ioff = fi->off; fi->off = si; }
+    if (ooff) { *ooff = fo->off; fo->off = so; }
+    return tot;
+}
+
 static int do_getdents64(int fd, uint8_t* buf, uint64_t n) {
     file_t* f = getf(fd);
     if (!f) return -EBADF;
@@ -1904,6 +1932,7 @@ static int64_t nl_call(int call, file_t* f, uint64_t b, uint64_t c, uint64_t d, 
                 if (mh->name && ncap >= 12) { UCHK((void*)mh->name, 12); memset((void*)mh->name, 0, 12); *(uint16_t*)mh->name = 16; mh->namelen = 12; }   // sockaddr_nl, busybox ip wants it
             } else { buf = (uint8_t*)b; cap = c; }
             if (!q->count) return -EAGAIN;
+            if ((call == 17 ? c : d) & 0x20 && (call == 17 ? c : d) & 2) return q->count;   /* PEEK|TRUNC: iproute2 sizes its buffer */
             UCHK(buf, cap);
             // whole messages only, never split one
             uint32_t n = 0;
@@ -2429,6 +2458,11 @@ static int64_t dispatch(regs_t* r) {
             return 0;
         }
         case 126: return 0;                                          /* capset: sure */
+        case 188: case 189: case 190: return -95;           /* setxattr family: no xattrs */
+        case 191: case 192: case 193: return -61;                    /* getxattr: ENODATA */
+        case 194: case 195: case 196: return 0;                      /* listxattr: empty (ls -l, cp -a, xbps) */
+        case 197: case 198: case 199: return -95;                    /* removexattr */
+        case 444: case 445: case 446: return -ENOSYS;                /* landlock, xz asks */
         case 285: return -95;                                        /* fallocate, apk asks. EOPNOTSUPP and it just writes */
         // signalfd(4), membarrier, rseq: not here yet. glib/qemu fall back
         // to pipes and poll on ENOSYS, so just say no without spamming the log
@@ -2552,7 +2586,8 @@ static int64_t dispatch(regs_t* r) {
         case 45:  return sys_socket_call(12, a, b, c, d, e, f6);      /* recvfrom */
         case 47:  return sys_socket_call(17, a, b, c, 0, 0, 0);       /* recvmsg */
         case 48:  return sys_socket_call(13, a, b, 0, 0, 0, 0);       /* shutdown */
-        case 40:  return -EINVAL;                                    /* sendfile: use read/write */
+        case 40:  return do_copy((int)b, (uint64_t*)c, (int)a, NULL, d);
+        case 326: return do_copy((int)a, (uint64_t*)b, (int)c, (uint64_t*)d, e);
         case 101: case 103: return -EPERM;
         case 425: return uring_setup(a, (void*)b);
         case 426: return uring_enter((int)a, b, c, d, (const void*)e, f6);
@@ -2692,13 +2727,13 @@ void fs_wait_room(uint32_t need) {
    a blocking write into a pipe would hold the sync off forever */
 static bool changes_fs(uint64_t nr, uint64_t a) {
     switch (nr) {
-        case 1: case 20: case 18: case 77: case 285: case 91: {
+        case 1: case 20: case 18: case 77: case 285: case 91: case 40: {
             file_t* f = getf((int)a);
             return f && f->type == F_NODE;
         }
         case 2: case 85: case 257: case 87: case 263: case 82: case 264: case 316:
         case 83: case 258: case 84: case 88: case 266: case 86: case 265:
-        case 76: case 90: case 268: case 132: case 235: case 280:
+        case 76: case 90: case 268: case 132: case 235: case 280: case 326:
             return true;
     }
     return false;
