@@ -87,7 +87,19 @@ static void x_try_map(struct xw *w) {
         s->parent = kfocus->s;
         wl_list_remove(&s->link);
         wl_list_insert(kfocus->s->popups.prev, &s->link);
-        s->px = w->x; s->py = w->y;
+        /* keep the menu inside the toplevel, the DE window clips it */
+        int mx = w->x, my = w->y;
+        if (mx + s->w > kfocus->cw) mx = kfocus->cw - s->w;
+        if (my + s->h > kfocus->ch) my = kfocus->ch - s->h;
+        if (mx < 0) mx = 0;
+        if (my < 0) my = 0;
+        if (mx != w->x || my != w->y) {
+            uint32_t v[2] = { mx, my };
+            xcb_configure_window(xc, w->id, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, v);
+            xcb_flush(xc);
+            w->x = mx; w->y = my;
+        }
+        s->px = mx; s->py = my;
         compose(kfocus, s->px, s->py, s->px + s->w, s->py + s->h);
         present(kfocus);
         return;
@@ -227,7 +239,7 @@ static int xwm_readable(int fd, uint32_t mask, void *d) {
         case XCB_UNMAP_NOTIFY: {
             struct xw *w = xw_find(((xcb_unmap_notify_event_t *)e)->window);
             if (w && w->t) { w->t->s->root = NULL; tl_destroy(w->t); w->t = NULL; }
-            else if (w && w->s && w->s->parent) { w->s->parent = NULL; }
+            else if (w && w->s && w->s->parent) surf_unmap(w->s);
             if (w) w->mapped = false;
             break;
         }
