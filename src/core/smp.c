@@ -132,7 +132,7 @@ void bkl_leave(int taken) {
 
 /* we sit at a yield point: let a waiting cpu in, if any. ticket lock so it gets it */
 void bkl_yield(struct cpu* c) {
-    if (tk_next - tk_serve < 2) return;
+    if (!c->bkl || tk_next - tk_serve < 2) return;
     bkl_drop(c);
     bkl_take(c);
 }
