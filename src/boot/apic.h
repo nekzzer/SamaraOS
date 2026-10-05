@@ -18,6 +18,7 @@ int  lapic_id(void);
 void lapic_ipi(int apic_id, int vec);
 void lapic_ipi_raw(int apic_id, uint32_t icr);
 void ioapic_irq(int irq, bool mask);   /* isa irq -> its gsi, vector 0x20+irq, to the bsp */
+uint64_t tsc_us(void);
 uint64_t tsc_ms(void);                 /* time since boot, tsc based */
 
 #endif
