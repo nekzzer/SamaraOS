@@ -7,6 +7,7 @@
 struct wl_display *dpy;
 struct wl_list tls;
 int scr_w, scr_h;
+int scale = 1;
 static uint32_t serial;
 static struct wl_event_source *ftimer;
 static struct wl_event_loop *loop;
@@ -79,6 +80,14 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 100 && (r = sm(OP_SCREEN, 0, 0, 0)) <= 0; i++) usleep(100000);
     scr_w = r >> 16; scr_h = r & 0xFFFF;
     if (scr_w <= 0) { fprintf(stderr, "samara-wl: no desktop\n"); return 1; }
+
+    char *e = getenv("SAMARA_SCALE");
+    FILE *f = fopen("/etc/samara-de.conf", "r");
+    char ln[64];
+    if (e) scale = atoi(e);
+    else while (f && fgets(ln, sizeof ln, f)) sscanf(ln, "scale=%d", &scale);
+    if (f) fclose(f);
+    if (scale < 1 || scale > 4) scale = 1;
 
     mkdir("/run", 0755);
     mkdir("/run/user", 0755);

@@ -112,7 +112,7 @@ static void pfocus_set(struct surf *s, int x, int y) {
     uint32_t sr = next_serial();
     wl_list_for_each(k, &ptrs, link)
         if (wl_resource_get_client(k->r) == s->cl)
-            wl_pointer_send_enter(k->r, sr, s->res, wl_fixed_from_int(x), wl_fixed_from_int(y));
+            wl_pointer_send_enter(k->r, sr, s->res, wl_fixed_from_double((double)x / scale), wl_fixed_from_double((double)y / scale));
     pframe(s->cl);
 }
 
@@ -129,7 +129,7 @@ void ptr_event(struct tl *t, uev_t *e) {
         if (e->type == EV_PMOVE && pfocus) {
             wl_list_for_each(k, &ptrs, link)
                 if (wl_resource_get_client(k->r) == pfocus->cl)
-                    wl_pointer_send_motion(k->r, ms, wl_fixed_from_int(lx), wl_fixed_from_int(ly));
+                    wl_pointer_send_motion(k->r, ms, wl_fixed_from_double((double)lx / scale), wl_fixed_from_double((double)ly / scale));
             pframe(pfocus->cl);
         }
         return;

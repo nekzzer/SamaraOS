@@ -10,7 +10,7 @@ void xdg_top_configure(struct tl *t, int w, int h) {
     struct wl_array st;
     wl_array_init(&st);
     if (t->focus) *(uint32_t *)wl_array_add(&st, 4) = XDG_TOPLEVEL_STATE_ACTIVATED;
-    if (t->xt) xdg_toplevel_send_configure(t->xt, w, h, &st);
+    if (t->xt) xdg_toplevel_send_configure(t->xt, w / scale, h / scale, &st);
     wl_array_release(&st);
     if (t->deco) zxdg_toplevel_decoration_v1_send_configure(t->deco, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
     t->cfg = next_serial();
@@ -193,14 +193,15 @@ static void xs_popup(struct wl_client *c, struct wl_resource *r, uint32_t id, st
     struct surf *q = ps;
     int bx, by;
     surf_rect(ps, &bx, &by);
+    bx /= scale; by /= scale;
     while (q->parent) q = q->parent;
     if (q->root && q->root->h >= 0) {
-        if (bx + x + p->w > q->root->cw) x = q->root->cw - p->w - bx;
-        if (by + y + p->h > q->root->ch) y = q->root->ch - p->h - by;
+        if (bx + x + p->w > q->root->cw / scale) x = q->root->cw / scale - p->w - bx;
+        if (by + y + p->h > q->root->ch / scale) y = q->root->ch / scale - p->h - by;
         if (bx + x < 0) x = -bx;
         if (by + y < 0) y = -by;
     }
-    s->px = x; s->py = y;
+    s->px = x * scale; s->py = y * scale;
     xdg_popup_send_configure(s->xp, x, y, p->w, p->h);
     xdg_surface_send_configure(r, next_serial());
 }

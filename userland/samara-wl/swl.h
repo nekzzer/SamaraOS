@@ -37,6 +37,7 @@ struct surf {
     struct wl_list subs, popups, link, glink; /* children, link in parent's list, all surfaces */
     struct wl_resource *xs;            /* xdg_surface */
     struct wl_resource *xp;            /* xdg_popup */
+    int bs, k;                         /* buffer_scale, pixel multiplier we apply */
     int xwin;                          /* x11 window id, 0 if none */
     bool grab, sub_sync;
     struct wl_listener bl;             /* pending buffer destroyed */
@@ -100,6 +101,7 @@ void xdg_close(struct tl *t);
 void popup_dismiss(struct tl *t);
 
 /* xwm.c */
+extern int scale;
 void xwm_start(void);
 void xwm_surface(int win, struct wl_resource *sres);
 void xwm_close(struct tl *t);
