@@ -10,6 +10,7 @@
 #include "core/task.h"
 #include "boot/pit.h"
 #include "drivers/ata.h"
+#include "fs/mount.h"
 #include "net/sock.h"
 #include "drivers/fbdev.h"
 #include "drivers/drm.h"
@@ -228,6 +229,8 @@ int node_write_at(fs_node_t* n, uint32_t off, const char* buf, uint32_t len) {
     if (n->type != FS_FILE) return -EISDIR;
     if (n->pc) pc_sync(n);
     uint32_t end = off + len;
+    int g = mnt_grow(n, end);
+    if (g < 0) return g;
     if (node_reserve(n, end > n->size ? end : n->size) < 0) return -ENOMEM;
     if (off > n->size) memset(n->data + n->size, 0, off - n->size);
     memcpy(n->data + off, buf, len);
@@ -241,6 +244,8 @@ int node_write_at(fs_node_t* n, uint32_t off, const char* buf, uint32_t len) {
 int node_truncate(fs_node_t* n, uint32_t len) {
     if (n->type != FS_FILE) return -EISDIR;
     if (n->pc) pc_sync(n);
+    int g = mnt_grow(n, len);
+    if (g < 0) return g;
     if (n->data && !n->cap && node_reserve(n, n->size) < 0) return -ENOMEM;   /* borrowed */
     if (len > n->size) {
         if (node_reserve(n, len) < 0) return -ENOMEM;
@@ -270,6 +275,22 @@ static int disk_rw(file_t* f, char* buf, uint32_t n, bool write) {
     uint32_t done = 0;
     while (done < n) {
         uint32_t lba = f->off / 512, in = f->off % 512;
+        if (!in && n - done >= 512) {                    /* whole sectors in one go */
+            uint32_t cnt = (n - done) / 512;
+            if (cnt > 128) cnt = 128;
+            char* big = kmalloc(cnt * 512);
+            if (!big) cnt = 1;
+            else {
+                int r;
+                if (write) { memcpy(big, buf + done, cnt * 512); r = ata_write(f->disk, lba, (int)cnt, big); }
+                else { r = ata_read(f->disk, lba, (int)cnt, big); if (!r) memcpy(buf + done, big, cnt * 512); }
+                kfree(big);
+                if (r < 0) break;
+                done += cnt * 512;
+                f->off += cnt * 512;
+                continue;
+            }
+        }
         uint32_t k = 512 - in;
         if (k > n - done) k = n - done;
         if (ata_read(f->disk, lba, 1, sec) < 0) break;
@@ -390,6 +411,37 @@ static int pipe_write(file_t* f, pipe_t* p, const char* buf, uint32_t n) {
         spin_unlock(&p->lk, fl);
     }
     return (int)put;
+}
+
+/* tee: copy what is in a's pipe into b's, a keeps it */
+int pipe_tee(file_t* a, file_t* b, uint32_t len) {
+    pipe_t* p = a->pipe;
+    if (len > PIPE_SZ) len = PIPE_SZ;
+    char* tmp = kmalloc(len ? len : 1);
+    if (!tmp) return -ENOMEM;
+    WQ_W(w);
+    uint32_t k;
+    for (;;) {
+        bool intr = proc_interrupted();
+        uint64_t fl = spin_lock(&p->lk);
+        if (p->count == 0) {
+            if (p->writers <= 0) { spin_unlock(&p->lk, fl); kfree(tmp); return 0; }
+            if (a->flags & O_NONBLOCK) { spin_unlock(&p->lk, fl); kfree(tmp); return -EAGAIN; }
+            if (intr) { spin_unlock(&p->lk, fl); kfree(tmp); return -EINTR; }
+            pipe_sleep(p, fl, &w);
+            continue;
+        }
+        k = (uint32_t)p->count < len ? (uint32_t)p->count : len;
+        uint32_t c1 = PIPE_SZ - (uint32_t)p->tail;
+        if (c1 > k) c1 = k;
+        memcpy(tmp, p->buf + p->tail, c1);
+        memcpy(tmp + c1, p->buf, k - c1);
+        spin_unlock(&p->lk, fl);
+        break;
+    }
+    int r = pipe_write(b, b->pipe, tmp, k);
+    kfree(tmp);
+    return r;
 }
 
 uint32_t file_gen(file_t* f) {

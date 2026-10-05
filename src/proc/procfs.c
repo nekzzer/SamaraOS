@@ -17,6 +17,7 @@
 #include "core/clock.h"
 #include "boot/pit.h"
 #include "fs/fatfs.h"
+#include "fs/mount.h"
 #include "net/net.h"
 #include "core/prof.h"
 
@@ -145,8 +146,7 @@ static void fill_pid_dir(fs_node_t* d, proc_t* p, char* mem, uint32_t cap) {
     }
 
     b = (sb_t){ mem, 0, cap };                                /* df and friends read /proc/self/mounts (void's /etc/mtab) */
-    sb_puts(&b, "rootfs / ramfs rw 0 0\nproc /proc proc rw 0 0\n");
-    b.len += (uint32_t)fatfs_mounts_text(b.buf + b.len, (int)(b.cap - b.len));
+    b.len += (uint32_t)mnt_text(b.buf + b.len, (int)(b.cap - b.len));
     put(d, "mounts", &b);
 
     static const char* const long_state[] = { "R (running)", "S (sleeping)", "Z (zombie)", "t (tracing stop)" };
@@ -311,12 +311,11 @@ static void fill_globals(char* mem, uint32_t cap) {
     put(proc_root, "cpuinfo", &b);
 
     b = (sb_t){ mem, 0, cap };
-    sb_puts(&b, "rootfs / ramfs rw 0 0\nproc /proc proc rw 0 0\n");
-    b.len += (uint32_t)fatfs_mounts_text(b.buf + b.len, (int)(b.cap - b.len));
+    b.len += (uint32_t)mnt_text(b.buf + b.len, (int)(b.cap - b.len));
     put(proc_root, "mounts", &b);
 
     b = (sb_t){ mem, 0, cap };
-    sb_puts(&b, "nodev\tramfs\nnodev\tproc\n\tvfat\n");
+    sb_puts(&b, "nodev\tsysfs\nnodev\ttmpfs\nnodev\tproc\nnodev\tdevtmpfs\nnodev\tdevpts\nnodev\tramfs\n\text3\n\text4\n\text2\n\tvfat\n");
     put(proc_root, "filesystems", &b);
 
     fs_node_t* nd = ensure(proc_root, "net", FS_DIR, 0555);

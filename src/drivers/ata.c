@@ -3,6 +3,7 @@
 #include "core/io.h"
 #include "core/string.h"
 #include "drivers/ahci.h"
+#include "drivers/nvme.h"
 
 #define SR_BSY  0x80
 #define SR_DRDY 0x40
@@ -90,6 +91,7 @@ int ata_primary(void) {
     for (int i = 0; i < ATA_DRIVES; i++) if (drives[i].present) return i;
     for (int i = 0; i < AHCI_MAX_DISKS; i++) if (ahci_present(i)) return DISK_AHCI_BASE + i;
     for (int i = 0; i < VBLK_MAX; i++) if (vblk_present(i)) return DISK_VIRTIO_BASE + i;
+    for (int i = 0; i < NVME_MAX; i++) if (nvme_present(i)) return DISK_NVME_BASE + i;
     return -1;
 }
 
@@ -110,32 +112,84 @@ bool ata_init_all(void) {
     }
     if (ahci_init() > 0) any = true;
     if (vblk_init() > 0) any = true;
+    if (nvme_init() > 0) any = true;
     return any;
 }
 
+typedef struct { bool used; int parent, num; uint32_t start, len; char name[16]; } part_t;
+static part_t parts[DISK_MAX - DISK_PART_BASE];
+static char nv_names[NVME_MAX][8] = { "nvme0n1", "nvme0n2" };
+
+int ata_part_add(int parent, uint32_t start, uint32_t len, int num) {
+    for (int i = 0; i < DISK_MAX - DISK_PART_BASE; i++) {
+        part_t* p = &parts[i];
+        if (p->used) continue;
+        p->used = true; p->parent = parent; p->start = start; p->len = len; p->num = num;
+        const char* b = ata_drive_name(parent);
+        strcpy(p->name, b);
+        char t[12];
+        int l = strlen(p->name);
+        if (parent >= DISK_NVME_BASE) p->name[l++] = 'p';
+        itoa(num, t, 10);
+        strcpy(p->name + l, t);
+        return DISK_PART_BASE + i;
+    }
+    return -1;
+}
+
+int ata_part_info(int idx, int* parent, uint32_t* start, int* num) {
+    if (idx < DISK_PART_BASE || idx >= DISK_MAX || !parts[idx - DISK_PART_BASE].used) return -1;
+    part_t* p = &parts[idx - DISK_PART_BASE];
+    if (parent) *parent = p->parent;
+    if (start) *start = p->start;
+    if (num) *num = p->num;
+    return 0;
+}
+
+int ata_rdev(int idx) {
+    int pn = 0;
+    if (idx >= DISK_PART_BASE) { pn = parts[idx - DISK_PART_BASE].num; idx = parts[idx - DISK_PART_BASE].parent; }
+    if (idx >= DISK_NVME_BASE) return (259 << 8) | (idx - DISK_NVME_BASE) * 16 + pn;
+    if (idx >= DISK_VIRTIO_BASE) return (253 << 8) | (idx - DISK_VIRTIO_BASE) * 16 + pn;
+    if (idx >= DISK_AHCI_BASE) return (8 << 8) | (idx - DISK_AHCI_BASE) * 16 + pn;
+    return (3 << 8) | idx * 64 + pn;
+}
+
 bool ata_drive_present(int idx) {
-    if (idx >= DISK_VIRTIO_BASE && idx < DISK_MAX) return vblk_present(idx - DISK_VIRTIO_BASE);
-    if (idx >= DISK_AHCI_BASE && idx < DISK_MAX) return ahci_present(idx - DISK_AHCI_BASE);
+    if (idx >= DISK_PART_BASE && idx < DISK_MAX) return parts[idx - DISK_PART_BASE].used;
+    if (idx >= DISK_NVME_BASE && idx < DISK_PART_BASE) return nvme_present(idx - DISK_NVME_BASE);
+    if (idx >= DISK_VIRTIO_BASE && idx < DISK_NVME_BASE) return vblk_present(idx - DISK_VIRTIO_BASE);
+    if (idx >= DISK_AHCI_BASE && idx < DISK_VIRTIO_BASE) return ahci_present(idx - DISK_AHCI_BASE);
     if (idx < 0 || idx >= ATA_DRIVES) return false;
     return drives[idx].present;
 }
 
 uint32_t ata_drive_sectors(int idx) {
-    if (idx >= DISK_VIRTIO_BASE && idx < DISK_MAX) return vblk_sectors(idx - DISK_VIRTIO_BASE);
-    if (idx >= DISK_AHCI_BASE && idx < DISK_MAX) return ahci_sectors(idx - DISK_AHCI_BASE);
+    if (idx >= DISK_PART_BASE && idx < DISK_MAX) return parts[idx - DISK_PART_BASE].len;
+    if (idx >= DISK_NVME_BASE && idx < DISK_PART_BASE) return nvme_sectors(idx - DISK_NVME_BASE);
+    if (idx >= DISK_VIRTIO_BASE && idx < DISK_NVME_BASE) return vblk_sectors(idx - DISK_VIRTIO_BASE);
+    if (idx >= DISK_AHCI_BASE && idx < DISK_VIRTIO_BASE) return ahci_sectors(idx - DISK_AHCI_BASE);
     if (idx < 0 || idx >= ATA_DRIVES) return 0;
     return drives[idx].sectors;
 }
 
 const char* ata_drive_name(int idx) {
-    static const char* const names[DISK_MAX] = { "hda", "hdb", "hdc", "hdd", "sda", "sdb", "sdc", "sdd",
-                                                 "vda", "vdb", "vdc", "vdd" };
-    return (idx >= 0 && idx < DISK_MAX) ? names[idx] : "?";
+    static const char* const names[DISK_NVME_BASE] = { "hda", "hdb", "hdc", "hdd", "sda", "sdb", "sdc", "sdd",
+                                                       "vda", "vdb", "vdc", "vdd" };
+    if (idx >= DISK_PART_BASE && idx < DISK_MAX) return parts[idx - DISK_PART_BASE].name;
+    if (idx >= DISK_NVME_BASE && idx < DISK_PART_BASE) return nv_names[idx - DISK_NVME_BASE];
+    return (idx >= 0 && idx < DISK_NVME_BASE) ? names[idx] : "?";
 }
 
 int ata_read(int idx, uint32_t lba, int count, void* buf) {
-    if (idx >= DISK_VIRTIO_BASE && idx < DISK_MAX) return vblk_read(idx - DISK_VIRTIO_BASE, lba, count, buf);
-    if (idx >= DISK_AHCI_BASE && idx < DISK_MAX) return ahci_read(idx - DISK_AHCI_BASE, lba, count, buf);
+    if (idx >= DISK_PART_BASE && idx < DISK_MAX) {
+        part_t* p = &parts[idx - DISK_PART_BASE];
+        if (!p->used || lba + (uint32_t)count > p->len) return -1;
+        return ata_read(p->parent, p->start + lba, count, buf);
+    }
+    if (idx >= DISK_NVME_BASE && idx < DISK_PART_BASE) return nvme_read(idx - DISK_NVME_BASE, lba, count, buf);
+    if (idx >= DISK_VIRTIO_BASE && idx < DISK_NVME_BASE) return vblk_read(idx - DISK_VIRTIO_BASE, lba, count, buf);
+    if (idx >= DISK_AHCI_BASE && idx < DISK_VIRTIO_BASE) return ahci_read(idx - DISK_AHCI_BASE, lba, count, buf);
     if (idx < 0 || idx >= ATA_DRIVES) return -1;
     ata_t* d = &drives[idx];
     if (!d->present || count <= 0) return -1;
@@ -169,8 +223,14 @@ int ata_read(int idx, uint32_t lba, int count, void* buf) {
 }
 
 int ata_write(int idx, uint32_t lba, int count, const void* buf) {
-    if (idx >= DISK_VIRTIO_BASE && idx < DISK_MAX) return vblk_write(idx - DISK_VIRTIO_BASE, lba, count, buf);
-    if (idx >= DISK_AHCI_BASE && idx < DISK_MAX) return ahci_write(idx - DISK_AHCI_BASE, lba, count, buf);
+    if (idx >= DISK_PART_BASE && idx < DISK_MAX) {
+        part_t* p = &parts[idx - DISK_PART_BASE];
+        if (!p->used || lba + (uint32_t)count > p->len) return -1;
+        return ata_write(p->parent, p->start + lba, count, buf);
+    }
+    if (idx >= DISK_NVME_BASE && idx < DISK_PART_BASE) return nvme_write(idx - DISK_NVME_BASE, lba, count, buf);
+    if (idx >= DISK_VIRTIO_BASE && idx < DISK_NVME_BASE) return vblk_write(idx - DISK_VIRTIO_BASE, lba, count, buf);
+    if (idx >= DISK_AHCI_BASE && idx < DISK_VIRTIO_BASE) return ahci_write(idx - DISK_AHCI_BASE, lba, count, buf);
     if (idx < 0 || idx >= ATA_DRIVES) return -1;
     ata_t* d = &drives[idx];
     if (!d->present || count <= 0) return -1;

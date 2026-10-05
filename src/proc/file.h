@@ -72,6 +72,7 @@ bool    file_readable(file_t* f);
 bool    file_writable(file_t* f);
 
 int     pipe_create(file_t** rd, file_t** wr);
+int     pipe_tee(file_t* a, file_t* b, uint32_t len);
 int     spair_create(file_t** a, file_t** b);
 int     spair_shutdown(file_t* f, int how);
 uint32_t file_disk_size(file_t* f);
