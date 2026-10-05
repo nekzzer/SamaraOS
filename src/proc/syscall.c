@@ -1609,7 +1609,7 @@ static int ux_name(uint64_t addr, uint64_t len, char* out, int* olen) {
     /* the user's own sun_path: lookup_parent wants a user pointer (UCHK) */
     int k = 0;
     while (k < (int)len - 2 && sp[k]) k++;
-    if (k == (int)len - 2) return -EINVAL;                     /* no NUL inside */
+    if (k == (int)len - 2 && sp[k]) return -EINVAL;            /* libwayland passes len without the NUL, the struct is zeroed anyway */
     int err;
     char base[FS_NAME_MAX];
     fs_node_t* par = lookup_parent(AT_FDCWD, sp, base, &err);
