@@ -1,3 +1,4 @@
+#include "core/pcache.h"
 #include "proc/file.h"
 #include "proc/pty.h"
 #include "proc/proc.h"
@@ -225,6 +226,7 @@ static int node_reserve(fs_node_t* n, uint32_t need) {
 
 int node_write_at(fs_node_t* n, uint32_t off, const char* buf, uint32_t len) {
     if (n->type != FS_FILE) return -EISDIR;
+    if (n->pc) pc_sync(n);
     uint32_t end = off + len;
     if (node_reserve(n, end > n->size ? end : n->size) < 0) return -ENOMEM;
     if (off > n->size) memset(n->data + n->size, 0, off - n->size);
@@ -238,6 +240,7 @@ int node_write_at(fs_node_t* n, uint32_t off, const char* buf, uint32_t len) {
 
 int node_truncate(fs_node_t* n, uint32_t len) {
     if (n->type != FS_FILE) return -EISDIR;
+    if (n->pc) pc_sync(n);
     if (n->data && !n->cap && node_reserve(n, n->size) < 0) return -ENOMEM;   /* borrowed */
     if (len > n->size) {
         if (node_reserve(n, len) < 0) return -ENOMEM;
@@ -480,6 +483,7 @@ int file_read(file_t* f, char* buf, uint32_t n) {
         case F_NODE: {
             fs_node_t* nd = f->node;
             if (nd->type == FS_DIR) return -EISDIR;
+            if (nd->pc) pc_sync(nd);
             if (f->off >= nd->size) return 0;
             uint32_t k = nd->size - f->off;
             if (k > n) k = n;

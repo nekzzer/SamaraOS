@@ -82,6 +82,7 @@ uint32_t fs_now(void) { return clock_epoch(); }
 void (*fs_dirty_hook)(int mount_id);
 
 void fs_touch(fs_node_t* n) {
+    if (n && n->pc) pc_changed(n);
     for (; n; n = n->parent)
         if (n->mount_id) {
             if (n->mount_id >= 8) { extern void ext2_dirty(int); ext2_dirty(n->mount_id); }
@@ -261,6 +262,7 @@ void fs_drop_name(fs_node_t* n) {
     }
     fs_detach(n);
     if (n->refs > 0) { n->unlinked = true; return; }   /* still open */
+    pc_free(n);
     fs_data_free(n);
     kfree(n);
 }
@@ -290,6 +292,7 @@ void fs_release(fs_node_t* n) {
     if (!n || --n->refs > 0) return;
     if (n->unlinked) {
         if (fs_free_hook) fs_free_hook(n);       /* memfd: its shm frames go too */
+        pc_free(n);
         fs_data_free(n);
         kfree(n);
     }

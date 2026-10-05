@@ -27,6 +27,7 @@ typedef struct fs_node {
     struct fs_node* hl;        /* extra hard link name: the real node. everything else is empty */
     struct fs_node* hn;        /* real node: first extra name; extra name: the next one */
     uint16_t xl;               /* real node: how many extra names */
+    struct pcn* pc;            /* page cache of mapped pages, see core/pcache.c */
 } fs_node_t;
 
 enum { FS_DEV_NONE = 0, FS_DEV_NULL, FS_DEV_ZERO, FS_DEV_TTY, FS_DEV_RANDOM, FS_DEV_FB, FS_DEV_INPUT,
@@ -77,6 +78,8 @@ void        fs_attach(fs_node_t* dir, fs_node_t* node);
 uint32_t    fs_now(void);
 /* Note a change at/under `n` so the owning mounted volume gets synced. */
 void        fs_touch(fs_node_t* n);
+void        pc_changed(fs_node_t* n);         /* page cache, core/pcache.c */
+void        pc_free(fs_node_t* n);
 extern void (*fs_dirty_hook)(int mount_id);
 extern void (*fs_free_hook)(fs_node_t* n);    /* an unlinked node is about to be freed */
 

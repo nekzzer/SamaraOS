@@ -1,3 +1,4 @@
+#include "core/pcache.h"
 #include "fs/ext2.h"
 #include "drivers/ata.h"
 #include "core/heap.h"
@@ -398,6 +399,7 @@ static void orphan(ev_t* v, uint32_t ino, int depth) {
 static void drop(fs_node_t* n) {
     while (n->child) { fs_node_t* c = n->child; drop(c); }
     fs_detach(n);
+    pc_free(n);
     fs_data_free(n);
     kfree(n);
 }
@@ -942,6 +944,7 @@ static void ext2_reclaim(size_t need) {
 }
 
 int ext2_sync_all(void) {
+    pc_sync_all();
     fs_sync_begin();                      /* before our lock: a writer may be in a lazy read */
     lock();
     for (int i = 0; i < E2_MAX; i++)
@@ -960,6 +963,7 @@ static bool pressure(void) { return heap_big_used() > heap_big_total() / 20 * 17
 static void e2syncd(void) {
     for (;;) {
         task_sleep_ms(kicked ? 20 : 300);
+        pc_sync_all();
         uint32_t now = pit_uptime_ms();
         bool any = false;
         for (int i = 0; i < E2_MAX; i++) {

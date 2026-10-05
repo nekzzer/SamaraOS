@@ -662,7 +662,7 @@ static void free_tree(fs_node_t* n) {
         free_tree(c);
         fs_detach(c);
         if (c->refs > 0) c->unlinked = true;
-        else { fs_data_free(c); kfree(c); }
+        else { pc_free(c); fs_data_free(c); kfree(c); }
     }
 }
 
