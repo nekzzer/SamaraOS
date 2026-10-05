@@ -1,0 +1,41 @@
+#!/bin/sh
+# samara-install /dev/vdb: gpt (bios boot, esp, ext2 root), copies the running rootfs, grub for bios and uefi.
+# needs the iso (/boot/grub/*.img and BOOTX64.EFI come from install.tar)
+D=$1
+B=/boot/grub
+[ -b "$D" ] || { echo "usage: samara-install /dev/disk"; exit 1; }
+for f in /boot/samara.elf $B/boot.img $B/core-gpt.img $B/BOOTX64.EFI; do
+    [ -f $f ] || { echo "no $f, boot from the iso"; exit 1; }
+done
+case $D in *nvme*|*mmcblk*) P=${D}p ;; *) P=$D ;; esac
+
+samara-mkdisk $D $B/boot.img $B/core-gpt.img || exit 1
+mkfs.fat -F 32 -n ESP ${P}2 >/dev/null || exit 1
+# not "/" yet, else the kernel gets confused which root is which
+mke2fs -q -t ext2 -b 4096 -O ^dir_index,^resize_inode -L newroot ${P}3 || exit 1
+
+mkdir -p /mnt/new /mnt/esp
+mount -t ext2 ${P}3 /mnt/new || exit 1
+mount -t vfat ${P}2 /mnt/esp || exit 1
+
+echo "copying rootfs"
+cd /
+tar -c bin sbin lib lib64 usr etc var root home opt srv 2>/dev/null | tar -x -C /mnt/new
+cd /mnt/new
+mkdir -p dev proc sys run tmp mnt media disk boot/grub boot/efi
+chmod 1777 tmp
+cp /boot/samara.elf boot/
+cp $B/grub.cfg boot/grub/ 2>/dev/null
+printf 'LABEL=/\t/\text2\tdefaults\t0 1\nLABEL=ESP\t/boot/efi\tvfat\tdefaults\t0 2\n' > etc/fstab
+mkdir -p /mnt/esp/EFI/BOOT
+cp $B/BOOTX64.EFI /mnt/esp/EFI/BOOT/BOOTX64.EFI
+# the efi image has the same config embedded, but keep the kernel next to it too
+mkdir -p /mnt/esp/boot
+cp /boot/samara.elf /mnt/esp/boot/
+cd /
+sync
+umount /mnt/esp
+umount /mnt/new
+tune2fs -L / ${P}3 >/dev/null
+sync
+echo "done"

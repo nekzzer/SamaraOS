@@ -77,7 +77,7 @@ int     fifo_open(fs_node_t* n, int flags, file_t** out);
 int     pipe_tee(file_t* a, file_t* b, uint32_t len);
 int     spair_create(file_t** a, file_t** b);
 int     spair_shutdown(file_t* f, int how);
-uint32_t file_disk_size(file_t* f);
+uint64_t file_disk_size(file_t* f);
 void    ux_release(file_t* f);                     /* syscall.c: unbind, drop the backlog */
 bool    ux_pending(file_t* f);                     /* a connection waits for accept() */
 

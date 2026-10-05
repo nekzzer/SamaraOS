@@ -309,14 +309,13 @@ int node_truncate(fs_node_t* n, uint32_t len) {
 
 /* ---------------- block devices ---------------- */
 
-uint32_t file_disk_size(file_t* f) {
-    uint32_t s = ata_drive_sectors(f->disk);
-    return s >= 0x800000u ? 0xFFFFFE00u : s * 512;           /* clamp to 4 GiB */
+uint64_t file_disk_size(file_t* f) {
+    return (uint64_t)ata_drive_sectors(f->disk) * 512;
 }
 
 /* Byte-granular access through a one-sector bounce buffer. */
 static int disk_rw(file_t* f, char* buf, uint32_t n, bool write) {
-    uint32_t size = file_disk_size(f);
+    uint64_t size = file_disk_size(f);
     if (f->off >= size) return 0;
     if (n > size - f->off) n = size - f->off;
     uint8_t* sec = (uint8_t*)kmalloc(512);

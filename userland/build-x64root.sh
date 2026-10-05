@@ -50,6 +50,9 @@ printf 'pcm.!default {\n    type plug\n    slave.pcm "hw:0,0"\n}\nctl.!default {
 # mpv asks for float first and our plug path chokes on that
 mkdir -p etc/mpv
 printf 'ao=alsa\naudio-format=s16\n' > etc/mpv/mpv.conf
+# installer (needs the iso for grub images)
+sh $ROOT/userland/x64cc.sh -w $ROOT/userland/samara/mkdisk.c -o usr/bin/samara-mkdisk
+install -m755 $ROOT/userland/samara-install usr/bin/samara-install
 # wayland side of the desktop (userland/samara-wl/build.sh)
 [ -x $ROOT/build/samara-wl ] && install -m755 $ROOT/build/samara-wl usr/bin/samara-wl
 

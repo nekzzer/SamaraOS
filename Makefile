@@ -429,11 +429,23 @@ INSTALL_TAR := build/install.tar
 $(GRUB_CORE): iso/early.cfg | build
 	grub-mkimage -O i386-pc -o $@ -p /boot/grub -c iso/early.cfg biosdisk fat multiboot
 
-$(INSTALL_TAR): $(KERNEL) $(GRUB_CORE)
+# core + efi image for samara-install (gpt disk, ext2 root labeled /)
+GRUB_GPT := build/grub-core-gpt.img
+GRUB_EFI := build/BOOTX64.EFI
+
+$(GRUB_GPT): iso/inst-bios.cfg | build
+	grub-mkimage -O i386-pc -o $@ -p /boot/grub -c iso/inst-bios.cfg biosdisk part_gpt ext2 multiboot search search_label
+
+$(GRUB_EFI): iso/inst-efi.cfg | build
+	grub-mkimage -O x86_64-efi -o $@ -p /boot/grub -c iso/inst-efi.cfg part_gpt ext2 fat multiboot2 search search_label all_video efi_gop efi_uga normal
+
+$(INSTALL_TAR): $(KERNEL) $(GRUB_CORE) $(GRUB_GPT) $(GRUB_EFI)
 	@mkdir -p build/instdir/boot/grub
 	cp $(KERNEL) build/instdir/boot/samara.elf
 	cp $(GRUB_CORE) build/instdir/boot/grub/core.img
 	cp /usr/lib/grub/i386-pc/boot.img build/instdir/boot/grub/boot.img
+	cp $(GRUB_GPT) build/instdir/boot/grub/core-gpt.img
+	cp $(GRUB_EFI) build/instdir/boot/grub/BOOTX64.EFI
 	tar --format=ustar --owner=0 --group=0 -C build/instdir -cf $@ boot
 
 $(ISO): $(KERNEL) $(INSTALL_TAR) iso/grub.cfg

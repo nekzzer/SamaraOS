@@ -469,7 +469,7 @@ static int64_t do_lseek(int fd, int64_t off, int whence) {
         return base + off;
     }
     if (f->type != F_NODE && f->type != F_DISK) return f->type == F_NULL || f->type == F_ZERO ? 0 : -ESPIPE;
-    uint32_t end = f->type == F_DISK ? file_disk_size(f) : f->node->size;
+    uint64_t end = f->type == F_DISK ? file_disk_size(f) : f->node->size;
     int64_t base = whence == 0 ? 0 : whence == 1 ? (int64_t)f->off :
                    whence == 2 ? (int64_t)end : -1;
     if (base < 0) return -EINVAL;
@@ -2549,7 +2549,7 @@ static int64_t dispatch(regs_t* r) {
             if (a) { UCHK((void*)a, 8); *(int64_t*)a = t; }
             return t;
         }
-        case 90: case 268:
+        case 90: case 268: case 452:
             UCHK((void*)(r->rax == 90 ? a : b), 1);
             n = r->rax == 90 ? lookup_peek(AT_FDCWD, (const char*)a, &err, true) : lookup_peek((int)a, (const char*)b, &err, true);
             if (!n) return err;
@@ -3234,7 +3234,7 @@ static bool changes_fs(uint64_t nr, uint64_t a) {
         }
         case 2: case 85: case 257: case 87: case 263: case 82: case 264: case 316:
         case 83: case 258: case 84: case 88: case 266: case 86: case 265:
-        case 76: case 90: case 268: case 132: case 235: case 280: case 326: case 275:
+        case 76: case 90: case 268: case 452: case 132: case 235: case 280: case 326: case 275:
             return true;
     }
     return false;
