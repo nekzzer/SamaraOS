@@ -7,6 +7,7 @@
 #include "boot/pit.h"
 #include "proc/proc.h"
 #include "core/clock.h"
+#include "core/wq.h"
 
 #define EAGAIN       11
 #define ENOMEM       12
@@ -64,6 +65,8 @@ struct sock {
     bool     bound, connected;
     int      err;
     uint32_t rcvtmo;               /* ms, 0 = forever */
+    wq_t     wq;
+    uint32_t rdy;                  /* smask() when the last waiter looked */
     uint8_t  ttl, opts;            /* opts: 1 recvttl, 2 timestamp, 4 timestampns, 8 recvhoplimit */
     uint8_t  l_ttl;                /* what the last recv saw, for cmsg */
     uint32_t l_s, l_us;
@@ -177,6 +180,7 @@ static sock_t* alloc_sock(int type, int af) {
 }
 
 static void free_sock(sock_t* s) {
+    wq_drain(&s->wq);
     if (s->rx) kfree(s->rx);
     if (s->tx) kfree(s->tx);
     while (s->q_head) { dgram_t* d = s->q_head; s->q_head = d->next; kfree(d); }
@@ -600,12 +604,25 @@ void sock_input_icmp6(const uint8_t* src, const uint8_t* dst, const uint8_t* m, 
 
 /* ---------------- netd ---------------- */
 
+static uint32_t smask(sock_t* s) {
+    return (uint32_t)sock_readable(s) | (uint32_t)sock_writable(s) << 1 | (uint32_t)sock_hup(s) << 2 |
+           (uint32_t)s->state << 4 | (s->err != 0) << 8;
+}
+
 static void pump(void) {
     uint32_t f = irq_save();
     net_poll();
     sock_tick();
+    for (int i = 0; i < MAX_SOCKS; i++) {
+        sock_t* s = &socks[i];
+        if (!s->used || !s->wq.head) continue;
+        uint32_t m = smask(s);
+        if (m != s->rdy) { s->rdy = m; wq_wake(&s->wq); }
+    }
     irq_restore(f);
 }
+
+void sock_pump(void) { pump(); }
 
 static void ser(const char* m) { while (*m) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, *m++); } }
 
@@ -620,19 +637,36 @@ static void netd(void) {
 
 void sock_init(void) { task_spawn("netd", netd); }
 
-/* Wait for `cond` with packet processing; 0, -EAGAIN or -EINTR. */
+/* sleep until the socket changes, 0 = recheck, -EINTR, -EAGAIN when tmo ms are over */
+static int wstep(sock_t* s, wq_w_t** wp, uint32_t* t0, uint32_t tmo) {
+    if (proc_interrupted()) return -EINTR;
+    uint32_t el = pit_uptime_ms() - *t0;
+    if (tmo && el >= tmo) return -EAGAIN;
+    if (!*wp) {
+        *wp = wq_waiter();
+        if (*wp) {
+            if (wq_add(&s->wq, *wp)) { s->rdy = smask(s); return 0; }
+            wq_waiter_free(*wp);
+            *wp = NULL;
+        }
+    }
+    if (*wp) wq_sleep(*wp, tmo ? tmo - el : 0);
+    else { task_yield(); pump(); }
+    return 0;
+}
+
+static void wfree(wq_w_t** w) { if (*w) wq_waiter_free(*w); }
+
+/* Wait for `cond`; 0, -EAGAIN or -EINTR. Declares a var, once per scope. */
 #define WAIT_FOR(cond, nonblock)                                   \
-    do {                                                           \
-        uint32_t t0_ = pit_uptime_ms();                            \
-        pump();                                                    \
-        while (!(cond)) {                                          \
-            if (nonblock) return -EAGAIN;                          \
-            if (s->rcvtmo && pit_uptime_ms() - t0_ >= s->rcvtmo) return -EAGAIN; \
-            if (proc_interrupted()) return -EINTR;                 \
-            task_yield();                                          \
-            pump();                                                \
-        }                                                          \
-    } while (0)
+    wq_w_t* w_ __attribute__((cleanup(wfree))) = NULL;             \
+    uint32_t t0_ = pit_uptime_ms();                                \
+    pump();                                                        \
+    while (!(cond)) {                                              \
+        if (nonblock) return -EAGAIN;                              \
+        int r_ = wstep(s, &w_, &t0_, s->rcvtmo);                   \
+        if (r_) return r_;                                         \
+    }
 
 /* ---------------- API ---------------- */
 
@@ -675,6 +709,7 @@ void sock_close(sock_t* s) {
     s->shut_wr = true;
     tcp_output(s);
     reap_if_done(s);
+    pump();
 }
 
 int sock_bind(sock_t* s, const uint8_t* ip, uint16_t port) {
@@ -699,12 +734,12 @@ int sock_listen(sock_t* s, int backlog) {
 
 sock_t* sock_accept(sock_t* s, bool nonblock, int* err, uint8_t* ip, uint16_t* port) {
     if (s->state != S_LISTEN) { *err = -EINVAL; return NULL; }
+    wq_w_t* w_ __attribute__((cleanup(wfree))) = NULL;
+    uint32_t t0_ = pit_uptime_ms();
     pump();
     while (!s->aq_n) {
         if (nonblock) { *err = -EAGAIN; return NULL; }
-        if (proc_interrupted()) { *err = -EINTR; return NULL; }
-        task_yield();
-        pump();
+        if ((*err = wstep(s, &w_, &t0_, 0))) return NULL;
     }
     sock_t* c = s->acceptq[0];
     memmove(s->acceptq, s->acceptq + 1, (uint32_t)(--s->aq_n) * sizeof(sock_t*));
@@ -745,11 +780,12 @@ int sock_connect(sock_t* s, const uint8_t* ip, uint16_t port, bool nonblock) {
         tcp_segment(s, s->iss, TCP_SYN, NULL, 0);
         if (nonblock) return -EINPROGRESS;
     }
+    wq_w_t* w_ __attribute__((cleanup(wfree))) = NULL;
+    uint32_t t0_ = pit_uptime_ms();
     pump();
     while (s->state == S_SYN_SENT) {
-        if (proc_interrupted()) return -EINTR;
-        task_yield();
-        pump();
+        int r_ = wstep(s, &w_, &t0_, 0);
+        if (r_) return r_;
     }
     if (s->state == S_ESTABLISHED || s->state == S_CLOSE_WAIT) return 0;
     int e = s->err ? s->err : ECONNREFUSED;
@@ -813,7 +849,8 @@ int sock_send(sock_t* s, const uint8_t* buf, uint32_t len, bool nonblock,
         return r < 0 ? r : (int)len;
     }
     if (s->state == S_SYN_SENT || s->state == S_SYN_RCVD) return -ENOTCONN;
-    uint32_t done = 0;
+    uint32_t done = 0, st_ = pit_uptime_ms();
+    wq_w_t* sw_ __attribute__((cleanup(wfree))) = NULL;
     while (done < len) {
         if (s->err) { int e = s->err; s->err = 0; return done ? (int)done : -e; }
         if (s->shut_wr || (s->state != S_ESTABLISHED && s->state != S_CLOSE_WAIT)) {
@@ -825,9 +862,8 @@ int sock_send(sock_t* s, const uint8_t* buf, uint32_t len, bool nonblock,
         uint32_t room = TX_CAP - s->tx_len;
         if (!room) {
             if (nonblock) return done ? (int)done : -EAGAIN;
-            if (proc_interrupted()) return done ? (int)done : -EINTR;
-            task_yield();
-            pump();
+            int r_ = wstep(s, &sw_, &st_, 0);
+            if (r_) return done ? (int)done : r_;
             continue;
         }
         uint32_t n = len - done < room ? len - done : room;
@@ -892,6 +928,7 @@ int sock_shutdown(sock_t* s, int how) {
         uint32_t f = irq_save();
         tcp_output(s);
         irq_restore(f);
+        pump();
     }
     return 0;
 }
@@ -954,3 +991,6 @@ int sock_cmsg(sock_t* s, uint8_t* out, int cap) {
     }
     return n;
 }
+
+struct wq* sock_wq(sock_t* s) { return &s->wq; }
+void sock_arm(sock_t* s) { s->rdy = smask(s); }

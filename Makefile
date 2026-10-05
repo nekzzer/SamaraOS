@@ -74,6 +74,7 @@ KERN_SRC := \
     src/drivers/fbdev.c \
     src/core/heap.c \
     src/core/task.c \
+    src/core/wq.c \
     src/core/vmm.c \
     src/core/clock.c \
     src/proc/tty.c \

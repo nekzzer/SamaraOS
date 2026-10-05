@@ -8,6 +8,7 @@
 
 typedef struct sock sock_t;
 
+void    sock_pump(void);
 void    sock_init(void);                      /* starts the netd polling task */
 
 /* Packet input from net.c (payload = TCP/UDP header onwards). */
@@ -43,5 +44,8 @@ int     sock_take_error(sock_t* s);           /* SO_ERROR */
 bool    sock_readable(sock_t* s);
 bool    sock_writable(sock_t* s);
 bool    sock_hup(sock_t* s);
+struct wq;
+struct wq* sock_wq(sock_t* s);               /* wakes on any readiness change */
+void    sock_arm(sock_t* s);                   /* call after queueing a waiter */
 
 #endif
