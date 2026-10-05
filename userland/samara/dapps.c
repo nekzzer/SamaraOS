@@ -15,12 +15,17 @@ uint32_t c_bg = 0x17181B, c_bg2 = 0x1E1F23, c_bar = 0x131417, c_well = 0x101114,
          c_danger = 0xC43B30, c_ok = 0x5FB06A;
 int fh_reg, fh_small, fh_mono;
 
+int ui_scale = 100;
+
 void th_load(void) {
     FILE *f = fopen("/etc/samara-desktop.conf", "r");
     char l[128];
     int light = 0;
     if (f) {
-        while (fgets(l, sizeof l, f)) if (!strncmp(l, "theme=light", 11)) light = 1;
+        while (fgets(l, sizeof l, f)) {
+            if (!strncmp(l, "theme=light", 11)) light = 1;
+            if (!strncmp(l, "scale=", 6)) ui_scale = atoi(l + 6);
+        }
         fclose(f);
     }
     if (light) {
@@ -397,6 +402,7 @@ int main(int argc, char **argv) {
 }
 
 int ui_open(int w, int h, const char *title) {
+    if (ui_scale > 100 && ui_scale <= 200) { w = w * ui_scale / 100; h = h * ui_scale / 100; }
     if (be_open(w, h, title) < 0) { fprintf(stderr, "%s: no desktop\n", title); return -1; }
     fh_reg = be_font_h(F_REG);
     fh_small = be_font_h(F_SMALL);

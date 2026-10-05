@@ -7,6 +7,8 @@
 extern uint32_t c_bg, c_bg2, c_bar, c_well, c_ink, c_dim, c_faint, c_rule, c_hover, c_acc, c_selbg, c_danger, c_ok;
 extern int fh_reg, fh_small, fh_mono;
 
+extern int ui_scale;
+
 typedef struct { char buf[512]; int len, pos, all; } LineEd;
 
 void th_load(void);

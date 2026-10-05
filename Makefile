@@ -224,7 +224,7 @@ fm:
 # edit, sysmon, pkg, settings, notify-send-lite: one binary (userland/samara/dapps.c), same recipe
 dapps:
 	userland/x64cc.sh -O2 -s -w -Iuserland/samara -o userland/dapps userland/samara/dapps.c userland/samara/d_edit.c \
-	    userland/samara/d_sysmon.c userland/samara/d_pkg.c userland/samara/d_settings.c userland/samara/fm_samara.c
+	    userland/samara/d_sysmon.c userland/samara/d_pkg.c userland/samara/d_settings.c userland/samara/fm_samara.c userland/samara/fm_img.c
 # terminal font atlas (tools/mktermfont.py), linked in like the userland blobs
 TERMFONT_OBJ  := src/gfx/termfont.bin.o
 
