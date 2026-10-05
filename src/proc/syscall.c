@@ -1,3 +1,4 @@
+#include "boot/acpi.h"
 /* Linux x86_64 system call ABI (syscall insn): rax = number, args in rdi,
    rsi, rdx, r10, r8, r9; result (or -errno) back in rax. Only what static
    musl binaries such as busybox actually need is implemented; everything
@@ -2616,8 +2617,15 @@ static int64_t dispatch(regs_t* r) {
         case 105: case 106: case 113: case 114: case 117: case 119: case 116:
         case 26: pc_sync_all(); return 0;                            /* msync */
         case 157: case 203: case 28: case 149: case 150: case 151: case 152:
-        case 221: case 160: case 169:
+        case 221: case 160:
             return 0;
+        case 169:                                                    /* reboot */
+            if (a != 0xfee1dead) return -EINVAL;
+            switch ((uint32_t)c) {
+                case 0x01234567: case 0xA1B2C3D4: acpi_reboot(); break;
+                case 0x4321FEDC: case 0xCDEF0123: acpi_poweroff();    /* halt = off too */
+            }
+            return 0;                                                /* cad on/off */
         case 8:   return do_lseek((int)a, (int64_t)b, (int)c);
         case 39:  return p->tgid;
         case 186: return p->pid;                                     /* gettid */

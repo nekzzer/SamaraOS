@@ -15,10 +15,15 @@ struct acpi_info {
     int      niso;
     struct { uint8_t irq; uint32_t gsi; uint16_t flags; } iso[MAX_ISO];
     int      nmi_lint[2];               /* lint pin for nmi, -1 none */
+    void*    dsdt;
+    uint64_t hpet_pa;
 };
 extern struct acpi_info acpi;
 
 void acpi_init(void);
+void acpi_pm_init(void);               /* sci + power button, after tasks */
+void acpi_poweroff(void);              /* sync, _S5, never returns */
+void acpi_reboot(void);
 /* gsi an isa irq ends up on, and the mps flags of the override (0 = default) */
 uint32_t acpi_irq_gsi(int irq, uint16_t* flags);
 

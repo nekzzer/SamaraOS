@@ -1,3 +1,4 @@
+#include "boot/acpi.h"
 #include "gui/wm.h"
 #include "drivers/fbdev.h"
 #include "apps/browser.h"
@@ -787,8 +788,8 @@ static void menu_run(int action) {
         case 5:  wm_open_info(W / 2 - 180, H / 2 - 120, 360, 190, "About", about_text); break;
         case 6:  wm_open_info(W / 2 - 200, H / 2 - 120, 400, 200, "Welcome", welcome_text); break;
         case 7:  wm_open_info(W / 2 - 200, H / 2 - 120, 400, 210, "System Info", wm_sysinfo_text()); break;
-        case 8:  ext2_sync_all(); fatfs_sync_all(); while (inb(0x64) & 0x02) {} outb(0x64, 0xFE); break;
-        case 9:  ext2_sync_all(); fatfs_sync_all(); outw(0x604, 0x2000); outw(0xB004, 0x2000); break;
+        case 8:  acpi_reboot(); break;
+        case 9:  acpi_poweroff(); break;
         case 10: exit_requested = true; break;
         case 11: if (shell_launch_detached("/usr/bin/fm") < 0) wm_open_info(W / 2 - 150, H / 2 - 60, 300, 120, "Files", "fm not found"); break;
         case 12: if (shell_launch_detached("xterm") < 0) wm_open_info(W / 2 - 150, H / 2 - 60, 300, 120, "XTerm", "xterm not installed"); break;

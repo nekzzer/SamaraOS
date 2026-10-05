@@ -1,3 +1,4 @@
+#include "boot/acpi.h"
 #include "../shell_priv.h"
 #include "boot/pit.h"
 #include "core/heap.h"
@@ -113,24 +114,14 @@ void cmd_shutdown(int argc, char **argv) {
   (void)argc;
   (void)argv;
   vga_puts("shutdown...\n");
-  ext2_sync_all();  /* root disk, apk stuff */
-  fatfs_sync_all();
-  outw(0x604, 0x2000);  /* QEMU >= 2.0 */
-  outw(0xB004, 0x2000); /* older QEMU/Bochs */
-  outw(0x4004, 0x3400); /* virtualbox */
-  __asm__ volatile("cli; hlt");
+  acpi_poweroff();
 }
 
 void cmd_reboot(int argc, char **argv) {
   (void)argc;
   (void)argv;
   vga_puts("rebooting...\n");
-  ext2_sync_all();
-  fatfs_sync_all();
-  while (inb(0x64) & 0x02) {
-  }
-  outb(0x64, 0xFE);
-  __asm__ volatile("cli; hlt");
+  acpi_reboot();
 }
 
 void cmd_beep(int argc, char **argv) {

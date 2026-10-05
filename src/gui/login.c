@@ -1,3 +1,4 @@
+#include "boot/acpi.h"
 #include "gui/login.h"
 #include "gui/theme.h"
 #include "gui/wm.h"
@@ -472,8 +473,7 @@ key:
             break;
         case P_DONE:
             if (k == '\n') {
-                while (inb(0x64) & 0x02) {}
-                outb(0x64, 0xFE);
+                acpi_reboot();
             }
             break;
         }

@@ -114,7 +114,7 @@ static void boot_autorun(void) {
     ext2_sync_all(); fatfs_sync_all();   /* last writes were lost on poweroff */
     const char* bye = "\r\n[autosh done]\r\n";
     while (*bye) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, *bye++); }
-    outw(0x604, 0x2000);                 /* QEMU ACPI power off */
+    acpi_poweroff();
 }
 
 /* ---- boot modules ---- */
@@ -283,6 +283,7 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
     BOOT_OK("mouse", mouse_init());
     BOOT_OK("tasks", task_init());
     BOOT_OK("pit 1000Hz", pit_init(1000));
+    acpi_pm_init();
 
     /* Process frames: all usable RAM past the heap up to the boot modules, and
        whatever sits above 4 GiB. With RAM to spare the top 40% of the low
