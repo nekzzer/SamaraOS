@@ -469,6 +469,7 @@ void efd_wake(void) {
 }
 
 
+int shm_rw(fs_node_t* n, uint64_t off, char* buf, uint32_t len, bool wr);
 int file_read(file_t* f, char* buf, uint32_t n) {
     switch (f->type) {
         case F_URING: return -22;
@@ -542,6 +543,8 @@ int file_read(file_t* f, char* buf, uint32_t n) {
         case F_NODE: {
             fs_node_t* nd = f->node;
             if (nd->type == FS_DIR) return -EISDIR;
+            int sr = shm_rw(nd, f->off, buf, n, false);
+            if (sr >= 0) { f->off += sr; return sr; }
             if (nd->pc) pc_sync(nd);
             if (f->off >= nd->size) return 0;
             uint32_t k = nd->size - f->off;
@@ -595,7 +598,8 @@ int file_write(file_t* f, const char* buf, uint32_t n) {
         case F_PIPE_W: return pipe_write(f, f->pipe, buf, n);
         case F_NODE: {
             if (f->flags & O_APPEND) f->off = f->node->size;
-            int r = node_write_at(f->node, f->off, buf, n);
+            int r = shm_rw(f->node, f->off, (char*)buf, n, true);
+            if (r == -1) r = node_write_at(f->node, f->off, buf, n);
             if (r > 0) { f->off += (uint32_t)r; ino_node(f->node, 2); }
             return r;
         }

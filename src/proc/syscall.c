@@ -907,6 +907,28 @@ static uint64_t* shm_frames(fs_node_t* n, uint32_t pages) {
     return fr;
 }
 
+/* read()/write() on shm and memfd go to the same frames mmap hands out */
+int shm_rw(fs_node_t* n, uint64_t off, char* buf, uint32_t len, bool wr) {
+    if (!is_shm(n)) return -1;
+    if (!wr) {
+        if (off >= n->size) return 0;
+        if (len > n->size - off) len = n->size - off;
+    }
+    if (!len) return 0;
+    uint64_t* fr = shm_frames(n, (off + len + PAGE_SIZE - 1) / PAGE_SIZE);
+    if (!fr) return -ENOMEM;
+    for (uint32_t d = 0; d < len; ) {
+        uint64_t o = off + d;
+        uint32_t k = PAGE_SIZE - (o & (PAGE_SIZE - 1));
+        if (k > len - d) k = len - d;
+        char* pg = (char*)P2V(fr[o / PAGE_SIZE]) + (o & (PAGE_SIZE - 1));
+        if (wr) memcpy(pg, buf + d, k); else memcpy(buf + d, pg, k);
+        d += k;
+    }
+    if (wr && off + len > n->size) n->size = off + len;
+    return len;
+}
+
 /* SysV shm, the four calls end up in do_ipc. a segment is a
    dummy node in the shm[] table above, so every shmat maps the same frames.
    for MIT-SHM: glxgears sent every frame down the socket without it */
