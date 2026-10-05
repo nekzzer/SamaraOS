@@ -37,7 +37,7 @@ typedef struct {
     int id, disk;
     fs_node_t* root;
     uint32_t bs, spb, nblocks, ninodes, ipg, bpg, ngroups, first_data, first_ino, isize;
-    uint32_t gdt_blocks, incompat, rocompat, compat;
+    uint32_t gdt_blocks, incompat, rocompat, compat, dsz;
     uint8_t sb[1024];
     uint8_t* gdt;                         /* ngroups * 32 */
     uint8_t* mgdt;                        /* the same at mount: where metadata lives, never changes */
@@ -107,7 +107,7 @@ bool ext2_probe(int disk) {
 static uint8_t* inode_ptr(ev_t* v, uint32_t ino, uint8_t* blkbuf) {
     uint32_t g = (ino - 1) / v->ipg, idx = (ino - 1) % v->ipg;
     if (g >= v->ngroups) return NULL;
-    uint32_t tab = rd32(v->gdt + g * 32 + 8);
+    uint32_t tab = rd32(v->gdt + g * v->dsz + 8);
     uint32_t off = idx * v->isize;
     if (rblk(v, tab + off / v->bs, blkbuf) < 0) return NULL;
     return blkbuf + off % v->bs;
@@ -270,7 +270,7 @@ static bool is_meta(ev_t* v, uint32_t b) {
     if (g >= v->ngroups) return true;
     uint32_t base = v->first_data + g * v->bpg;
     if (has_super(v, g) && b <= base + v->gdt_blocks) return true;
-    const uint8_t* gd = v->mgdt + g * 32;
+    const uint8_t* gd = v->mgdt + g * v->dsz;
     uint32_t it = rd32(gd + 8);
     return b == rd32(gd) || b == rd32(gd + 4) || (b >= it && b < it + v->itb);
 }
@@ -1023,10 +1023,11 @@ int ext2_mount(int disk, fs_node_t* at) {
     v->isize = rev ? rd16(sb + 88) : 128;
     v->compat = rd32(sb + 92); v->incompat = rd32(sb + 96); v->rocompat = rd32(sb + 100);
     if (v->bs > 4096 || !v->ipg || !v->bpg || v->isize < 128 || v->isize > 1024) return -22;
-    if (v->incompat & 0x80) return -22;                     /* 64bit descriptors: not here */
+    v->dsz = (v->incompat & 0x80) ? rd16(sb + 254) : 32;    /* 64bit: wide descriptors, ro anyway */
+    if (v->dsz < 32 || v->dsz > 1024) return -22;
     v->spb = v->bs / 512;
     v->ngroups = (v->nblocks - v->first_data + v->bpg - 1) / v->bpg;
-    v->gdt_blocks = (v->ngroups * 32 + v->bs - 1) / v->bs;
+    v->gdt_blocks = (v->ngroups * v->dsz + v->bs - 1) / v->bs;
     /* write only what we fully understand: filetype and sparse_super, large_file */
     v->ro = (v->incompat & ~2u) || (v->rocompat & ~3u) || (v->compat & 4);
     v->gdt = kmalloc(v->gdt_blocks * v->bs);
