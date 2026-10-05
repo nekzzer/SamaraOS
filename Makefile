@@ -78,6 +78,7 @@ KERN_SRC := \
     src/core/clock.c \
     src/proc/tty.c \
     src/proc/file.c \
+    src/proc/flock.c \
     src/proc/proc.c \
     src/proc/syscall.c \
     src/proc/userland.c \

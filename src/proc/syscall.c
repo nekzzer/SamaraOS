@@ -612,7 +612,7 @@ static int do_dup2(int fd, int nfd, bool cloexec) {
     if (!f) return -EBADF;
     if (nfd < 0 || nfd >= MAX_FDS) return -EBADF;
     if (fd == nfd) return nfd;
-    if (me()->sh->fds[nfd]) file_close(me()->sh->fds[nfd]);
+    if (me()->sh->fds[nfd]) { flk_close(me()->sh, me()->sh->fds[nfd]); file_close(me()->sh->fds[nfd]); }
     file_ref(f);
     me()->sh->fds[nfd] = f;
     me()->sh->cloexec[nfd] = cloexec;
@@ -629,8 +629,9 @@ static int do_fcntl(int fd, int cmd, uint64_t arg) {
         case 2:    me()->sh->cloexec[fd] = arg & 1; return 0;       /* F_SETFD */
         case 3:    return f->flags;                              /* F_GETFL */
         case 4:    f->flags = (f->flags & O_ACCMODE) | (int)(arg & (O_APPEND | O_NONBLOCK)); return 0;
-        case 5: case 6: case 7: case 12: case 13: case 14:       /* locks: always granted */
-            return 0;
+        case 5: case 6: case 7: case 12: case 13: case 14: case 36: case 37: case 38:   /* record locks, ofd */
+            UCHK((void*)arg, 32);
+            return flk_fcntl(f, cmd, (uint8_t*)arg);
     }
     return -EINVAL;
 }
@@ -2179,6 +2180,7 @@ static int64_t dispatch(regs_t* r) {
             file_t* fl = getf((int)a);
             if (!fl) return -EBADF;
             p->sh->fds[a] = NULL;
+            flk_close(p->sh, fl);
             file_close(fl);
             return 0;
         }
@@ -2239,7 +2241,10 @@ static int64_t dispatch(regs_t* r) {
             if (b) UCHK((void*)b, 24);
             return proc_sigaltstack((const uint64_t*)a, (uint64_t*)b, r->rsp);
         case 122: case 123: return 0;                                /* setfsuid/gid: zsh. we're root anyway */
-        case 73: return 0;                                           /* flock, apk wants it. nobody fights for locks here */
+        case 73: {                                                   /* flock */
+            file_t* fl = getf((int)a);
+            return fl ? flk_flock(fl, (int)b) : -EBADF;
+        }
         case 162: case 74: case 75: case 306:                        /* sync, fsync, fdatasync, syncfs */
             ext2_sync_all();
             return fatfs_sync_all();

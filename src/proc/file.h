@@ -63,6 +63,13 @@ uint32_t file_disk_size(file_t* f);
 void    ux_release(file_t* f);                     /* syscall.c: unbind, drop the backlog */
 bool    ux_pending(file_t* f);                     /* a connection waits for accept() */
 
+int     flk_flock(file_t* f, int op);
+int     flk_fcntl(file_t* f, int cmd, uint8_t* u);
+void    flk_close(void* sh, file_t* f);     /* a process closed an fd of f: its posix locks go */
+void    flk_exit(void* sh);
+void    flk_release(file_t* f);             /* last close */
+int     flk_text(char* b, int cap);
+
 /* ramfs helpers */
 int     node_write_at(fs_node_t* n, uint32_t off, const char* buf, uint32_t len);
 int     node_truncate(fs_node_t* n, uint32_t len);
