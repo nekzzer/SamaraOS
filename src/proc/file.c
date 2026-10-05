@@ -410,6 +410,37 @@ static int pipe_write(file_t* f, pipe_t* p, const char* buf, uint32_t n) {
     return (int)put;
 }
 
+/* tee: copy what is in a's pipe into b's, a keeps it */
+int pipe_tee(file_t* a, file_t* b, uint32_t len) {
+    pipe_t* p = a->pipe;
+    if (len > PIPE_SZ) len = PIPE_SZ;
+    char* tmp = kmalloc(len ? len : 1);
+    if (!tmp) return -ENOMEM;
+    WQ_W(w);
+    uint32_t k;
+    for (;;) {
+        bool intr = proc_interrupted();
+        uint64_t fl = spin_lock(&p->lk);
+        if (p->count == 0) {
+            if (p->writers <= 0) { spin_unlock(&p->lk, fl); kfree(tmp); return 0; }
+            if (a->flags & O_NONBLOCK) { spin_unlock(&p->lk, fl); kfree(tmp); return -EAGAIN; }
+            if (intr) { spin_unlock(&p->lk, fl); kfree(tmp); return -EINTR; }
+            pipe_sleep(p, fl, &w);
+            continue;
+        }
+        k = (uint32_t)p->count < len ? (uint32_t)p->count : len;
+        uint32_t c1 = PIPE_SZ - (uint32_t)p->tail;
+        if (c1 > k) c1 = k;
+        memcpy(tmp, p->buf + p->tail, c1);
+        memcpy(tmp + c1, p->buf, k - c1);
+        spin_unlock(&p->lk, fl);
+        break;
+    }
+    int r = pipe_write(b, b->pipe, tmp, k);
+    kfree(tmp);
+    return r;
+}
+
 uint32_t file_gen(file_t* f) {
     if (f->type == F_PIPE_R || f->type == F_PIPE_W) return f->pipe->wgen;
     if (f->type == F_SPAIR) return f->pipe->wgen + f->pipe2->wgen;

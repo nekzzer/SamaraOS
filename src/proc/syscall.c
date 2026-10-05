@@ -491,6 +491,37 @@ static int64_t do_copy(int ifd, uint64_t* ioff, int ofd, uint64_t* ooff, uint64_
     return tot;
 }
 
+static int64_t do_splice(int ifd, uint64_t* ioff, int ofd, uint64_t* ooff, uint64_t len) {
+    file_t* fi = getf(ifd);
+    file_t* fo = getf(ofd);
+    if (!fi || !fo) return -EBADF;
+    bool ip = fi->type == F_PIPE_R, op = fo->type == F_PIPE_W;
+    if (!ip && !op) return -EINVAL;
+    if ((ip && ioff) || (op && ooff)) return -ESPIPE;
+    if (ioff) UCHK(ioff, 8);
+    if (ooff) UCHK(ooff, 8);
+    if (len > 65536) len = 65536;
+    if (!len) return 0;
+    char* kb = kmalloc(len);
+    if (!kb) return -ENOMEM;
+    uint64_t si = fi->off, so = fo->off;
+    if (ioff) fi->off = *ioff;
+    if (ooff) fo->off = *ooff;
+    int64_t tot = file_read(fi, kb, len);
+    if (tot > 0) {
+        int64_t w = 0;
+        while (w < tot) {
+            int r = file_write(fo, kb + w, tot - w);
+            if (r <= 0) { if (!w) tot = r; else tot = w; break; }
+            w += r;
+        }
+    }
+    kfree(kb);
+    if (ioff) { *ioff = fi->off; fi->off = si; }
+    if (ooff) { *ooff = fo->off; fo->off = so; }
+    return tot;
+}
+
 static int do_getdents64(int fd, uint8_t* buf, uint64_t n) {
     file_t* f = getf(fd);
     if (!f) return -EBADF;
@@ -2934,6 +2965,20 @@ static int64_t dispatch(regs_t* r) {
         case 47:  return sys_socket_call(17, a, b, c, 0, 0, 0);       /* recvmsg */
         case 48:  return sys_socket_call(13, a, b, 0, 0, 0, 0);       /* shutdown */
         case 40:  return do_copy((int)b, (uint64_t*)c, (int)a, NULL, d);
+        case 275: return do_splice((int)a, (uint64_t*)b, (int)c, (uint64_t*)d, e);
+        case 276: {                                                  /* tee */
+            file_t* fa = getf((int)a);
+            file_t* fb = getf((int)b);
+            if (!fa || !fb) return -EBADF;
+            if (fa->type != F_PIPE_R || fb->type != F_PIPE_W || fa->pipe == fb->pipe) return -EINVAL;
+            return pipe_tee(fa, fb, c > 0x7fffffff ? 0x7fffffff : (uint32_t)c);
+        }
+        case 278: {                                                  /* vmsplice */
+            file_t* fv = getf((int)a);
+            if (!fv) return -EBADF;
+            if (fv->type != F_PIPE_R && fv->type != F_PIPE_W) return -EBADF;
+            return do_rwv((int)a, (iovec_t*)b, (int)c, fv->type == F_PIPE_W);
+        }
         case 326: return do_copy((int)a, (uint64_t*)b, (int)c, (uint64_t*)d, e);
         case 101: return sys_ptrace(a, b, c, d);
         case 135: {                                                   /* personality, gdb wants ADDR_NO_RANDOMIZE to stick */
@@ -3087,7 +3132,7 @@ static bool changes_fs(uint64_t nr, uint64_t a) {
         }
         case 2: case 85: case 257: case 87: case 263: case 82: case 264: case 316:
         case 83: case 258: case 84: case 88: case 266: case 86: case 265:
-        case 76: case 90: case 268: case 132: case 235: case 280: case 326:
+        case 76: case 90: case 268: case 132: case 235: case 280: case 326: case 275:
             return true;
     }
     return false;
