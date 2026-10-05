@@ -114,6 +114,27 @@ static bool ustr_ok(const char* s) {
 
 static proc_t* me(void) { return proc_current(); }
 
+/* slot changes (close, dup2) and the nobkl lookups, so a file can't die between
+   the lookup and the ref */
+static spin_t fdl;
+
+static file_t* getf_ref(int fd) {
+    if (fd < 0 || fd >= MAX_FDS) return NULL;
+    uint64_t fl = spin_lock(&fdl);
+    file_t* f = proc_current()->sh->fds[fd];
+    file_ref(f);
+    spin_unlock(&fdl, fl);
+    return f;
+}
+
+static file_t* fd_swap(int fd, file_t* nf) {
+    uint64_t fl = spin_lock(&fdl);
+    file_t* old = me()->sh->fds[fd];
+    me()->sh->fds[fd] = nf;
+    spin_unlock(&fdl, fl);
+    return old;
+}
+
 static file_t* getf(int fd) {
     if (fd < 0 || fd >= MAX_FDS) return NULL;
     return me()->sh->fds[fd];
@@ -596,9 +617,8 @@ static int do_dup2(int fd, int nfd, bool cloexec) {
     if (!f) return -EBADF;
     if (nfd < 0 || nfd >= MAX_FDS) return -EBADF;
     if (fd == nfd) return nfd;
-    if (me()->sh->fds[nfd]) file_close(me()->sh->fds[nfd]);
     file_ref(f);
-    me()->sh->fds[nfd] = f;
+    file_close(fd_swap(nfd, f));
     me()->sh->cloexec[nfd] = cloexec;
     return nfd;
 }
@@ -2162,7 +2182,7 @@ static int64_t dispatch(regs_t* r) {
         case 3: {
             file_t* fl = getf((int)a);
             if (!fl) return -EBADF;
-            p->sh->fds[a] = NULL;
+            fd_swap((int)a, NULL);
             file_close(fl);
             return 0;
         }
@@ -2649,7 +2669,7 @@ int16_t sys_revents(file_t* f, int16_t want) { return fd_revents(f, want); }
 int sys_close(int fd) {
     file_t* fl = getf(fd);
     if (!fl) return -EBADF;
-    me()->sh->fds[fd] = NULL;
+    fd_swap(fd, NULL);
     file_close(fl);
     return 0;
 }
@@ -2885,6 +2905,15 @@ int64_t syscall_nobkl(regs_t* r) {
             break;
         }
         case 202: ret = do_futex(a, (uint32_t)b, (uint32_t)c, r->r10, r->r8, (uint32_t)r->r9); break;
+        case 0: case 1: {                            /* pipes only */
+            file_t* f = getf_ref((int)a);
+            if (!f || (f->type != F_PIPE_R && f->type != F_PIPE_W)) { file_close(f); ret = NB_SLOW; break; }
+            if (nr == 0 ? f->type == F_PIPE_W : f->type == F_PIPE_R) ret = -EBADF;
+            else if (!uok((void*)b, c)) ret = -EFAULT;
+            else ret = nr == 0 ? file_read(f, (char*)b, c) : file_write(f, (const char*)b, c);
+            file_close(f);
+            break;
+        }
         case 9: {                                    /* anon only, the rest keeps the lock */
             if (!(r->r10 & MAP_ANON)) { ret = NB_SLOW; break; }
             uint64_t len = (b + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
@@ -2917,6 +2946,6 @@ int64_t syscall_nobkl(regs_t* r) {
 
 void syscall_init(void) {
     fs_free_hook = shm_drop;
-    static const uint16_t nb[] = { 9, 10, 11, 39, 186, 102, 104, 107, 108, 96, 228, 229, 24, 35, 230, 202 };
+    static const uint16_t nb[] = { 0, 1, 9, 10, 11, 39, 186, 102, 104, 107, 108, 96, 228, 229, 24, 35, 230, 202 };
     for (unsigned i = 0; i < sizeof(nb) / sizeof(nb[0]); i++) nobkl_tab[nb[i]] = 1;
 }

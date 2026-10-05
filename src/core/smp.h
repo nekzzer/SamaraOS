@@ -8,6 +8,8 @@
 void bkl_take(struct cpu* c);
 void bkl_drop(struct cpu* c);
 void bkl_yield(struct cpu* c);
+int  bkl_enter(void);                   /* nobkl code that needs the lock for a bit: 1 = taken, pass to bkl_leave */
+void bkl_leave(int taken);
 
 /* small spinlocks for the parts that run without the bkl. irq off while held,
    so never touch user memory under one (a fault longjmps out with the lock held) */

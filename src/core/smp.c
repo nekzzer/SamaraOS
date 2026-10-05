@@ -113,6 +113,23 @@ void bkl_drop(struct cpu* c) {
     __atomic_store_n(&tk_serve, tk_serve + 1, __ATOMIC_RELEASE);
 }
 
+int bkl_enter(void) {
+    uint64_t f = irq_save();
+    struct cpu* c = this_cpu();
+    int t = !c->bkl;
+    if (t) { bkl_take(c); c->cur->nobkl = 0; }      // isr_leave would drop it again otherwise
+    irq_restore(f);
+    return t;
+}
+
+void bkl_leave(int taken) {
+    if (!taken) return;
+    uint64_t f = irq_save();
+    this_cpu()->cur->nobkl = 1;
+    bkl_drop(this_cpu());
+    irq_restore(f);
+}
+
 /* we sit at a yield point: let a waiting cpu in, if any. ticket lock so it gets it */
 void bkl_yield(struct cpu* c) {
     if (tk_next - tk_serve < 2) return;

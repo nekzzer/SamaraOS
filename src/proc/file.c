@@ -97,10 +97,47 @@ file_t* file_open_node(fs_node_t* n, int flags) {
     return f;
 }
 
-void file_ref(file_t* f) { if (f) f->refs++; }
+/* the pipe is shared with whatever runs on other cpus without the big lock */
+static void pipe_wake(pipe_t* p) {
+    for (int i = 0; i < 8; i++)
+        if (p->wq[i]) { task_ready(p->wq[i]); p->wq[i] = NULL; }
+}
+
+/* lock held on entry, gone on return. 10 ms backstop in case wq is full or a signal comes */
+static void pipe_sleep(pipe_t* p, uint64_t fl) {
+    task_t* t = task_current();
+    if (!t->proc || !t->id) {                    /* kernel tasks just poll */
+        spin_unlock(&p->lk, fl);
+        task_yield();
+        return;
+    }
+    int i = 0;
+    while (i < 8 && p->wq[i]) i++;
+    if (i < 8) p->wq[i] = t;
+    t->wake_ms = pit_uptime_ms() + 10;
+    t->state = T_BLOCKED;
+    spin_unlock(&p->lk, fl);
+    while (t->state == T_BLOCKED) task_yield();
+    fl = spin_lock(&p->lk);
+    for (i = 0; i < 8; i++) if (p->wq[i] == t) p->wq[i] = NULL;
+    spin_unlock(&p->lk, fl);
+}
+
+/* true when nobody has either end anymore */
+static bool pipe_end(pipe_t* p, int dr, int dw) {
+    uint64_t fl = spin_lock(&p->lk);
+    p->readers += dr;
+    p->writers += dw;
+    pipe_wake(p);
+    bool dead = p->readers <= 0 && p->writers <= 0;
+    spin_unlock(&p->lk, fl);
+    return dead;
+}
+
+void file_ref(file_t* f) { if (f) __atomic_add_fetch(&f->refs, 1, __ATOMIC_ACQ_REL); }
 
 void file_close(file_t* f) {
-    if (!f || --f->refs > 0) return;
+    if (!f || __atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL) > 0) return;
     if (f->type == F_NODE && f->node) fs_release(f->node);
     if (f->type == F_SOCKET && f->sock) sock_close(f->sock);
     if (f->type == F_FB) fbdev_close();
@@ -116,9 +153,7 @@ void file_close(file_t* f) {
         if (f->pipe->readers <= 0 && f->pipe->writers <= 0) kfree(f->pipe);
         if (f->pipe2->readers <= 0 && f->pipe2->writers <= 0) kfree(f->pipe2);
     } else if (f->pipe) {
-        if (f->type == F_PIPE_R) f->pipe->readers--;
-        else                     f->pipe->writers--;
-        if (f->pipe->readers <= 0 && f->pipe->writers <= 0) kfree(f->pipe);
+        if (pipe_end(f->pipe, f->type == F_PIPE_R ? -1 : 0, f->type == F_PIPE_R ? 0 : -1)) kfree(f->pipe);
     }
     kfree(f);
 }
@@ -160,8 +195,8 @@ int spair_create(file_t** a, file_t** b) {
 /* how: 0 = SHUT_RD, 1 = SHUT_WR, 2 = both. */
 int spair_shutdown(file_t* f, int how) {
     if (how < 0 || how > 2) return -22;             /* EINVAL */
-    if ((how == 0 || how == 2) && !(f->shut & 1)) { f->shut |= 1; f->pipe->readers--; }
-    if ((how == 1 || how == 2) && !(f->shut & 2)) { f->shut |= 2; f->pipe2->writers--; }
+    if ((how == 0 || how == 2) && !(f->shut & 1)) { f->shut |= 1; pipe_end(f->pipe, -1, 0); }
+    if ((how == 1 || how == 2) && !(f->shut & 2)) { f->shut |= 2; pipe_end(f->pipe2, 0, -1); }
     return 0;
 }
 
@@ -291,47 +326,63 @@ bool file_writable(file_t* f) {
 }
 
 static int pipe_read(file_t* f, pipe_t* p, char* buf, uint32_t n) {
-    while (p->count == 0) {
-        if (p->writers <= 0) return 0;
-        if (f->flags & O_NONBLOCK) return -EAGAIN;
-        if (proc_interrupted()) return -EINTR;
-        task_yield();
-    }
+    char tmp[1024];
     uint32_t got = 0;
-    while (got < n && p->count > 0) {                /* at most two runs around the ring */
+    for (;;) {
+        bool intr = got ? false : proc_interrupted();
+        uint64_t fl = spin_lock(&p->lk);
+        if (p->count == 0) {
+            if (got || p->writers <= 0) { spin_unlock(&p->lk, fl); return (int)got; }
+            if (f->flags & O_NONBLOCK) { spin_unlock(&p->lk, fl); return -EAGAIN; }
+            if (intr) { spin_unlock(&p->lk, fl); return -EINTR; }
+            pipe_sleep(p, fl);
+            continue;
+        }
         uint32_t k = PIPE_SZ - (uint32_t)p->tail;
         if (k > (uint32_t)p->count) k = (uint32_t)p->count;
         if (k > n - got) k = n - got;
-        memcpy(buf + got, p->buf + p->tail, k);
-        got += k;
+        if (k > sizeof(tmp)) k = sizeof(tmp);
+        memcpy(tmp, p->buf + p->tail, k);
         p->tail = (p->tail + (int)k) % PIPE_SZ;
         p->count -= (int)k;
+        pipe_wake(p);
+        spin_unlock(&p->lk, fl);
+        memcpy(buf + got, tmp, k);               // user buffer, may fault
+        got += k;
+        if (got >= n) return (int)got;
     }
-    return (int)got;
 }
 
 static int pipe_write(file_t* f, pipe_t* p, const char* buf, uint32_t n) {
+    char tmp[1024];
     uint32_t put = 0;
     while (put < n) {
+        uint32_t k = n - put < sizeof(tmp) ? n - put : sizeof(tmp);
+        memcpy(tmp, buf + put, k);
+        bool intr = proc_interrupted();
+        uint64_t fl = spin_lock(&p->lk);
         if (p->readers <= 0) {
+            spin_unlock(&p->lk, fl);
             proc_t* me = proc_current();
-            if (me) proc_send_signal(me, 13);   /* SIGPIPE */
+            if (me) { int tk = bkl_enter(); proc_send_signal(me, 13); bkl_leave(tk); }   /* SIGPIPE */
             return put ? (int)put : -EPIPE;
         }
         if (p->count == PIPE_SZ) {
-            if (f->flags & O_NONBLOCK) return put ? (int)put : -EAGAIN;
-            if (proc_interrupted()) return put ? (int)put : -EINTR;
-            task_yield();
+            if (f->flags & O_NONBLOCK) { spin_unlock(&p->lk, fl); return put ? (int)put : -EAGAIN; }
+            if (intr) { spin_unlock(&p->lk, fl); return put ? (int)put : -EINTR; }
+            pipe_sleep(p, fl);
             continue;
         }
-        uint32_t k = PIPE_SZ - (uint32_t)p->head, room = PIPE_SZ - (uint32_t)p->count;
-        if (k > room) k = room;
-        if (k > n - put) k = n - put;
-        memcpy(p->buf + p->head, buf + put, k);
-        put += k;
-        p->head = (p->head + (int)k) % PIPE_SZ;
-        p->count += (int)k;
+        uint32_t c = PIPE_SZ - (uint32_t)p->head, room = PIPE_SZ - (uint32_t)p->count;
+        if (c > room) c = room;
+        if (c > k) c = k;
+        memcpy(p->buf + p->head, tmp, c);
+        put += c;
+        p->head = (p->head + (int)c) % PIPE_SZ;
+        p->count += (int)c;
         p->wgen++;
+        pipe_wake(p);
+        spin_unlock(&p->lk, fl);
     }
     return (int)put;
 }
