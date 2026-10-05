@@ -9,7 +9,9 @@ SIZE=${SIZE:-4G}
 REPO=${REPO:-https://repo-default.voidlinux.org/current/musl}
 PKGS="base-files musl busybox coreutils findutils grep sed gawk tar gzip xz bash dash xbps \
       ca-certificates openssl curl wget nano htop dropbear openssh iproute2 file less \
-      ncurses-base ncurses procps-ng util-linux shadow"
+      ncurses-base ncurses procps-ng util-linux shadow \
+      wayland libxkbcommon xkeyboard-config foot xterm xorg-server-xwayland \
+      font-misc-misc dejavu-fonts-ttf fontconfig"
 
 # everything inside a user namespace: files end up owned by root:root without sudo
 if [ -z "$IN_NS" ]; then
@@ -39,6 +41,8 @@ printf 'repository=%s\n' "$REPO" > etc/xbps.d/00-repository-main.conf
 mkdir -p var/cache/xbps root etc/dropbear tmp
 chmod 1777 tmp
 printf 'SamaraOS\n' > etc/issue
+# wayland side of the desktop (userland/samara-wl/build.sh)
+[ -x $ROOT/build/samara-wl ] && install -m755 $ROOT/build/samara-wl usr/bin/samara-wl
 
 # the kernel fs has no hard links: every link becomes its own file
 find . -type f -links +1 | while read f; do cp -p "$f" "$f.hl" && mv "$f.hl" "$f"; done
