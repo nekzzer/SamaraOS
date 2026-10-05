@@ -110,7 +110,7 @@ over-engineering. Talk to the user in Russian, informally.
   ENABLE_RINGS, SINGLE_ISSUER check, PROVIDE/REMOVE_BUFFERS, PBUF_RING (user memory only, no MMAP/INC flags),
   BUFFER_SELECT for read/recv, multishot recv (not recvmsg), CQE_SKIP_SUCCESS. reqs and overflow cqes come from
   pools (kmalloc is first fit, 65k poll_adds crawled). not done: registered wait regions, recvmsg multishot,
-  send zerocopy, send vectorized. liburing tests that pass: nop poll poll-cancel poll-link poll-mshot-update
+  send zerocopy, send vectorized. liburing tests that pass: nop poll (flaky: multishot cqe is posted by a worker, not inline in send, test peeks too early) poll-cancel poll-link poll-mshot-update
   poll-many accept accept-link io-cancel timeout eventfd link link-timeout sq-poll-* sqpoll-* buf-ring buf-ring-mshot
   buf-ring-stress multicqes_drain cq-overflow cq-full sq-full socket-rw-eagain poll-race submit-reuse statx unlink
   open-close single-issuer; examples io_uring-cp link-cp echo-server (pbuf ring + multishot recv, nc). failing:
