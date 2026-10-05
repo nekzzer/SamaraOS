@@ -95,14 +95,27 @@ void vmm_flush(void) {
 
 static uint64_t* pte_slot(uint64_t pd, uint64_t va, bool create);
 
-/* every change of a live leaf pte goes through here. SMP: shootdown for the other cpus goes in tlb_inval */
+/* every change of a live leaf pte goes through here. other cpus may hold the old pte
+   (threads of one process), so they get a shootdown too. range loops batch it: sd_defer */
+static int sd_defer, sd_need;
+
 static void tlb_inval(uint64_t va) {
     __asm__ volatile ("invlpg (%0)" : : "r"(va) : "memory");
+    if (ncpu < 2) return;
+    if (sd_defer) sd_need = 1;
+    else tlb_shootdown();
 }
 
+static void sd_end(void) {
+    if (--sd_defer == 0 && sd_need) { sd_need = 0; tlb_shootdown(); }
+}
+
+/* not present before: nobody can have it cached */
 static void pte_put(uint64_t* p, uint64_t va, uint64_t v) {
+    uint64_t old = *p;
     *p = v;
-    tlb_inval(va);
+    if (old & PTE_P) tlb_inval(va);
+    else __asm__ volatile ("invlpg (%0)" : : "r"(va) : "memory");
 }
 
 /* writable now: a frame that somebody else holds too waits for the write fault */
@@ -166,23 +179,27 @@ uint64_t vmm_pte(uint64_t pd, uint64_t va) {
 
 int vmm_alloc_range(uint64_t pd, uint64_t va, uint64_t len, bool writable) {
     uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    int ret = 0;
+    sd_defer++;
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
-        if (!uaddr(a)) return -1;
+        if (!uaddr(a)) { ret = -1; break; }
         uint64_t* p = pte_slot(pd, a, true);
-        if (!p) return -1;
+        if (!p) { ret = -1; break; }
         if (*p & PTE_P) {
             if (writable) make_writable(p, a);
             continue;
         }
         uint64_t fr = pmm_alloc();
-        if (!fr) return -1;
+        if (!fr) { ret = -1; break; }
         pte_put(p, a, fr | PTE_P | PTE_US | (writable ? PTE_RW : 0));
     }
-    return 0;
+    sd_end();
+    return ret;
 }
 
 void vmm_set_writable(uint64_t pd, uint64_t va, uint64_t len, bool writable) {
     uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    sd_defer++;
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
         uint64_t* p = pte_slot(pd, a, false);
         if (!p || !(*p & (PTE_P | PTE_LAZY))) continue;
@@ -190,6 +207,7 @@ void vmm_set_writable(uint64_t pd, uint64_t va, uint64_t len, bool writable) {
         else if (*p & PTE_P) make_writable(p, a);
         else pte_put(p, a, *p | PTE_RW);
     }
+    sd_end();
 }
 
 int vmm_map_frame(uint64_t pd, uint64_t va, uint64_t fr, bool rw) {
@@ -206,14 +224,17 @@ int vmm_map_frame(uint64_t pd, uint64_t va, uint64_t fr, bool rw) {
    front: minecraft ran the box out of memory while making the world */
 int vmm_lazy_range(uint64_t pd, uint64_t va, uint64_t len, bool rw, bool user) {
     uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    int ret = 0;
+    sd_defer++;
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
-        if (!uaddr(a)) return -1;
+        if (!uaddr(a)) { ret = -1; break; }
         uint64_t* p = pte_slot(pd, a, true);
-        if (!p) return -1;
+        if (!p) { ret = -1; break; }
         if (*p & PTE_P) pmm_unref(*p & PTE_ADDR);
         pte_put(p, a, PTE_LAZY | (rw ? PTE_RW : 0) | (user ? PTE_US : 0));
     }
-    return 0;
+    sd_end();
+    return ret;
 }
 
 bool vmm_fault_in(uint64_t pd, uint64_t va) {
@@ -228,15 +249,18 @@ bool vmm_fault_in(uint64_t pd, uint64_t va) {
 // PROT_NONE = present but supervisor only, so user access faults
 void vmm_set_user(uint64_t pd, uint64_t va, uint64_t len, bool user) {
     uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    sd_defer++;
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
         uint64_t* p = pte_slot(pd, a, false);
         if (!p || !(*p & (PTE_P | PTE_LAZY))) continue;
         pte_put(p, a, user ? *p | PTE_US : *p & ~PTE_US);
     }
+    sd_end();
 }
 
 void vmm_free_range(uint64_t pd, uint64_t va, uint64_t len) {
     uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    sd_defer++;
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
         if (!uaddr(a)) continue;
         uint64_t* p = pte_slot(pd, a, false);
@@ -244,6 +268,7 @@ void vmm_free_range(uint64_t pd, uint64_t va, uint64_t len) {
         if (*p & PTE_P) pmm_unref(*p & PTE_ADDR);
         pte_put(p, a, 0);
     }
+    sd_end();
 }
 
 bool vmm_range_unmapped(uint64_t pd, uint64_t va, uint64_t len) {
@@ -344,6 +369,7 @@ uint64_t vmm_clone_space(uint64_t pd) {
     if (!npd) return 0;
     uint64_t* s = (uint64_t*)P2V(pd);
     uint64_t* d = (uint64_t*)P2V(npd);
+    sd_defer++;
     for (int i = 0; i < 256; i++) {
         if (!(s[i] & PTE_P)) continue;
         uint64_t n = pmm_alloc();
@@ -351,8 +377,10 @@ uint64_t vmm_clone_space(uint64_t pd) {
         d[i] = n | (s[i] & 0xFFF);
         if (!clone_level(s[i] & PTE_ADDR, n, 2, (uint64_t)i << 39)) goto fail;
     }
+    sd_end();      /* siblings of the parent on other cpus must not write through a stale RW */
     return npd;
 fail:
+    sd_end();
     vmm_destroy_space(npd);
     return 0;
 }
