@@ -12,6 +12,7 @@
 #include "core/string.h"
 #include "core/task.h"
 #include "core/vmm.h"
+#include "core/prof.h"
 #include "drivers/keyboard.h"
 #include "drivers/mouse.h"
 #include "proc/proc.h"
@@ -500,6 +501,7 @@ int32_t uwin_syscall(uint32_t op, uint64_t a, uint64_t b, uint64_t c) {
         if (c && (c >> 16 != (uint32_t)u->w || (c & 0xFFFF) != (uint32_t)u->h)) return 0;   /* stale size after a resize */
         if (!uok(b, (uint32_t)u->w * u->h * 4)) return -EFAULT;
         memcpy(u->pix, (const void*)b, (size_t)u->w * u->h * 4);
+        uwin_bytes += (uint64_t)u->w * u->h * 4;
         if (u->buf == b) {                    /* frame's text goes live with its pixels */
             int nx = 1 - u->ovl_cur;
             memcpy(u->ovl[nx], u->ovl_next, (size_t)u->n_next * sizeof(ovl_t));

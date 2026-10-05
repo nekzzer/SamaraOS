@@ -26,6 +26,7 @@
 #include "net/net.h"
 #include "drivers/drm.h"
 #include "proc/uring.h"
+#include "core/prof.h"
 
 #define EPERM 1
 #define ENOENT 2
@@ -376,6 +377,7 @@ static int do_write(int fd, const char* buf, uint64_t n) {
     if (!f) return -EBADF;
     if ((f->flags & O_ACCMODE) == 0 && f->type == F_NODE) return -EBADF;
     UCHK(buf, n);
+    if (f->type == F_NODE && !strcmp(f->node->name, "prof")) { prof_cmd(buf, n); return n; }
     return file_write(f, buf, n);
 }
 
@@ -2783,6 +2785,7 @@ void syscall_dispatch(regs_t* r) {
         fs_write_begin();
     }
     int64_t ret;
+    uint64_t t0 = prof_tsc();
     proc_t* pc = proc_current();
     if (pc && !setjmp((void*)pc->ujb)) {
         pc->ujb_on = true;
@@ -2794,6 +2797,7 @@ void syscall_dispatch(regs_t* r) {
         ret = -EFAULT;
     } else ret = dispatch(r);
     if (mut) fs_write_end();
+    prof_sys((int)nr, prof_tsc() - t0);
     if (g_strace && g_strace_pid && proc_current() && proc_current()->pid == g_strace_pid) {
         /* buffered: record now, print when the process exits (timing stays intact) */
         static struct { int32_t nr, a, b, c, ret; } rec[4096];

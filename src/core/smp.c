@@ -1,4 +1,5 @@
 #include "core/smp.h"
+#include "core/prof.h"
 #include "core/heap.h"
 #include "core/string.h"
 #include "core/vmm.h"
@@ -45,10 +46,14 @@ void tlb_unload(uint64_t pd) {
 
 void bkl_take(struct cpu* c) {
     uint32_t t = __atomic_fetch_add(&tk_next, 1, __ATOMIC_ACQUIRE);
+    uint64_t w0 = 0;
+    if (__atomic_load_n(&tk_serve, __ATOMIC_ACQUIRE) != t) { w0 = prof_tsc(); bkl_slow++; }
     while (__atomic_load_n(&tk_serve, __ATOMIC_ACQUIRE) != t) {
         tlb_service();
         __asm__ volatile ("pause");
     }
+    bkl_takes++;
+    if (w0) bkl_wait += prof_tsc() - w0;
     c->bkl = 1;
 }
 
@@ -73,7 +78,9 @@ void tlb_shootdown(void) {
         __atomic_store_n(&c->tlb_req, 1, __ATOMIC_SEQ_CST);
         lapic_ipi(c->apic_id, VEC_TLB);
         mask |= 1 << i;
+        tlb_ipis++;
     }
+    tlb_rounds++;
     for (int i = 0; i < ncpu; i++)
         while ((mask & (1 << i)) && __atomic_load_n(&cpus[i].tlb_req, __ATOMIC_ACQUIRE)) __asm__ volatile ("pause");
 }

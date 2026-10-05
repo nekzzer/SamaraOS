@@ -15,6 +15,7 @@
 #include "boot/pit.h"
 #include "fs/fatfs.h"
 #include "net/net.h"
+#include "core/prof.h"
 
 extern uint32_t cpu_ticks_user, cpu_ticks_sys, cpu_ticks_idle, cpu_ctxt;
 
@@ -377,5 +378,26 @@ void procfs_refresh(void) {
 
     fill_globals(mem, cap);
     kfree(mem);
+    {
+        fs_node_t* sd = ensure(proc_root, "samara", FS_DIR, 0555);
+        // only rebuilt for a read: dump is big
+        static int shown = -1;
+        if (sd && prof_on) {
+            sb_t pb = { "running\n", 8, 9 };
+            put(sd, "prof", &pb);
+            shown = -1;
+        } else if (sd && shown != prof_gen) {
+            shown = prof_gen;
+            sb_t pb = { kmalloc(300000), 0, 300000 };
+            if (pb.buf) {
+                pb.len = prof_dump(pb.buf, pb.cap);
+                put(sd, "prof", &pb);
+                kfree(pb.buf);
+            }
+        }
+        if (sd) sd->mode = 0555;
+        fs_node_t* pn = sd ? fs_child(sd, "prof") : NULL;
+        if (pn) pn->mode = 0666;
+    }
     irq_restore(f);
 }

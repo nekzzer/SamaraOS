@@ -63,6 +63,7 @@ KERN_SRC := \
     src/boot/apic.c \
     src/boot/gdt.c \
     src/core/smp.c \
+    src/core/prof.c \
     src/boot/idt.c \
     src/boot/paging.c \
     src/boot/fpu.c \

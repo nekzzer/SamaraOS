@@ -5,6 +5,7 @@
 #include "boot/pic.h"
 #include "boot/apic.h"
 #include "core/smp.h"
+#include "core/prof.h"
 #include "core/io.h"
 #include "boot/gdt.h"
 #include "boot/paging.h"
@@ -250,6 +251,7 @@ static regs_t* schedule(regs_t* saved) {
         else if (user) c->t_user++;
         else c->t_sys++;
         if (cur->proc && !c->in_idle) proc_account_tick(cur->proc, user);
+        if (prof_on) prof_sample(saved->rip, user, c->in_idle || cur == c->idle, cur->proc ? cur->proc->name : "?");
     }
 
     /* 1 kHz tick, 10 ms time slice. A task that is no longer runnable gives
