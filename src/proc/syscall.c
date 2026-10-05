@@ -2220,6 +2220,9 @@ static int64_t sys_socket_call(int call, uint64_t a, uint64_t b, uint64_t c,
                 UCHK((void*)d, 16);
                 int64_t* tv = (int64_t*)d;
                 sock_rcvtmo(s, (uint32_t)(tv[0] * 1000 + tv[1] / 1000));
+            } else if (b == 6 && c == 13 && d && e >= 4) {            /* TCP_CONGESTION */
+                UCHK((void*)d, e);
+                return sock_setcc(s, (const char*)d, (int)e);
             } else if (d && e >= 1) {
                 UCHK((void*)d, 1);
                 sock_opt(s, (int)b, (int)c, e >= 4 ? *(int*)d : *(uint8_t*)d);
@@ -2231,6 +2234,7 @@ static int64_t sys_socket_call(int call, uint64_t a, uint64_t b, uint64_t c,
             UCHK((void*)e, 4);
             UCHK((void*)d, 4);
             int v = 0;
+            { uint32_t l = *(uint32_t*)e; UCHK((void*)d, l); if (sock_getopt(s, (int)b, (int)c, (uint8_t*)d, &l)) { *(uint32_t*)e = l; return 0; } }
             if (b == 1 && c == 4) v = sock_take_error(s);             /* SO_ERROR */
             else if (b == 1 && c == 3) v = sock_type(s);              /* SO_TYPE */
             else if (b == 1 && (c == 7 || c == 8)) v = 65536;         /* SO_SNDBUF/RCVBUF */

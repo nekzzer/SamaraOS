@@ -20,6 +20,8 @@ void    sock_input_icmp6(const uint8_t* src, const uint8_t* dst, const uint8_t* 
 void    sock_input_icmp(uint32_t src, uint32_t dst, const uint8_t* pkt, int ihl, int total);
 void    sock_rcvtmo(sock_t* s, uint32_t ms);
 void    sock_opt(sock_t* s, int level, int name, int val);
+int     sock_setcc(sock_t* s, const char* name, int len);
+int     sock_getopt(sock_t* s, int level, int name, uint8_t* out, uint32_t* len);
 int     sock_cmsg(sock_t* s, uint8_t* out, int cap);
 
 /* All return >= 0 or -errno. `nonblock` comes from the file's O_NONBLOCK. */

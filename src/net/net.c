@@ -326,6 +326,12 @@ void net_send_ip(uint32_t dst, uint8_t proto, const void* payload, int len) {
     send_ip(dst, proto, payload, len);
 }
 
+uint32_t net_rxwnd(uint32_t dst) {
+    if ((dst >> 24) == 127) return 1 << 20;
+    nif_t* f = dst ? route(dst) : &nifs[0];
+    return f && f->kind == NIC_E1000 ? 192 * 1024 : 48 * 1024;
+}
+
 uint32_t net_src_for(uint32_t dst) {
     if ((dst >> 24) == 127) return dst;
     nif_t* f = route(dst);
