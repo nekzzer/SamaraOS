@@ -35,6 +35,7 @@ int  net_http_get(uint32_t ip, uint16_t port, const char* host, const char* path
                   uint8_t* out, int outcap);
 
 /* For the socket layer (net/sock.c). Addresses in host byte order. */
+extern uint8_t net_ttl;                    /* 0 = default 64, set around net_send_ip */
 void     net_send_ip(uint32_t dst, uint8_t proto, const void* payload, int len);
 uint32_t net_src_for(uint32_t dst);        /* our address as seen by `dst` */
 

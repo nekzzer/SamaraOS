@@ -6,6 +6,7 @@
 #include "core/task.h"
 #include "boot/pit.h"
 #include "proc/proc.h"
+#include "core/clock.h"
 
 #define EAGAIN       11
 #define ENOMEM       12
@@ -46,6 +47,8 @@ typedef struct dgram {
     uint8_t  ip[16];
     uint16_t port;
     uint16_t len;
+    uint8_t  ttl;
+    uint32_t ts_s, ts_us;
     uint8_t  data[];
 } dgram_t;
 
@@ -60,6 +63,10 @@ struct sock {
     uint16_t lport, rport;
     bool     bound, connected;
     int      err;
+    uint32_t rcvtmo;               /* ms, 0 = forever */
+    uint8_t  ttl, opts;            /* opts: 1 recvttl, 2 timestamp, 4 timestampns, 8 recvhoplimit */
+    uint8_t  l_ttl;                /* what the last recv saw, for cmsg */
+    uint32_t l_s, l_us;
 
     /* TCP */
     uint32_t iss, snd_una, snd_nxt, rcv_nxt, tx_seq;
@@ -497,8 +504,58 @@ void sock_input_udp(uint32_t src, uint32_t dst, const uint8_t* d, int len) {
 }
 void sock_input_udp6(const uint8_t* src, const uint8_t* dst, const uint8_t* d, int len) { udp_in(src, dst, d, len); }
 
+static void q_icmp(sock_t* s, const uint8_t* src, const uint8_t* m, int len, int ttl) {
+    if (s->q_n >= UDP_QMAX) return;
+    dgram_t* g = (dgram_t*)kmalloc(sizeof(dgram_t) + (uint32_t)len);
+    if (!g) return;
+    g->next = NULL; memcpy(g->ip, src, 16); g->port = 0; g->len = (uint16_t)len;
+    g->ttl = (uint8_t)ttl;
+    clock_now_us(&g->ts_s, &g->ts_us);
+    memcpy(g->data, m, (uint32_t)len);
+    if (s->q_tail) s->q_tail->next = g; else s->q_head = g;
+    s->q_tail = g;
+    s->q_n++;
+}
+
+/* icmp v4: p is the whole ip packet (raw sockets want the header too) */
+void sock_input_icmp(uint32_t src4, uint32_t dst4, const uint8_t* p, int ihl, int total) {
+    const uint8_t* m = p + ihl;
+    int len = total - ihl;
+    uint8_t src[16], dst[16];
+    map4(src, src4); map4(dst, dst4);
+    if (len < 8) return;
+    if (m[0] == 3 && len >= 8 + 20 + 8) {              /* dest unreach: tell tcp/udp sockets */
+        const uint8_t* in = m + 8;
+        int il = (in[0] & 15) * 4;
+        if (il >= 20 && len >= 8 + il + 8) {
+            const uint8_t* t = in + il;
+            uint16_t sp = (t[0] << 8) | t[1], dp = (t[2] << 8) | t[3];
+            uint8_t odst[16];
+            map4(odst, (uint32_t)in[16] << 24 | in[17] << 16 | in[18] << 8 | in[19]);
+            int e = m[1] == 3 ? ECONNREFUSED : m[1] == 2 ? ECONNREFUSED : m[1] == 1 ? 113 : ENETUNREACH;
+            for (int i = 0; i < MAX_SOCKS; i++) {
+                sock_t* s = &socks[i];
+                if (!s->used || s->af != 2 || s->lport != sp || s->rport != dp || memcmp(s->rip, odst, 16)) continue;
+                if (s->type == 1 && in[9] == 6 && s->state == S_SYN_SENT) { s->err = e; s->state = S_CLOSED; }
+                else if (s->type == 2 && in[9] == 17 && s->connected && !s->proto) s->err = e;
+                else if (s->type == 2 && in[9] == 17 && s->connected && s->proto == 17) s->err = e;
+            }
+        }
+    }
+    for (int i = 0; i < MAX_SOCKS; i++) {
+        sock_t* s = &socks[i];
+        if (!s->used || s->proto != 1 || s->af != 2 || s->type == 1) continue;
+        if (!zero16(s->lip) && memcmp(s->lip, dst, 16)) continue;
+        if (s->type == 2) {
+            if (m[0] != 0 || ((m[4] << 8) | m[5]) != s->lport) continue;
+            if (s->connected && memcmp(s->rip, src, 16)) continue;
+            q_icmp(s, src, m, len, p[8]);
+        } else q_icmp(s, src, p, total, p[8]);
+    }
+}
+
 /* icmpv6 for raw sockets (and the ping kind of dgram ones) */
-void sock_input_icmp6(const uint8_t* src, const uint8_t* dst, const uint8_t* m, int len) {
+void sock_input_icmp6(const uint8_t* src, const uint8_t* dst, const uint8_t* m, int len, int hl) {
     if (m[0] == 1 && len >= 8 + 40 + 4 && m[8 + 6] == 6) {      /* dest unreach for our syn */
         const uint8_t* in = m + 8;
         uint16_t sp = (in[40] << 8) | in[41], dp = (in[42] << 8) | in[43];
@@ -517,14 +574,7 @@ void sock_input_icmp6(const uint8_t* src, const uint8_t* dst, const uint8_t* m, 
         if (s->type == 2 && (m[0] != 129 || len < 8 || ((m[4] << 8) | m[5]) != s->lport)) continue;
         if (!zero16(s->lip) && memcmp(s->lip, dst, 16)) continue;
         if (s->connected && memcmp(s->rip, src, 16)) continue;
-        if (s->q_n >= UDP_QMAX) continue;
-        dgram_t* g = (dgram_t*)kmalloc(sizeof(dgram_t) + (uint32_t)len);
-        if (!g) continue;
-        g->next = NULL; memcpy(g->ip, src, 16); g->port = 0; g->len = (uint16_t)len;
-        memcpy(g->data, m, (uint32_t)len);
-        if (s->q_tail) s->q_tail->next = g; else s->q_head = g;
-        s->q_tail = g;
-        s->q_n++;
+        q_icmp(s, src, m, len, hl);
     }
 }
 
@@ -553,9 +603,11 @@ void sock_init(void) { task_spawn("netd", netd); }
 /* Wait for `cond` with packet processing; 0, -EAGAIN or -EINTR. */
 #define WAIT_FOR(cond, nonblock)                                   \
     do {                                                           \
+        uint32_t t0_ = pit_uptime_ms();                            \
         pump();                                                    \
         while (!(cond)) {                                          \
             if (nonblock) return -EAGAIN;                          \
+            if (s->rcvtmo && pit_uptime_ms() - t0_ >= s->rcvtmo) return -EAGAIN; \
             if (proc_interrupted()) return -EINTR;                 \
             task_yield();                                          \
             pump();                                                \
@@ -569,7 +621,7 @@ sock_t* sock_create(int af, int type, int proto, int* err) {
     sock_t* s = alloc_sock(type, af);
     if (!s) { *err = -ENOMEM; return NULL; }
     s->proto = proto;
-    if (type == 2 && proto == 58 && !s->lport) s->lport = ephemeral(2);       /* ping socket: the port is the echo id */
+    if (type == 2 && (proto == 58 || proto == 1) && !s->lport) s->lport = ephemeral(2);       /* ping socket: the port is the echo id */
     return s;
 }
 
@@ -699,7 +751,7 @@ int sock_send(sock_t* s, const uint8_t* buf, uint32_t len, bool nonblock,
             else map4(src, net_src_for(d));
         } else if (!zero16(s->lip) && !is4(s->lip)) memcpy(src, s->lip, 16);
         else if (!ip6_src_for(ip, src)) return -ENETUNREACH;
-        if (s->type == 3 || s->proto == 58) {          /* icmp: whole message from the user */
+        if (s->type == 3 || s->proto == 58 || s->proto == 1) {   /* icmp: whole message from the user */
             uint8_t m[1472];
             if (len < 8) return -EINVAL;
             memcpy(m, buf, len);
@@ -708,9 +760,17 @@ int sock_send(sock_t* s, const uint8_t* buf, uint32_t len, bool nonblock,
                 m[2] = m[3] = 0;
                 uint16_t c = l4_sum(src, ip, 58, m, (int)len);
                 m[2] = c >> 8; m[3] = (uint8_t)c;
+            } else if (s->type == 2) {                 /* ping socket v4, id changed so redo the sum */
+                uint32_t x = 0;
+                m[2] = m[3] = 0;
+                x = sum16(0, m, (int)len);
+                while (x >> 16) x = (x & 0xFFFF) + (x >> 16);
+                m[2] = (uint8_t)(~x >> 8); m[3] = (uint8_t)~x;
             }
             uint32_t f = irq_save();
+            net_ttl = s->ttl;
             int r = ip_out(src, ip, (uint8_t)s->proto, m, (int)len);
+            net_ttl = 0;
             irq_restore(f);
             pump();
             return r < 0 ? r : (int)len;
@@ -770,6 +830,7 @@ int sock_recv(sock_t* s, uint8_t* buf, uint32_t len, bool nonblock, bool peek,
         memcpy(buf, g->data, n);
         if (from_ip) memcpy(from_ip, g->ip, 16);
         if (from_port) *from_port = g->port;
+        s->l_ttl = g->ttl; s->l_s = g->ts_s; s->l_us = g->ts_us;
         if (!peek) {
             s->q_head = g->next;
             if (!s->q_head) s->q_tail = NULL;
@@ -834,4 +895,40 @@ bool sock_writable(sock_t* s) {
 
 bool sock_hup(sock_t* s) {
     return s->type == 1 && (s->state == S_CLOSED || (s->fin_rcvd && s->shut_wr));
+}
+
+void sock_rcvtmo(sock_t* s, uint32_t ms) { s->rcvtmo = ms; }
+
+/* setsockopt bits that only matter for the icmp cmsgs */
+void sock_opt(sock_t* s, int level, int name, int val) {
+    if (level == 0 && name == 12) s->opts = val ? s->opts | 1 : s->opts & ~1;                 /* IP_RECVTTL */
+    else if (level == 0 && name == 2) s->ttl = val;                                          /* IP_TTL */
+    else if (level == 1 && name == 29) s->opts = val ? s->opts | 2 : s->opts & ~2;           /* SO_TIMESTAMP */
+    else if (level == 1 && name == 35) s->opts = val ? s->opts | 4 : s->opts & ~4;           /* SO_TIMESTAMPNS */
+    else if (level == 41 && name == 51) s->opts = val ? s->opts | 8 : s->opts & ~8;          /* IPV6_RECVHOPLIMIT */
+    else if (level == 41 && (name == 16 || name == 52)) s->ttl = val;
+}
+
+/* control messages for the datagram recv'd last, returns bytes */
+int sock_cmsg(sock_t* s, uint8_t* out, int cap) {
+    int n = 0;
+    uint64_t* h;
+    if (s->type == 1) return 0;
+    if ((s->opts & 1) && s->af == 2 && s->l_ttl && n + 24 <= cap) {
+        h = (uint64_t*)(out + n);
+        h[0] = 20; ((int*)h)[2] = 0; ((int*)h)[3] = 2; ((int*)h)[4] = s->l_ttl; ((int*)h)[5] = 0;
+        n += 24;
+    }
+    if ((s->opts & 8) && s->af == 10 && s->l_ttl && n + 24 <= cap) {
+        h = (uint64_t*)(out + n);
+        h[0] = 20; ((int*)h)[2] = 41; ((int*)h)[3] = 52; ((int*)h)[4] = s->l_ttl; ((int*)h)[5] = 0;
+        n += 24;
+    }
+    if ((s->opts & 6) && s->l_s && n + 32 <= cap) {
+        h = (uint64_t*)(out + n);
+        h[0] = 32; ((int*)h)[2] = 1; ((int*)h)[3] = (s->opts & 4) ? 35 : 29;
+        h[2] = s->l_s; h[3] = (s->opts & 4) ? s->l_us * 1000ull : s->l_us;
+        n += 32;
+    }
+    return n;
 }

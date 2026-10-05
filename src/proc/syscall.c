@@ -1159,6 +1159,7 @@ static int do_poll(pollfd_t* fds, uint64_t n, int timeout_ms) {
         int r = poll_once(fds, n);
         if (r || timeout_ms == 0) return r;
         if (timeout_ms > 0 && pit_uptime_ms() - start >= (uint32_t)timeout_ms) return 0;
+        if (proc_interrupted()) return -EINTR;
         task_sleep_ms(1);
     }
 }
@@ -1199,6 +1200,7 @@ static int do_select(int n, uint32_t* rd, uint32_t* wr, uint32_t* ex, int timeou
             }
             return ready;
         }
+        if (proc_interrupted()) return -EINTR;
         task_sleep_ms(1);
     }
 }
@@ -1996,7 +1998,7 @@ static int64_t sys_socket_call(int call, uint64_t a, uint64_t b, uint64_t c,
             if (a != AF_INET && a != AF_INET6) return -97;
             int type = (int)(b & 0xF);
             if (type == 3) { if (c != (a == AF_INET ? 1 : 58)) return -93; }
-            else if (c && !((type == 1 && c == 6) || (type == 2 && (c == 17 || (c == 58 && a == AF_INET6))))) return -93;  /* EPROTONOSUPPORT */
+            else if (c && !((type == 1 && c == 6) || (type == 2 && (c == 17 || (c == 58 && a == AF_INET6) || (c == 1 && a == AF_INET))))) return -93;  /* EPROTONOSUPPORT */
             s = sock_create((int)a, type, (int)c, &err);
             if (!s) return err ? err : -93;
             fl = file_new(F_SOCKET, 2 | ((b & 04000) ? O_NONBLOCK : 0));
@@ -2057,6 +2059,13 @@ static int64_t sys_socket_call(int call, uint64_t a, uint64_t b, uint64_t c,
             if (b == 41 && c == 26 && d && e >= 4) {                  /* IPV6_V6ONLY */
                 UCHK((void*)d, 4);
                 sock_v6only(s, 1, *(int*)d);
+            } else if (b == 1 && c == 20 && d && e >= 16) {           /* SO_RCVTIMEO */
+                UCHK((void*)d, 16);
+                int64_t* tv = (int64_t*)d;
+                sock_rcvtmo(s, (uint32_t)(tv[0] * 1000 + tv[1] / 1000));
+            } else if (d && e >= 1) {
+                UCHK((void*)d, 1);
+                sock_opt(s, (int)b, (int)c, e >= 4 ? *(int*)d : *(uint8_t*)d);
             }
             return 0;
         case 15: {                                                    /* getsockopt */
@@ -2096,7 +2105,11 @@ static int64_t sys_socket_call(int call, uint64_t a, uint64_t b, uint64_t c,
                 /* was &len on the kernel stack, UCHK said no and the name never got written.
                    musl 1.2.5 dns drops replies without it (apk) */
                 if (m->name) write_addr(m->name, (uint64_t)&m->namelen, sock_af(s), ip, port);
-                m->ctllen = 0; m->flags = 0;
+                m->flags = 0;
+                if (m->ctl && m->ctllen) {
+                    UCHK((void*)m->ctl, m->ctllen);
+                    m->ctllen = total >= 0 ? sock_cmsg(s, (uint8_t*)m->ctl, (int)m->ctllen) : 0;
+                } else m->ctllen = 0;
             }
             return total;
         }

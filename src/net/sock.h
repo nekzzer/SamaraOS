@@ -15,7 +15,11 @@ void    sock_input_tcp(uint32_t src, uint32_t dst, const uint8_t* seg, int len);
 void    sock_input_udp(uint32_t src, uint32_t dst, const uint8_t* dgram, int len);
 void    sock_input_tcp6(const uint8_t* src, const uint8_t* dst, const uint8_t* seg, int len);
 void    sock_input_udp6(const uint8_t* src, const uint8_t* dst, const uint8_t* dgram, int len);
-void    sock_input_icmp6(const uint8_t* src, const uint8_t* dst, const uint8_t* msg, int len);
+void    sock_input_icmp6(const uint8_t* src, const uint8_t* dst, const uint8_t* msg, int len, int hl);
+void    sock_input_icmp(uint32_t src, uint32_t dst, const uint8_t* pkt, int ihl, int total);
+void    sock_rcvtmo(sock_t* s, uint32_t ms);
+void    sock_opt(sock_t* s, int level, int name, int val);
+int     sock_cmsg(sock_t* s, uint8_t* out, int cap);
 
 /* All return >= 0 or -errno. `nonblock` comes from the file's O_NONBLOCK. */
 /* addresses below are 16 bytes, v4 as ::ffff:a.b.c.d */

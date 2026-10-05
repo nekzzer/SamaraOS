@@ -278,6 +278,8 @@ static bool is_local(uint32_t ip) { return (ip >> 24) == 127 || nif_by_ip(ip) !=
 
 static void on_ipv4(const uint8_t* pkt, int len);
 
+uint8_t net_ttl;
+
 static void send_ip(uint32_t dst, uint8_t proto, const void* payload, int len) {
     uint8_t frame[PKT_BUF];
     int total = sizeof(ip4_hdr_t) + len;
@@ -293,7 +295,7 @@ static void send_ip(uint32_t dst, uint8_t proto, const void* payload, int len) {
     static uint16_t ipid = 1;
     ih->id = htons(ipid++);
     ih->flags_frag = 0;
-    ih->ttl = 64;
+    ih->ttl = net_ttl ? net_ttl : 64;
     ih->proto = proto;
     ih->check = 0;
     ih->src = htonl(src);
@@ -389,6 +391,7 @@ static void on_arp(nif_t* f, const uint8_t* pkt, int len) {
 
 static void on_icmp(const ip4_hdr_t* ih, const uint8_t* pkt, int len) {
     if (len < (int)sizeof(icmp_echo_t)) return;
+    sock_input_icmp(ntohl(ih->src), ntohl(ih->dst), (const uint8_t*)ih, (int)(pkt - (const uint8_t*)ih), (int)(pkt - (const uint8_t*)ih) + len);
     const icmp_echo_t* e = (const icmp_echo_t*)pkt;
     if (e->type == ICMP_ECHO_REQ) {
         /* reply */
