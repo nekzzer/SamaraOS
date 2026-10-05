@@ -27,7 +27,7 @@ typedef struct {
     int        id;                 /* 1..FATFS_MAX_MOUNTS, stored in root->mount_id */
     int        disk;
     fs_node_t* root;
-    bool       fat32;
+    bool       fat32, fat12;       /* fat12: read-only, the fat sits in memory as u16 */
     uint32_t   spc, csize, reserved, nfats, fatsz, root_entries;
     uint32_t   root_lba, root_secs, data_lba, nclus;
     uint32_t   fsinfo, backup_boot;
@@ -111,9 +111,9 @@ static int parse_bpb(vol_t* v, const uint8_t* b) {
     if (total <= v->data_lba) return -EINVAL;
     v->nclus = (total - v->data_lba) / v->spc;
     v->csize = v->spc * 512;
-    uint32_t max_entries = v->fatsz * 512 / (v->fat32 ? 4 : 2);
+    v->fat12 = !v->fat32 && v->nclus < 4085;
+    uint32_t max_entries = v->fat12 ? v->fatsz * 512 * 2 / 3 : v->fatsz * 512 / (v->fat32 ? 4 : 2);
     if (v->nclus + 2 > max_entries) v->nclus = max_entries - 2;
-    if (!v->fat32 && v->nclus < 4085) return -EINVAL;              /* FAT12: not supported */
     v->fsinfo = v->fat32 ? rd16(b + 48) : 0;
     v->backup_boot = v->fat32 ? rd16(b + 50) : 0;
     return 0;
@@ -135,7 +135,7 @@ static uint32_t fat_get(vol_t* v, uint32_t c) {
 }
 
 static bool is_eoc(vol_t* v, uint32_t c) {
-    return v->fat32 ? c >= 0x0FFFFFF8 : c >= 0xFFF8;
+    return v->fat32 ? c >= 0x0FFFFFF8 : v->fat12 ? c >= 0xFF8 : c >= 0xFFF8;
 }
 
 /* ---------------- loading ---------------- */
@@ -212,8 +212,31 @@ static int load_entry(vol_t* v, fs_node_t* dir, const char* name, const uint8_t*
     return 0;
 }
 
+static int to_ucs(const char* s, uint16_t* u) {
+    int n = 0;
+    while (*s && n < 255) {
+        uint8_t c = (uint8_t)*s++;
+        if (c < 0x80) u[n++] = c;
+        else if (c >= 0xC0 && c < 0xE0 && (s[0] & 0xC0) == 0x80) { u[n++] = (uint16_t)((c & 0x1F) << 6 | (s[0] & 0x3F)); s++; }
+        else if (c >= 0xE0 && c < 0xF0 && (s[0] & 0xC0) == 0x80 && (s[1] & 0xC0) == 0x80) { u[n++] = (uint16_t)((c & 0x0F) << 12 | (s[0] & 0x3F) << 6 | (s[1] & 0x3F)); s += 2; }
+        else u[n++] = '_';
+    }
+    return n;
+}
+
+static void from_ucs(const uint16_t* u, char* o) {
+    int n = 0;
+    for (int i = 0; u[i] && n < 250; i++) {
+        uint16_t c = u[i];
+        if (c < 0x80) o[n++] = (char)c;
+        else if (c < 0x800) { o[n++] = (char)(0xC0 | c >> 6); o[n++] = (char)(0x80 | (c & 0x3F)); }
+        else { o[n++] = (char)(0xE0 | c >> 12); o[n++] = (char)(0x80 | (c >> 6 & 0x3F)); o[n++] = (char)(0x80 | (c & 0x3F)); }
+    }
+    o[n] = 0;
+}
+
 static int load_dir(vol_t* v, fs_node_t* dir, const uint8_t* ents, uint32_t bytes, int depth) {
-    char lfn[264];
+    uint16_t lfn[264];
     int lfn_len = 0;
     uint8_t lfn_sum = 0;
     for (uint32_t off = 0; off + 32 <= bytes; off += 32) {
@@ -229,7 +252,7 @@ static int load_dir(vol_t* v, fs_node_t* dir, const uint8_t* ents, uint32_t byte
                 uint16_t ch = rd16(e + pos[k]);
                 int idx = (ord - 1) * 13 + k;
                 if (idx >= 263) continue;
-                lfn[idx] = ch == 0 || ch == 0xFFFF ? 0 : ch < 0x80 ? (char)ch : '_';
+                lfn[idx] = ch == 0xFFFF ? 0 : ch;
             }
             continue;
         }
@@ -239,8 +262,7 @@ static int load_dir(vol_t* v, fs_node_t* dir, const uint8_t* ents, uint32_t byte
         uint8_t sum = 0;
         for (int k = 0; k < 11; k++) sum = (uint8_t)(((sum & 1) << 7) + (sum >> 1) + e[k]);
         if (lfn_len && sum == lfn_sum && lfn[0]) {
-            strncpy(name, lfn, sizeof(name) - 1);
-            name[sizeof(name) - 1] = 0;
+            from_ucs(lfn, name);
         } else {
             int n = 0;
             bool low_base = e[12] & 0x08, low_ext = e[12] & 0x10;
@@ -295,7 +317,8 @@ static bool as_short(const char* name, uint8_t out[11], uint8_t* nt) {
 static int lfn_slots(const char* name) {
     uint8_t sn[11], nt;
     if (as_short(name, sn, &nt)) return 0;
-    return ((int)strlen(name) + 12) / 13;
+    uint16_t u[256];
+    return (to_ucs(name, u) + 12) / 13;
 }
 
 static uint32_t dir_bytes(fs_node_t* d, bool is_root) {
@@ -486,7 +509,8 @@ static int emit_dir(layout_t* L, fs_node_t* d, place_t* self, uint32_t parent_fi
             make_alias(c->name, sn, used, nused);
             memcpy(used[nused++], sn, 11);
             nt = 0;
-            int len = (int)strlen(c->name);
+            uint16_t u[256];
+            int len = to_ucs(c->name, u);
             nl = (len + 12) / 13;
             uint8_t sum = 0;
             for (int k = 0; k < 11; k++) sum = (uint8_t)(((sum & 1) << 7) + (sum >> 1) + sn[k]);
@@ -499,7 +523,7 @@ static int emit_dir(layout_t* L, fs_node_t* d, place_t* self, uint32_t parent_fi
                 e[13] = sum;
                 for (int j = 0; j < 13; j++) {
                     int idx = (k - 1) * 13 + j;
-                    uint16_t ch = idx < len ? (uint8_t)c->name[idx] : idx == len ? 0 : 0xFFFF;
+                    uint16_t ch = idx < len ? u[idx] : idx == len ? 0 : 0xFFFF;
                     wr16(e + pos[j], ch);
                 }
                 off += 32;
@@ -681,7 +705,7 @@ int fatfs_mount(int disk, fs_node_t* at) {
     if (!ata_drive_present(disk) || ata_read(disk, 0, 1, v->boot) < 0) return -EIO;
     int r = parse_bpb(v, v->boot);
     if (r < 0) return r;
-    v->fat = (uint8_t*)kmalloc(v->fatsz * 512);
+    v->fat = (uint8_t*)kmalloc(v->fat12 ? (v->nclus + 2) * 2 > v->fatsz * 512 ? (v->nclus + 2) * 2 : v->fatsz * 512 : v->fatsz * 512);
     v->clus_hash = (uint32_t*)kmalloc((v->nclus + 2) * 4);
     v->fat_hash = (uint32_t*)kmalloc(v->fatsz * 4);
     v->root_hash = (uint32_t*)kmalloc((v->root_secs + 1) * 4);
@@ -689,7 +713,15 @@ int fatfs_mount(int disk, fs_node_t* at) {
     memset(v->clus_hash, 0, (v->nclus + 2) * 4);
     memset(v->fat_hash, 0, v->fatsz * 4);
     memset(v->root_hash, 0, (v->root_secs + 1) * 4);
-    if (ata_read(disk, v->reserved, (int)v->fatsz, v->fat) < 0) { r = -EIO; goto fail; }
+    if (v->fat12) {
+        uint8_t* raw = (uint8_t*)kmalloc(v->fatsz * 512);
+        if (!raw || ata_read(disk, v->reserved, (int)v->fatsz, raw) < 0) { if (raw) kfree(raw); r = -EIO; goto fail; }
+        for (uint32_t i = 0; i < v->nclus + 2; i++) {
+            uint32_t o = i * 3 / 2, w = raw[o] | (o + 1 < v->fatsz * 512 ? raw[o + 1] << 8 : 0);
+            ((uint16_t*)v->fat)[i] = (uint16_t)(i & 1 ? w >> 4 : w & 0xFFF);
+        }
+        kfree(raw);
+    } else if (ata_read(disk, v->reserved, (int)v->fatsz, v->fat) < 0) { r = -EIO; goto fail; }
 
     uint32_t len;
     uint8_t* rootd;
@@ -712,6 +744,7 @@ int fatfs_mount(int disk, fs_node_t* at) {
     char dn[24] = "/dev/";
     strcat(dn, ata_drive_name(disk));
     mnt_add("vfat", dn, at, disk);
+    if (v->fat12) mnt_set_ro(at);
     return 0;
 fail:
     if (v->fat) kfree(v->fat);
