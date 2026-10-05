@@ -32,6 +32,7 @@ void be_text(int x, int y, const char *s, uint32_t c, int font);
 int  be_text_w(const char *s, int font);
 int  be_font_h(int font);
 void be_blit(int x, int y, int w, int h, const uint32_t *src, int sw, int sh);   /* scaled to w x h */
+void be_clip_set(const char *s, int n);        /* system clipboard, utf-8 */
 int  be_flip(void);                            /* < 0: window gone */
 
 #endif
