@@ -89,6 +89,9 @@ void kbd_leave(void);
 void ptr_event(struct tl *t, uev_t *e);
 void ptr_gone(struct surf *s);
 void data_init(void);
+void data_set_x(void);
+const char *data_wl_mime(void);
+void data_wl_send(const char *m, int fd);
 
 /* xdg.c */
 void xdg_init(void);
@@ -102,4 +105,6 @@ void xwm_surface(int win, struct wl_resource *sres);
 void xwm_close(struct tl *t);
 void xwm_resize(struct tl *t, int w, int h);
 void xwm_focus(struct tl *t);
+void xwm_sel_own(bool on);
+void xwm_sel_get(int fd);
 void xwm_surf_commit(struct surf *s);

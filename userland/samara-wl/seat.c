@@ -218,13 +218,14 @@ void seat_init(void) {
 
 /* ---- clipboard: wl_data_device_manager, selection only ---- */
 
-struct dsrc { struct wl_resource *res; char mime[8][64]; int n; };
+struct dsrc { struct wl_resource *res; char mime[8][64]; int n; bool x; };
 static struct dsrc *sel;
 static struct wl_list ddevs;
 struct dd { struct wl_resource *r; struct wl_list link; };
 
 static void off_accept(struct wl_client *c, struct wl_resource *r, uint32_t s, const char *m) {}
 static void off_receive(struct wl_client *c, struct wl_resource *r, const char *m, int fd) {
+    if (sel && sel->x) { xwm_sel_get(fd); return; }
     if (sel) wl_data_source_send_send(sel->res, m, fd);
     close(fd);
 }
@@ -259,6 +260,7 @@ static void src_free(struct wl_resource *r) {
         wl_list_for_each(d, &ddevs, link) send_sel(d);
     }
     free(s);
+    if (!sel) xwm_sel_own(false);
 }
 
 static void dd_drag(struct wl_client *c, struct wl_resource *r, struct wl_resource *s, struct wl_resource *o, struct wl_resource *i, uint32_t sr) {}
@@ -266,8 +268,39 @@ static void dd_set_sel(struct wl_client *c, struct wl_resource *r, struct wl_res
     struct dd *d;
     struct dsrc *old = sel;
     sel = s ? wl_resource_get_user_data(s) : NULL;
-    if (old && old != sel) wl_data_source_send_cancelled(old->res);
+    if (old && old != sel && old->res) wl_data_source_send_cancelled(old->res);
+    if (old && old != sel && old->x) free(old);
     wl_list_for_each(d, &ddevs, link) send_sel(d);
+    if (sel) xwm_sel_own(true);
+}
+
+/* x11 client took CLIPBOARD */
+void data_set_x(void) {
+    struct dd *d;
+    struct dsrc *old = sel;
+    sel = calloc(1, sizeof(*sel));
+    sel->x = true;
+    strcpy(sel->mime[0], "text/plain;charset=utf-8");
+    strcpy(sel->mime[1], "UTF8_STRING");
+    sel->n = 2;
+    if (old && old->res) wl_data_source_send_cancelled(old->res);
+    if (old && old->x) free(old);
+    wl_list_for_each(d, &ddevs, link) send_sel(d);
+}
+
+/* for xwm: current wl selection, returns the mime to ask for or NULL */
+const char *data_wl_mime(void) {
+    if (!sel || sel->x) return NULL;
+    for (int i = 0; i < sel->n; i++)
+        if (!strcmp(sel->mime[i], "text/plain;charset=utf-8") || !strcmp(sel->mime[i], "UTF8_STRING")) return sel->mime[i];
+    for (int i = 0; i < sel->n; i++)
+        if (!strcmp(sel->mime[i], "text/plain")) return sel->mime[i];
+    return NULL;
+}
+
+void data_wl_send(const char *m, int fd) {
+    wl_data_source_send_send(sel->res, m, fd);
+    wl_display_flush_clients(dpy);
 }
 static void dd_release(struct wl_client *c, struct wl_resource *r) { wl_resource_destroy(r); }
 static const struct wl_data_device_interface dd_impl = { dd_drag, dd_set_sel, dd_release };

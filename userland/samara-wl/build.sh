@@ -18,5 +18,5 @@ gcc -O2 -Wall -Wno-unused-parameter -nostdinc -isystem $GI -isystem $R/usr/inclu
     -nostdlib -o $OUT $R/usr/lib/crt1.o $R/usr/lib/crti.o \
     $D/main.c $D/comp.c $D/seat.c $D/xdg.c $D/xwm.c $G/xdg-shell-protocol.c $G/xdg-decoration-protocol.c \
     -L$R/usr/lib -Wl,-rpath-link,$R/usr/lib -Wl,--dynamic-linker=/lib/ld-musl-x86_64.so.1 \
-    -lwayland-server -lxkbcommon -lxcb -lxcb-composite -lpthread -lc $(gcc -print-libgcc-file-name) $R/usr/lib/crtn.o
+    -lwayland-server -lxkbcommon -lxcb -lxcb-composite -lxcb-xfixes -lpthread -lc $(gcc -print-libgcc-file-name) $R/usr/lib/crtn.o
 echo "built $OUT"

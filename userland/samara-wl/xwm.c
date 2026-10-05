@@ -1,6 +1,8 @@
 #include "swl.h"
 #include <xcb/xcb.h>
 #include <xcb/composite.h>
+#include <xcb/xfixes.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/eventfd.h>
@@ -20,6 +22,8 @@ struct xw {
     struct tl *t;
     struct wl_list link;
 };
+static xcb_atom_t a_clip, a_targets, a_text, a_wprop;
+static int xf_ev, sel_own, pend_fd = -1;
 static struct wl_list xws;
 static struct wl_event_source *csrc;
 
@@ -202,10 +206,92 @@ static void ev_property(xcb_property_notify_event_t *e) {
     } else if (e->atom == a_proto) get_proto(w->t);
 }
 
+void xwm_sel_own(bool on) {
+    if (!xc || !a_clip) return;
+    if (on == sel_own) return;
+    sel_own = on;
+    xcb_set_selection_owner(xc, on ? wmwin : XCB_NONE, a_clip, XCB_CURRENT_TIME);
+    xcb_flush(xc);
+}
+
+void xwm_sel_get(int fd) {
+    if (pend_fd >= 0) close(pend_fd);
+    pend_fd = fd;
+    xcb_convert_selection(xc, wmwin, a_clip, a_utf8, a_wprop, XCB_CURRENT_TIME);
+    xcb_flush(xc);
+}
+
+static void ev_sel_notify(xcb_selection_notify_event_t *e) {
+    if (pend_fd < 0) return;
+    if (e->property != XCB_NONE) {
+        xcb_get_property_reply_t *r = xcb_get_property_reply(xc,
+            xcb_get_property(xc, 1, wmwin, a_wprop, XCB_GET_PROPERTY_TYPE_ANY, 0, 1 << 18), NULL);
+        if (r) {
+            int n = xcb_get_property_value_length(r);
+            char *p = xcb_get_property_value(r);
+            while (n > 0) {
+                int k = write(pend_fd, p, n);
+                if (k <= 0) break;
+                p += k; n -= k;
+            }
+            free(r);
+        }
+    }
+    close(pend_fd);
+    pend_fd = -1;
+}
+
+static void ev_sel_request(xcb_selection_request_event_t *e) {
+    xcb_selection_notify_event_t n = { 0 };
+    xcb_atom_t prop = e->property ? e->property : e->target;
+    n.response_type = XCB_SELECTION_NOTIFY;
+    n.requestor = e->requestor; n.selection = e->selection; n.target = e->target;
+    n.time = e->time; n.property = XCB_NONE;
+    if (e->selection == a_clip && e->target == a_targets) {
+        xcb_atom_t t[4] = { a_targets, a_utf8, XCB_ATOM_STRING, a_text };
+        xcb_change_property(xc, XCB_PROP_MODE_REPLACE, e->requestor, prop, XCB_ATOM_ATOM, 32, 4, t);
+        n.property = prop;
+    } else if (e->selection == a_clip && (e->target == a_utf8 || e->target == XCB_ATOM_STRING || e->target == a_text)) {
+        const char *m = data_wl_mime();
+        if (m) {
+            int p[2];
+            static char buf[1 << 18];
+            int len = 0;
+            pipe(p);
+            data_wl_send(m, p[1]);
+            close(p[1]);
+            struct pollfd pf = { p[0], POLLIN, 0 };
+            while (len < (int)sizeof(buf) && poll(&pf, 1, 500) > 0) {
+                int k = read(p[0], buf + len, sizeof(buf) - len);
+                if (k <= 0) break;
+                len += k;
+            }
+            close(p[0]);
+            xcb_change_property(xc, XCB_PROP_MODE_REPLACE, e->requestor, prop,
+                e->target == a_utf8 ? a_utf8 : XCB_ATOM_STRING, 8, len, buf);
+            n.property = prop;
+        }
+    }
+    xcb_send_event(xc, 0, e->requestor, XCB_EVENT_MASK_NO_EVENT, (char *)&n);
+    xcb_flush(xc);
+}
+
 static int xwm_readable(int fd, uint32_t mask, void *d) {
     xcb_generic_event_t *e;
     while ((e = xcb_poll_for_event(xc))) {
-        switch (e->response_type & 0x7f) {
+        int rt = e->response_type & 0x7f;
+        if (xf_ev && rt == xf_ev + XCB_XFIXES_SELECTION_NOTIFY) {
+            xcb_xfixes_selection_notify_event_t *x = (void *)e;
+            if (x->selection == a_clip && x->owner != wmwin) {
+                sel_own = 0;
+                if (x->owner != XCB_NONE) data_set_x();
+            }
+            free(e);
+            continue;
+        }
+        switch (rt) {
+        case XCB_SELECTION_REQUEST: ev_sel_request((void *)e); break;
+        case XCB_SELECTION_NOTIFY: ev_sel_notify((void *)e); break;
         case XCB_CREATE_NOTIFY: {
             xcb_create_notify_event_t *c = (void *)e;
             if (c->parent == root) {
@@ -295,6 +381,10 @@ static int conn_done(int fd, uint32_t mask, void *d) {
     xcb_change_property(xc, XCB_PROP_MODE_REPLACE, wmwin, a_check, XCB_ATOM_WINDOW, 32, 1, &wmwin);
     xcb_change_property(xc, XCB_PROP_MODE_REPLACE, wmwin, a_netname, a_utf8, 8, 10, "samara-wl");
     xcb_set_selection_owner(xc, wmwin, a_sel, XCB_CURRENT_TIME);
+    a_clip = atom("CLIPBOARD"); a_targets = atom("TARGETS"); a_text = atom("TEXT"); a_wprop = atom("SWL_SEL");
+    xcb_xfixes_query_version_reply(xc, xcb_xfixes_query_version(xc, 4, 0), NULL);
+    xf_ev = xcb_get_extension_data(xc, &xcb_xfixes_id)->first_event;
+    xcb_xfixes_select_selection_input(xc, wmwin, a_clip, XCB_XFIXES_SELECTION_EVENT_MASK_SET_SELECTION_OWNER);
     xcb_flush(xc);
     wl_event_loop_add_fd(loop, xcb_get_file_descriptor(xc), WL_EVENT_READABLE, xwm_readable, NULL);
     /* windows that were mapped before we got here */
