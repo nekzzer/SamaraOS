@@ -1007,6 +1007,10 @@ typedef struct { const char* label; const char* hint; int action; } menu_entry_t
 static const menu_entry_t menu_entries[] = {
     { "Terminal",     NULL,  0 },
     { "Files",        NULL, 11 },
+    { "Text Editor",  NULL, 14 },
+    { "System Monitor", NULL, 15 },
+    { "Packages",     NULL, 16 },
+    { "Settings",     NULL, 17 },
     { "XTerm",        NULL, 12 },
     { "Foot",         NULL, 13 },
     { "Web Browser",  NULL,  1 },
@@ -1110,6 +1114,10 @@ static void menu_run(int action) {
         case 10: exit_requested = true; break;
         case 11: if (shell_launch_detached("/usr/bin/fm") < 0) wm_open_info(W / 2 - 150, H / 2 - 60, 300, 120, "Files", "fm not found"); break;
         case 12: if (shell_launch_detached("xterm") < 0) wm_open_info(W / 2 - 150, H / 2 - 60, 300, 120, "XTerm", "xterm not installed"); break;
+        case 14: if (shell_launch_detached("/usr/bin/edit") < 0) wm_open_info(W / 2 - 150, H / 2 - 60, 300, 120, "Edit", "edit not found"); break;
+        case 15: if (shell_launch_detached("/usr/bin/sysmon") < 0) wm_open_info(W / 2 - 150, H / 2 - 60, 300, 120, "Monitor", "sysmon not found"); break;
+        case 16: if (shell_launch_detached("/usr/bin/pkg") < 0) wm_open_info(W / 2 - 150, H / 2 - 60, 300, 120, "Packages", "pkg not found"); break;
+        case 17: if (shell_launch_detached("/usr/bin/settings") < 0) wm_open_info(W / 2 - 150, H / 2 - 60, 300, 120, "Settings", "settings not found"); break;
         case 13: if (shell_launch_detached("foot") < 0) wm_open_info(W / 2 - 150, H / 2 - 60, 300, 120, "Foot", "foot not installed"); break;
     }
 }
@@ -1127,7 +1135,7 @@ static void menu_run(int action) {
 #define ICON_TILE 48
 #define GAMES_DIR "/usr/games"
 
-enum { IG_TERM, IG_WEB, IG_MUSIC, IG_PAINT, IG_CLOCK, IG_PY, IG_ELF, IG_FILES };
+enum { IG_TERM, IG_WEB, IG_MUSIC, IG_PAINT, IG_CLOCK, IG_PY, IG_ELF, IG_FILES, IG_EDIT, IG_MON, IG_PKG, IG_SET };
 
 typedef struct {
     char label[24];
@@ -1194,6 +1202,10 @@ static void scan_icons(void) {
     n_icons = 0;
     add_icon("Terminal", IG_TERM, 0, NULL);
     add_icon("Files", IG_FILES, 11, NULL);
+    add_icon("Edit", IG_EDIT, 14, NULL);
+    add_icon("Monitor", IG_MON, 15, NULL);
+    add_icon("Packages", IG_PKG, 16, NULL);
+    add_icon("Settings", IG_SET, 17, NULL);
     add_icon("Browser", IG_WEB, 1, NULL);
     add_icon("Music", IG_MUSIC, 2, NULL);
     add_icon("Paint", IG_PAINT, 3, NULL);
@@ -1349,6 +1361,28 @@ static void draw_icon_glyph(int g, int x, int y, bool sel) {
         gfx_rect_fill(x + 10, y + 18, S - 20, 17, fg);
         gfx_rect_fill(x + 11, y + 19, S - 22, 15, bg);
         gfx_rect_fill(x + 11, y + 23, S - 22, 1, dim);
+        break;
+    case IG_EDIT:
+        gfx_rect_fill(x + 12, y + 10, S - 24, S - 20, fg);
+        gfx_rect_fill(x + 13, y + 11, S - 26, S - 22, bg);
+        for (int k = 0; k < 4; k++) gfx_rect_fill(x + 17, y + 17 + k * 6, k == 3 ? 10 : S - 34, 2, k == 1 ? dim : fg);
+        break;
+    case IG_MON:
+        gfx_rect_fill(x + 10, y + 12, S - 20, S - 22, fg);
+        gfx_rect_fill(x + 11, y + 13, S - 22, S - 24, bg);
+        for (int k = 0; k < 5; k++) { int hh = 4 + (k * 7 + 3) % 15; gfx_rect_fill(x + 15 + k * 5, y + S - 13 - hh, 3, hh, fg); }
+        break;
+    case IG_PKG:
+        gfx_rect_fill(x + 10, y + 14, S - 20, S - 24, fg);
+        gfx_rect_fill(x + 11, y + 15, S - 22, S - 26, bg);
+        gfx_rect_fill(x + 11, y + 22, S - 22, 1, fg);
+        gfx_rect_fill(x + S / 2 - 1, y + 14, 3, 8, fg);
+        break;
+    case IG_SET:
+        for (int k = 0; k < 3; k++) {
+            gfx_rect_fill(x + 10, y + 15 + k * 9, S - 20, 1, fg);
+            gfx_rect_fill(x + 14 + (k * 11 + 5) % 20, y + 12 + k * 9, 4, 7, fg);
+        }
         break;
     case IG_PY:
         uif_draw_center(x, y, S, S, UIF_BIG, "py", fg);
