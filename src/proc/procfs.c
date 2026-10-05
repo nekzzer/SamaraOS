@@ -134,6 +134,14 @@ static void fill_pid_dir(fs_node_t* d, proc_t* p, char* mem, uint32_t cap) {
     sb_puts(&b, p->name); sb_putc(&b, '\n');
     put(d, "comm", &b);
 
+    {   // gdb opens /proc/pid/exe to see if the tracee is 64 bit
+        proc_t* lp = proc_by_pid(p->tgid);
+        const char* x = lp && lp->exe[0] ? lp->exe : p->exe;
+        fs_node_t* ol = fs_child(d, "exe");
+        if (ol && (ol->type != FS_LINK || strcmp(ol->data, x))) { remove_tree(ol); ol = NULL; }
+        if (!ol && x[0]) fs_symlink(d, "exe", x);
+    }
+
     b = (sb_t){ mem, 0, cap };                                /* df and friends read /proc/self/mounts (void's /etc/mtab) */
     sb_puts(&b, "rootfs / ramfs rw 0 0\nproc /proc proc rw 0 0\n");
     b.len += (uint32_t)fatfs_mounts_text(b.buf + b.len, (int)(b.cap - b.len));

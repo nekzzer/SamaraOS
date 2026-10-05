@@ -48,6 +48,8 @@ int pt_stop(proc_t* p, regs_t* r, int sig, int event, int kind) {
     p->pt_rep = false;
     p->pt_state = 1;
     if (kind != 1) p->pt_sival = false;
+    proc_t* tr = proc_by_pid(p->tracer);
+    if (tr) { tr->sig_pending |= SIGBIT(17); ready_task_of(tr); }      // gdb waits for sigchld in its event loop
     if (p->pt_isr) {
         p->pt_isr_stop = true;
         return 0;
@@ -154,7 +156,7 @@ static void get_regs(proc_t* p, uint64_t* u) {
     u[10] = p->pt_entry ? (uint64_t)-38 : r->rax;
     u[11] = r->rcx; u[12] = r->rdx; u[13] = r->rsi; u[14] = r->rdi;
     u[15] = p->pt_entry ? r->rax : p->pt_orig;
-    u[16] = r->rip; u[17] = r->cs; u[18] = r->rflags; u[19] = r->rsp; u[20] = r->ss;
+    u[16] = r->rip; u[17] = 0x33; u[18] = r->rflags; u[19] = r->rsp; u[20] = 0x2b;   // linux selectors, gdb checks cs
     u[21] = p->tls_base; u[22] = 0;
     u[23] = u[24] = u[25] = u[26] = 0;
     if (p->pt_tf) u[18] &= ~0x100ul;
