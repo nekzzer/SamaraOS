@@ -163,7 +163,7 @@ static void kbd_rep(hid_t* h, const uint8_t* b, int len) {
         for (int j = 2; j < 8; j++) if (b[j] == h->prev[i]) still = 1;
         if (still) continue;
         if (h->prev[i] < 102 && ukey[h->prev[i]]) { input_report(h->id, IEV_KEY, ukey[h->prev[i]], 0); ch = 1; }
-        if (h->rep_code == h->prev[i]) h->rep_code = 0;
+        if (h->prev[i] < 102 && h->rep_code == ukey[h->prev[i]]) h->rep_code = 0;
     }
     for (int i = 2; i < 8; i++) {                              /* pressed */
         if (!b[i]) continue;

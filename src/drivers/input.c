@@ -101,11 +101,19 @@ int input_read(int d, char* buf, uint32_t n, bool nonblock) {
         if (proc_interrupted()) return -4;       /* EINTR */
         task_yield();
     }
-    uint32_t got = 0;
-    while (got + sizeof(input_event_t) <= n && r[d].head != r[d].tail) {
-        *(input_event_t*)(buf + got) = r[d].ev[r[d].tail];
+    uint32_t got = 0, sz = d >= 3 ? 24 : sizeof(input_event_t);   /* eventN: 64 bit timeval like x86_64 linux */
+    if (n < sz) return -22;
+    while (got + sz <= n && r[d].head != r[d].tail) {
+        input_event_t* e = &r[d].ev[r[d].tail];
+        if (d >= 3) {
+            uint64_t* t = (uint64_t*)(buf + got);
+            t[0] = e->sec; t[1] = e->usec;
+            *(uint16_t*)(buf + got + 16) = e->type;
+            *(uint16_t*)(buf + got + 18) = e->code;
+            *(int32_t*)(buf + got + 20) = e->value;
+        } else *(input_event_t*)(buf + got) = *e;
         r[d].tail = (r[d].tail + 1) % IN_CAP;
-        got += sizeof(input_event_t);
+        got += sz;
     }
     return (int)got;
 }
