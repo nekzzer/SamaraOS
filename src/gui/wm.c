@@ -2019,13 +2019,13 @@ void wm_run(void) {
         if (dz && !button) on_wheel(mx, my, dz);
         if (terminal_idx >= 0) wm_terminal_poll(&windows[terminal_idx]);
 
+        uwin_wm_frame();    // before layout: a window closed here leaves the taskbar this frame
         if (layout_changed) { layout_taskbar(); if (menu_open) layout_menu(); }
         if (!button && (moved || layout_changed)) update_hover(mx, my);
         layout_changed = false;
         want_spr = edge_sprite(pointer_edge(mx, my, button));
 
         uint64_t T1 = tsc();
-        uwin_wm_frame();
         if (bg_dirty) {
             bg_dirty = false;
             build_background(gfx_w(), gfx_h() - TASKBAR_H, true);
