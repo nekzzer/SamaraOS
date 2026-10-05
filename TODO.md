@@ -48,7 +48,7 @@ make run SELF=0 NICS=3                      # + virtio-net cards eth1, eth2
   loops and fork's cow marking batch it (sd_defer). EFAULT longjmp keeps the BKL (kernel fault, lock stays held).
   tested -smp 4 kvm + -smp 2 tcg: nproc, xbps-install/remove nano, cow, fork+threads cow (pthreads write the heap while
   the parent forks), kill/spin, fork/exec stress in 4 shells, uring tests, drmtest virtio-gpu, ping6, desktop+fm
-* left: ping6 prints ttl=-1 (no IPV6_HOPLIMIT cmsg); bochs drm has no hw cursor
+* left: bochs drm has no hw cursor
   (ENXIO, expected); fm right click / menus only checked by eye on the first screen, not clicked through
 
 ## Done recently (all committed and pushed)
@@ -98,6 +98,21 @@ Code like a person wrote it (see CLAUDE.md, local only): snake_case, short
 names, few comments with some life in them, no docstrings, no banners, no
 over-engineering. Talk to the user in Russian, informally.
 
-* io_uring: no SQPOLL, no provided buffer rings (PBUF_RING), no registered wait
-  regions, multishot poll is sampled by workers (no real wakeups), UDP sends
-  over MSS fail (send_recv test)
+* net/wakeups (ag/net): `core/wq.c` wait queues (static entry pool, waiter = task, or a callback).
+  sockets, pipes/spair (so unix), tty, pty, eventfd, unix listeners and the uring fd have one;
+  poll/select/epoll and the uring workers sleep on them instead of the 1ms loop. no queue (timerfd, input, ...)
+  still ticks at 1ms. sockets: `pump()` (netd every 2ms and after every op) diffs `smask()` and wakes.
+  tcp loopback ping-pong 739 us -> 10 us per round, idle cpu ~0.5% sys. waiters cap their sleep at 500ms
+  (uring workers 100ms) as a net against a lost wake
+* icmpv4 raw + ping (dgram) sockets, ping_group_range, IP_TTL/IP_RECVTTL, SO_TIMESTAMP(NS), SO_RCVTIMEO,
+  ipv6 hoplimit cmsg, icmp port unreachable both ways (ECONNREFUSED for udp/tcp v4), clock has us resolution
+* io_uring: SQPOLL (one kernel thread per ring, no shared threads for ATTACH_WQ, SQ_AFF ignored), R_DISABLED +
+  ENABLE_RINGS, SINGLE_ISSUER check, PROVIDE/REMOVE_BUFFERS, PBUF_RING (user memory only, no MMAP/INC flags),
+  BUFFER_SELECT for read/recv, multishot recv (not recvmsg), CQE_SKIP_SUCCESS. reqs and overflow cqes come from
+  pools (kmalloc is first fit, 65k poll_adds crawled). not done: registered wait regions, recvmsg multishot,
+  send zerocopy, send vectorized. liburing tests that pass: nop poll poll-cancel poll-link poll-mshot-update
+  poll-many accept accept-link io-cancel timeout eventfd link link-timeout sq-poll-* sqpoll-* buf-ring buf-ring-mshot
+  buf-ring-stress multicqes_drain cq-overflow cq-full sq-full socket-rw-eagain poll-race submit-reuse statx unlink
+  open-close single-issuer; examples io_uring-cp link-cp echo-server (pbuf ring + multishot recv, nc). failing:
+  send_recv (vectorized send), recv-multishot (needs dgram socketpair + recvmsg multishot), buf-ring-upgrade,
+  fixed-reuse, io_uring_register, ring-leak, defer-taskrun, read-write (buf select with readv)
