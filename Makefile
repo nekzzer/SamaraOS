@@ -15,6 +15,8 @@ QEMU     ?= qemu-system-x86_64
 # lost_tick_policy=discard: kvm replays pit ticks lost while we boot with irqs
 # off, uptime flies ahead and every short timeout (dhcp!) fires instantly
 ACCEL    ?= -accel kvm -accel tcg -cpu max -global kvm-pit.lost_tick_policy=discard
+# cores for the guest, the kernel brings them all up (acpi madt)
+SMP      ?= 4
 # Guest resolution, shown 1:1 (no blurry scaling): pick one that fits your
 # screen with the window frame. `make run VIDEO=1920x1080` for fullscreen.
 VIDEO    ?= 1600x900
@@ -343,7 +345,7 @@ run: $(KERNEL) $(DISK_IMG) $(ROOTDISK) src-tar
 	@mkdir -p $(MUSIC_DIR)
 	@test -f $(GCC_TAR) || $(MAKE) --no-print-directory $(GCC_TAR) || echo "(no gcc module: toolchain/gcc-native missing)"
 	K=$$(python3 tools/pick-kernel.py $(DISK_IMG) $(KERNEL) $(SELF_KERNEL)) && \
-	$(QEMU) -kernel $$K $(ACCEL) -m $(GCC_MEM) $(RUN_MODULES) -append "video=$(VIDEO) $(APPEND)" \
+	$(QEMU) -kernel $$K $(ACCEL) -smp $(SMP) -m $(GCC_MEM) $(RUN_MODULES) -append "video=$(VIDEO) $(APPEND)" \
 	    -vga std $(QDISPLAY) -serial stdio $(AUDIO) $(USB) $(MUSIC_DRIVE) $(NET_DRIVE) $(DISK_DRIVE)
 
 run-gcc: run
