@@ -2473,6 +2473,34 @@ static int64_t dispatch(regs_t* r) {
             *(int*)a = *(int*)b = *(int*)c = 0;
             return 0;
         case 115: return 0;                                          /* getgroups: none */
+        case 128: {                                                  /* rt_sigtimedwait(set, info, ts, sz) */
+            UCHK((void*)a, 8);
+            uint64_t set = *(uint64_t*)a;
+            uint32_t end = 0;
+            if (c) { UCHK((void*)c, 16); int64_t* ts = (int64_t*)c; end = pit_uptime_ms() + ts[0] * 1000 + (ts[1] + 999999) / 1000000; if (!end) end = 1; }
+            for (;;) {
+                uint64_t hit = p->sig_pending & set;
+                if (hit) {
+                    int sg = __builtin_ctzll(hit) + 1;
+                    p->sig_pending &= ~(1ull << (sg - 1));
+                    if (b) {
+                        UCHK((void*)b, 128);
+                        uint32_t* si = (uint32_t*)b;
+                        memset(si, 0, 128);
+                        si[0] = sg;
+                        if (sg == p->sq_sig) {
+                            si[2] = (uint32_t)-2; si[4] = p->sq_tid; si[5] = p->sq_over;
+                            *(uint64_t*)(si + 6) = p->sq_val;
+                            p->sq_sig = 0;
+                        }
+                    }
+                    return sg;
+                }
+                if (end && (int32_t)(pit_uptime_ms() - end) >= 0) return -11;
+                if (proc_interrupted()) return -EINTR;
+                task_sleep_ms(2);
+            }
+        }
         case 34:                                                     /* pause */
             while (!proc_interrupted()) task_sleep_ms(10);
             return -EINTR;
@@ -2521,25 +2549,8 @@ static int64_t dispatch(regs_t* r) {
             p->alarm_interval = 0;
             return left;
         }
-        case 38: case 36: {                                          /* setitimer / getitimer */
-            if ((int)a != 0) return -EINVAL;                         /* ITIMER_REAL only */
-            int64_t* oldv = (int64_t*)(r->rax == 38 ? c : b);
-            if (oldv) {
-                UCHK(oldv, 32);
-                uint32_t left = p->alarm_at ? p->alarm_at - pit_uptime_ms() : 0;
-                oldv[0] = p->alarm_interval / 1000; oldv[1] = p->alarm_interval % 1000 * 1000;
-                oldv[2] = left / 1000; oldv[3] = left % 1000 * 1000;
-            }
-            if (r->rax == 38 && b) {
-                UCHK((void*)b, 32);
-                int64_t* nv = (int64_t*)b;
-                uint32_t val = nv[2] * 1000 + nv[3] / 1000, iv = nv[0] * 1000 + nv[1] / 1000;
-                if ((nv[2] || nv[3]) && !val) val = 1;
-                p->alarm_at = val ? pit_uptime_ms() + val : 0;
-                p->alarm_interval = val ? iv : 0;
-            }
-            return 0;
-        }
+        case 38: case 36: case 222: case 223: case 224: case 225: case 226:
+            return sys_timer(r->rax, a, b, c, d);
         case 15:  return proc_sigreturn(r);
         case 14:  return do_sigprocmask((int)a, (const uint64_t*)b, (uint64_t*)c, d);
         case 127:                                                    /* rt_sigpending */
@@ -2843,6 +2854,12 @@ static int64_t dispatch(regs_t* r) {
         case 40:  return do_copy((int)b, (uint64_t*)c, (int)a, NULL, d);
         case 326: return do_copy((int)a, (uint64_t*)b, (int)c, (uint64_t*)d, e);
         case 101: return sys_ptrace(a, b, c, d);
+        case 135: {                                                   /* personality, gdb wants ADDR_NO_RANDOMIZE to stick */
+            static uint32_t pers;
+            uint32_t old = pers;
+            if ((uint32_t)a != 0xffffffffu) pers = (uint32_t)a;
+            return old;
+        }
         case 103: return -EPERM;
         case 425: return uring_setup(a, (void*)b);
         case 426: return uring_enter((int)a, b, c, d, (const void*)e, f6);

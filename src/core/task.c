@@ -255,6 +255,7 @@ static regs_t* schedule(regs_t* saved) {
                 if (tasks[i].state == T_BLOCKED && tasks[i].wake_ms &&
                     (int32_t)(now - tasks[i].wake_ms) >= 0) { tasks[i].wake_ms = 0; tasks[i].state = T_READY; woke++; }
             if (woke) kick_idle();
+            proc_timers_tick(now);
         }
     }
     {

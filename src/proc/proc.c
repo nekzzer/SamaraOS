@@ -1082,6 +1082,8 @@ int proc_wait(int pid, int* status, int options) {
     }
 }
 
+void proc_cpu_timers(proc_t* p, bool user);
 void proc_account_tick(proc_t* p, bool user) {
     if (user) p->utime++; else p->stime++;
+    if (p->itv_at || p->itp_at) proc_cpu_timers(p, user);
 }

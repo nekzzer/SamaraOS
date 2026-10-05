@@ -152,6 +152,11 @@ have:;
     memcpy(u + 5 + 32, &oldmask, 8);                 /* uc_sigmask */
     uint32_t* si = (uint32_t*)info;
     si[0] = (uint32_t)sig;                           /* si_signo */
+    if (sig == p->sq_sig) {                          /* posix timer: SI_TIMER, tid, overrun, value */
+        si[2] = (uint32_t)-2; si[4] = (uint32_t)p->sq_tid; si[5] = (uint32_t)p->sq_over;
+        *(uint64_t*)(si + 6) = p->sq_val;
+        p->sq_sig = 0;
+    }
     if (sig == p->fault_sig) {                       /* from a cpu fault: what and where */
         si[2] = p->fault_trap == 14 ? ((p->fault_err & 1) ? 2 : 1)    /* SEGV_ACCERR / MAPERR */
               : 1;                                                    /* FPE_INTDIV, ILL_ILLOPC */

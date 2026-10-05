@@ -85,6 +85,7 @@ KERN_SRC := \
     src/proc/flock.c \
     src/proc/proc.c \
     src/proc/ptrace.c \
+    src/proc/timer.c \
     src/proc/syscall.c \
     src/proc/userland.c \
     src/proc/procfs.c \

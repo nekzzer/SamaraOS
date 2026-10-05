@@ -29,6 +29,13 @@ typedef struct pshared {
         uint64_t mask;
     } sa[NSIG_MAX];
     uint64_t brk_start, brk;
+    struct ptimer {                /* timer_create, ms resolution, deadline in uptime ms */
+        bool     used, armed;
+        int      clk, signo, notify, tid;
+        uint64_t val;              /* sigev_value */
+        uint32_t at, iv;
+        int      over;
+    } tm[16];
     fs_node_t* cwd;
     int      umask;
 } pshared_t;
@@ -70,6 +77,9 @@ typedef struct proc {
     uint32_t utime, stime;         /* PIT ticks (1 ms) in ring 3 / ring 0 */
     char     cmdline[256];         /* argv, NUL-separated, as the user typed it */
     uint16_t cmdline_len;
+    uint32_t itv_at, itv_iv, itp_at, itp_iv;   /* ITIMER_VIRTUAL / PROF: cpu ms left, reload */
+    int      sq_sig, sq_tid, sq_over;          /* siginfo of the last timer signal */
+    uint64_t sq_val;
     /* ptrace and job stop, see ptrace.c */
     int      tracer;               /* tgid of the tracer, 0 = nobody */
     int      pt_opts;
@@ -143,6 +153,8 @@ int     proc_sigsuspend(const uint64_t* mask);
 int     proc_sigaltstack(const uint64_t* ss, uint64_t* old, uint64_t rsp);
 void    proc_check_alarm(proc_t* p, bool from_irq);   /* fire SIGALRM when due */
 void    proc_account_tick(proc_t* p, bool user);
+void    proc_timers_tick(uint32_t now);
+int64_t sys_timer(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d);
 
 /* ptrace.c */
 int64_t sys_ptrace(uint64_t req, uint64_t pid, uint64_t addr, uint64_t data);
