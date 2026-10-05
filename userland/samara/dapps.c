@@ -28,7 +28,10 @@ void th_load(void) {
         }
         fclose(f);
     }
-    if (light) {
+    if (!light) {
+        c_bg = 0x17181B; c_bg2 = 0x1E1F23; c_bar = 0x131417; c_well = 0x101114; c_ink = 0xE6E6E6; c_dim = 0x85868C;
+        c_faint = 0x55565C; c_rule = 0x2C2D32; c_hover = 0x25262A; c_selbg = 0x3A2E1A;
+    } else {
         c_bg = 0xF4F4F2; c_bg2 = 0xEAEAE6; c_bar = 0xE2E2DE; c_well = 0xFFFFFF; c_ink = 0x1E1F23; c_dim = 0x62646B;
         c_faint = 0x9A9BA0; c_rule = 0xC8C8C4; c_hover = 0xE0E0DC; c_selbg = 0xF6DDB0;
     }
