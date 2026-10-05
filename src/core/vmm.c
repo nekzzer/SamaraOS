@@ -3,6 +3,7 @@
 #include "core/string.h"
 #include "core/task.h"
 #include "core/heap.h"
+#include "core/swap.h"
 #include "boot/paging.h"
 
 /* ---------------- physical frame pool ---------------- */
@@ -75,6 +76,8 @@ static bool ours(uint64_t frame) {
     return i < max_pfn && refcnt[i] != 0xFF;
 }
 
+int pmm_refcnt(uint64_t frame) { return ours(frame) ? refcnt[frame >> 12] : 0; }
+
 /* 254 is sticky: stays, never freed (too many forks of one page) */
 void pmm_ref(uint64_t frame) {
     uint64_t f = spin_lock(&pl);
@@ -99,6 +102,7 @@ void vmm_flush(void) {
 }
 
 static uint64_t* pte_slot(uint64_t pd, uint64_t va, bool create);
+#define SLOT(e) (((e) & PTE_ADDR) >> 12)
 
 /* every change of a live leaf pte goes through here. other cpus may hold the old pte
    (threads of one process), so they get a shootdown too. range loops batch it: sd_defer */
@@ -211,6 +215,7 @@ static int vmm_alloc_range_nl(uint64_t pd, uint64_t va, uint64_t len, bool writa
             if (writable) make_writable(p, a);
             continue;
         }
+        if (*p & PTE_SWAP) { if (writable) *p |= PTE_RW; continue; }
         uint64_t fr = pmm_alloc();
         if (!fr) { ret = -1; break; }
         pte_put(p, a, fr | PTE_P | PTE_US | (writable ? PTE_RW : 0));
@@ -231,7 +236,7 @@ static void vmm_set_writable_nl(uint64_t pd, uint64_t va, uint64_t len, bool wri
     SD_DEFER++;
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
         uint64_t* p = pte_slot(pd, a, false);
-        if (!p || !(*p & (PTE_P | PTE_LAZY))) continue;
+        if (!p || !(*p & PTE_USED)) continue;
         if (!writable) pte_put(p, a, *p & ~(PTE_RW | PTE_COW));
         else if (*p & PTE_P) make_writable(p, a);
         else pte_put(p, a, *p | PTE_RW);
@@ -250,6 +255,7 @@ static int vmm_map_frame_nl(uint64_t pd, uint64_t va, uint64_t fr, bool rw) {
     if (!p) return -1;
     pmm_ref(fr);
     if (*p & PTE_P) pmm_unref(*p & PTE_ADDR);
+    else if (*p & PTE_SWAP) swap_put(SLOT(*p));
     pte_put(p, va, fr | PTE_P | PTE_US | (rw ? PTE_RW : 0) | PTE_SHARED);   /* every caller maps something shared */
     return 0;
 }
@@ -257,6 +263,22 @@ static int vmm_map_frame_nl(uint64_t pd, uint64_t va, uint64_t fr, bool rw) {
 int vmm_map_frame(uint64_t pd, uint64_t va, uint64_t fr, bool rw) {
     uint64_t f = MMLOCK(pd);
     int r = vmm_map_frame_nl(pd, va, fr, rw);
+    spin_unlock(MML(pd), f);
+    return r;
+}
+
+int vmm_map_cache(uint64_t pd, uint64_t va, uint64_t fr, bool w, bool shared) {
+    uint64_t f = MMLOCK(pd);
+    int r = -1;
+    uint64_t* p = pte_slot(pd, va, true);
+    if (p) {
+        pmm_ref(fr);
+        if (*p & PTE_P) pmm_unref(*p & PTE_ADDR);
+        else if (*p & PTE_SWAP) swap_put(SLOT(*p));
+        uint64_t fl = shared ? PTE_SHARED | (w ? PTE_RW : 0) : (w ? PTE_COW : 0);
+        pte_put(p, va, fr | PTE_P | PTE_US | fl);
+        r = 0;
+    }
     spin_unlock(MML(pd), f);
     return r;
 }
@@ -273,6 +295,7 @@ static int vmm_lazy_range_nl(uint64_t pd, uint64_t va, uint64_t len, bool rw, bo
         uint64_t* p = pte_slot(pd, a, true);
         if (!p) { ret = -1; break; }
         if (*p & PTE_P) pmm_unref(*p & PTE_ADDR);
+        else if (*p & PTE_SWAP) swap_put(SLOT(*p));
         pte_put(p, a, PTE_LAZY | (rw ? PTE_RW : 0) | (user ? PTE_US : 0));
     }
     sd_end();
@@ -301,9 +324,39 @@ static bool vmm_fault_in_nl(uint64_t pd, uint64_t va) {
 
 bool vmm_fault_in(uint64_t pd, uint64_t va) {
     uint64_t f = MMLOCK(pd);
-    bool r = vmm_fault_in_nl(pd, va);
+    uint64_t* p = pte_slot(pd, va & ~(PAGE_SIZE - 1), false);
+    bool sw = p && (*p & (PTE_P | PTE_SWAP)) == PTE_SWAP;
+    bool r = sw ? false : vmm_fault_in_nl(pd, va);
     spin_unlock(MML(pd), f);
-    return r;
+    return sw ? vmm_swap_in(pd, va) : r;
+}
+
+/* the disk read happens with no lock held. the pte is looked at again after it:
+   a thread of the same process may have brought the page back (or unmapped it) meanwhile */
+bool vmm_swap_in(uint64_t pd, uint64_t va) {
+    va &= ~(PAGE_SIZE - 1);
+    for (int tries = 0; tries < 4; tries++) {
+        uint64_t f = MMLOCK(pd);
+        uint64_t* p = pte_slot(pd, va, false);
+        uint64_t e = p ? *p : 0;
+        spin_unlock(MML(pd), f);
+        if (e & PTE_P) return true;
+        if (!(e & PTE_SWAP)) return false;
+        uint64_t fr = pmm_alloc();
+        if (!fr) return false;
+        if (swap_read(SLOT(e), P2V(fr)) < 0) { pmm_unref(fr); return false; }
+        f = MMLOCK(pd);
+        p = pte_slot(pd, va, false);
+        if (p && *p == e) {
+            pte_put(p, va, fr | PTE_P | (e & (PTE_RW | PTE_US)));
+            spin_unlock(MML(pd), f);
+            swap_put(SLOT(e));
+            return true;
+        }
+        spin_unlock(MML(pd), f);
+        pmm_unref(fr);
+    }
+    return false;
 }
 
 // PROT_NONE = present but supervisor only, so user access faults
@@ -312,7 +365,7 @@ static void vmm_set_user_nl(uint64_t pd, uint64_t va, uint64_t len, bool user) {
     SD_DEFER++;
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
         uint64_t* p = pte_slot(pd, a, false);
-        if (!p || !(*p & (PTE_P | PTE_LAZY))) continue;
+        if (!p || !(*p & PTE_USED)) continue;
         pte_put(p, a, user ? *p | PTE_US : *p & ~PTE_US);
     }
     sd_end();
@@ -330,8 +383,9 @@ static void vmm_free_range_nl(uint64_t pd, uint64_t va, uint64_t len) {
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
         if (!uaddr(a)) continue;
         uint64_t* p = pte_slot(pd, a, false);
-        if (!p || !(*p & (PTE_P | PTE_LAZY))) continue;
+        if (!p || !(*p & PTE_USED)) continue;
         if (*p & PTE_P) pmm_unref(*p & PTE_ADDR);
+        else if (*p & PTE_SWAP) swap_put(SLOT(*p));
         pte_put(p, a, 0);
     }
     sd_end();
@@ -347,7 +401,7 @@ bool vmm_range_unmapped(uint64_t pd, uint64_t va, uint64_t len) {
     uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
         uint64_t* p = pte_slot(pd, a, false);
-        if (p && (*p & (PTE_P | PTE_LAZY))) return false;
+        if (p && (*p & PTE_USED)) return false;
     }
     return true;
 }
@@ -379,7 +433,7 @@ uint64_t vmm_find_free(uint64_t pd, uint64_t from, uint64_t limit, uint64_t len)
             continue;
         }
         uint64_t* p = pte_slot(pd, a, false);
-        if (p && (*p & (PTE_P | PTE_LAZY))) { run = 0; continue; }
+        if (p && (*p & PTE_USED)) { run = 0; continue; }
         if (run == 0) start = a;
         run += PAGE_SIZE;
         if (run >= len) return start;
@@ -401,7 +455,10 @@ uint64_t vmm_map_anon(uint64_t pd, uint64_t addr, bool fixed, uint64_t lo, uint6
 static void free_tables(uint64_t tbl, int lvl) {
     uint64_t* t = (uint64_t*)P2V(tbl);
     for (int i = 0; i < 512; i++) {
-        if (!(t[i] & PTE_P)) continue;
+        if (!(t[i] & PTE_P)) {
+            if (lvl == 0 && (t[i] & PTE_SWAP)) swap_put(SLOT(t[i]));
+            continue;
+        }
         if (lvl == 0) pmm_unref(t[i] & PTE_ADDR);
         else free_tables(t[i] & PTE_ADDR, lvl - 1);
     }
@@ -431,6 +488,7 @@ static bool clone_level(uint64_t src, uint64_t dst, int lvl, uint64_t base) {
         }
         if (!(e & PTE_P)) {
             if (e & PTE_LAZY) d[i] = e;            /* untouched: stays lazy */
+            else if (e & PTE_SWAP) { swap_dup(SLOT(e)); d[i] = e; }
             continue;
         }
         uint64_t fr = e & PTE_ADDR;
@@ -528,4 +586,97 @@ void* mmio_map(uint64_t pa, size_t len) {
     }
     vmm_flush();
     return P2V(pa);
+}
+
+/* clock scan for swap-out. under the space lock: pages with the accessed bit lose it (second chance),
+   the others get a slot, a ref of ours and go read-only+cow so a write meanwhile makes the owner a
+   copy and leaves ours alone. commit then checks the pte is still the same */
+int vmm_swap_scan(uint64_t pd, uint64_t* hand, int budget, swb_t* b, int* n) {
+    uint64_t f = MMLOCK(pd);
+    uint64_t va = *hand < USER_BASE ? USER_BASE : *hand;
+    bool full = false;
+    SD_DEFER++;
+    while (va < USER_TOP && budget > 0 && *n < SWB_MAX && !full) {
+        uint64_t* t = (uint64_t*)P2V(pd);
+        int lvl;
+        for (lvl = 3; lvl > 0; lvl--) {
+            uint64_t e = t[IDX(va, lvl)];
+            if (!(e & PTE_P)) {
+                uint64_t sz = 1ul << (12 + 9 * lvl);
+                va = (va & ~(sz - 1)) + sz;
+                break;
+            }
+            t = (uint64_t*)P2V(e & PTE_ADDR);
+        }
+        if (lvl) continue;
+        for (int i = IDX(va, 0); i < 512 && budget > 0 && *n < SWB_MAX; i++, va += PAGE_SIZE) {
+            uint64_t e = t[i];
+            if ((e & (PTE_P | PTE_US | PTE_SHARED)) != (PTE_P | PTE_US) || !(e & (PTE_RW | PTE_COW))) continue;
+            uint64_t fr = e & PTE_ADDR;
+            if (!ours(fr) || refcnt[fr >> 12] != 1) continue;
+            budget--;
+            if (e & PTE_A) { t[i] = e & ~PTE_A; tlb_inval(va); continue; }
+            int s = swap_alloc();
+            if (s < 0) { full = true; break; }
+            pmm_ref(fr);
+            pte_put(&t[i], va, (e & ~PTE_RW) | PTE_COW);
+            b[*n] = (swb_t){ pd, va, fr, PTE_RW | PTE_US, s };
+            (*n)++;
+        }
+    }
+    sd_end();
+    spin_unlock(MML(pd), f);
+    *hand = va;
+    return va >= USER_TOP;
+}
+
+int vmm_swap_commit(swb_t* b, int n) {
+    int freed = 0;
+    for (int i = 0; i < n; ) {
+        uint64_t pd = b[i].pd;
+        int j = i;
+        uint64_t f = MMLOCK(pd);
+        SD_DEFER++;
+        for (; j < n && b[j].pd == pd; j++) {
+            uint64_t* p = pte_slot(pd, b[j].va, false);
+            uint64_t e = p ? *p : 0;
+            if (p && (e & PTE_P) && (e & PTE_ADDR) == b[j].fr && (e & PTE_COW)) {
+                pte_put(p, b[j].va, PTE_SWAP | b[j].fl | ((uint64_t)b[j].slot << 12));
+                b[j].slot = -1;           // taken
+            }
+        }
+        sd_end();
+        spin_unlock(MML(pd), f);
+        for (int k = i; k < j; k++) {
+            if (b[k].slot < 0) { pmm_unref(b[k].fr); freed++; }    // the pte's ref, ours goes below
+            else swap_put(b[k].slot);
+            pmm_unref(b[k].fr);
+        }
+        i = j;
+    }
+    return freed;
+}
+
+/* first page of the space at or above `from` that sits in swap area `area` (-1 = any), 0 if none */
+uint64_t vmm_swap_find(uint64_t pd, uint64_t from, int area) {
+    uint64_t va = from < USER_BASE ? USER_BASE : from;
+    while (va < USER_TOP) {
+        uint64_t* t = (uint64_t*)P2V(pd);
+        int lvl;
+        for (lvl = 3; lvl > 0; lvl--) {
+            uint64_t e = t[IDX(va, lvl)];
+            if (!(e & PTE_P)) {
+                uint64_t sz = 1ul << (12 + 9 * lvl);
+                va = (va & ~(sz - 1)) + sz;
+                break;
+            }
+            t = (uint64_t*)P2V(e & PTE_ADDR);
+        }
+        if (lvl) continue;
+        for (int i = IDX(va, 0); i < 512; i++, va += PAGE_SIZE) {
+            uint64_t e = t[i];
+            if ((e & (PTE_P | PTE_SWAP)) == PTE_SWAP && (area < 0 || (int)(SLOT(e) >> 28) == area)) return va;
+        }
+    }
+    return 0;
 }

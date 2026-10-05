@@ -80,6 +80,9 @@ KERN_SRC := \
     src/core/task.c \
     src/core/wq.c \
     src/core/vmm.c \
+    src/core/swap.c \
+    src/core/mem.c \
+    src/core/pcache.c \
     src/core/clock.c \
     src/proc/tty.c \
     src/proc/file.c \

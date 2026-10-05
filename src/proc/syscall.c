@@ -3,6 +3,8 @@
    musl binaries such as busybox actually need is implemented; everything
    else answers -ENOSYS, which musl and busybox handle gracefully. */
 
+#include "core/pcache.h"
+#include "core/swap.h"
 #include "gui/uwin.h"
 #include "proc/proc.h"
 #include "proc/pty.h"
@@ -96,7 +98,7 @@ static bool uok(const void* p, uint64_t len) {
     for (uint64_t pg = a & ~(PAGE_SIZE - 1); pg < a + len; pg += PAGE_SIZE) {
         if (pg >= USER_STACK_TOP - USER_STACK_MAX) break;
         uint64_t pte = vmm_pte(pd, pg);
-        if (!(pte & PTE_P) && !((pte & PTE_LAZY) && (pte & PTE_US))) return false;   /* lazy: the fault fills it */
+        if (!(pte & PTE_P) && !((pte & (PTE_LAZY | PTE_SWAP)) && (pte & PTE_US))) return false;   /* lazy: the fault fills it */
     }
     return true;
 }
@@ -1047,6 +1049,18 @@ static int64_t do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd,
         vmm_flush();
         return (int64_t)addr;
     }
+    if (f && f->type == F_NODE && f->node->type == FS_FILE && !(off & (PAGE_SIZE - 1))) {
+        /* file pages come from the page cache, shared by everybody who maps this file */
+        int md = ((flags & MAP_SHARED) ? PCM_SHARED : 0) | ((prot & PROT_WRITE) ? PCM_W : 0);
+        if (pc_map(p->pd, addr, f->node, off, len, md) < 0) {
+            vmm_free_range(p->pd, addr, len);
+            vmm_flush();
+            return -ENOMEM;
+        }
+        if (!prot) vmm_set_user(p->pd, addr, len, false);
+        vmm_flush();
+        return (int64_t)addr;
+    }
     if (vmm_alloc_range(p->pd, addr, len, true) < 0) {
         vmm_free_range(p->pd, addr, len);
         vmm_flush();
@@ -1068,6 +1082,7 @@ static int do_munmap(uint64_t addr, uint64_t len) {
     if (addr < USER_BASE || addr >= USER_TOP) return 0;
     vmm_free_range(me()->pd, addr, len);
     vmm_flush();
+    pc_sync_all();
     return 0;
 }
 
@@ -2503,6 +2518,7 @@ static int64_t dispatch(regs_t* r) {
             if (!fl) return -EBADF;
             if (r->rax == 277 && (d & ~7ull)) return -EINVAL;
             if (r->rax != 306 && fl->type != F_NODE && fl->type != F_DISK) return -EINVAL;
+            pc_sync_all();
             ext2_sync_all();
             return fatfs_sync_all();
         }
@@ -2526,6 +2542,14 @@ static int64_t dispatch(regs_t* r) {
             fs_node_t* dst = lookup(AT_FDCWD, (const char*)b, &err);
             if (!dst) return err;
             return fatfs_mount(src->dev - FS_DEV_DISK, dst);
+        }
+        case 167: case 168: {                                        /* swapon, swapoff */
+            UCHK((void*)a, 1);
+            fs_node_t* src = lookup(AT_FDCWD, (const char*)a, &err);
+            if (!src) return err;
+            if (!FS_DEV_IS_DISK(src->dev)) return -EINVAL;
+            if (r->rax == 168) return swap_off(src->dev - FS_DEV_DISK);
+            return swap_on(src->dev - FS_DEV_DISK, (b & 0x8000) ? (int)(b & 0x7FFF) : -2);
         }
         case 166: {                                                  /* umount2 */
             UCHK((void*)a, 1);
@@ -2580,7 +2604,8 @@ static int64_t dispatch(regs_t* r) {
             return 0;
         case 92: case 93: case 94: case 260:                         /* chown & co */
         case 105: case 106: case 113: case 114: case 117: case 119: case 116:
-        case 157: case 203: case 28: case 26: case 149: case 150: case 151: case 152:
+        case 26: pc_sync_all(); return 0;                            /* msync */
+        case 157: case 203: case 28: case 149: case 150: case 151: case 152:
         case 221: case 160: case 169:
             return 0;
         case 8:   return do_lseek((int)a, (int64_t)b, (int)c);
@@ -2702,7 +2727,7 @@ static int64_t dispatch(regs_t* r) {
                the answer isn't ENOMEM. always ENOMEM = node spun through all 4 GB.
                the whole 8 MB stack window counts as mapped, it grows on demand */
             bool stk = a >= USER_STACK_TOP - USER_STACK_MAX && a < USER_STACK_TOP;
-            if (!stk && !(vmm_pte(me()->pd, a & ~(PAGE_SIZE - 1)) & PTE_P)) return -EFAULT;
+            if (!stk && !(vmm_pte(me()->pd, a & ~(PAGE_SIZE - 1)) & (PTE_P | PTE_SWAP))) return -EFAULT;
             return -ENOMEM;
         }
         case 76: {                                                   /* truncate */
@@ -3158,6 +3183,7 @@ void syscall_dispatch(regs_t* r) {
         if (tp->pt_sys) { pt_syscall_stop(tp, r, false); tp->pt_orig = r->rax; }
     }
     uint64_t nr = r->rax;
+    mem_check();
     proc_check_alarm(proc_current(), false);
     bool mut = changes_fs(nr, r->rdi);
     if (mut) {

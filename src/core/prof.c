@@ -9,7 +9,7 @@
 #include "proc/proc.h"
 
 int prof_on, prof_gen;
-uint64_t pf_anon, pf_cow, pf_file, pf_kern, tlb_ipis, tlb_rounds, uwin_bytes, bkl_wait, bkl_takes, bkl_slow;
+uint64_t pf_swapin, pf_anon, pf_cow, pf_file, pf_kern, tlb_ipis, tlb_rounds, uwin_bytes, bkl_wait, bkl_takes, bkl_slow;
 
 #define HN 8192
 static struct { uint64_t rip; uint32_t n; } ktab[HN];

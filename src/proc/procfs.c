@@ -1,3 +1,5 @@
+#include "core/pcache.h"
+#include "core/swap.h"
 #include "boot/gdt.h"
 /* /proc, rebuilt from live kernel state.
 
@@ -222,22 +224,38 @@ static void fill_pid_dir(fs_node_t* d, proc_t* p, char* mem, uint32_t cap) {
 static void fill_globals(char* mem, uint32_t cap) {
     sb_t b;
     uint32_t heap_free = heap_total() - heap_used();
-    uint32_t total_kb = (heap_total() + pmm_total_frames() * PAGE_SIZE) / 1024;
-    uint32_t free_kb = (heap_free + pmm_free_frames() * PAGE_SIZE) / 1024;
+    uint32_t arena_free = heap_big_total() - heap_big_used();
+    uint32_t total_kb = (heap_total() + heap_big_total() + pmm_total_frames() * PAGE_SIZE) / 1024;
+    uint32_t free_kb = (heap_free + arena_free + pmm_free_frames() * PAGE_SIZE) / 1024;
+    uint32_t cached_kb = heap_big_used() / 1024 + pc_pages() * 4;     /* file data + pages mapped from it */
+    uint32_t avail_kb = free_kb + heap_big_used() / 1024 + pc_idle_pages() * 4;
 
     b = (sb_t){ mem, 0, cap };
     sb_puts(&b, "MemTotal:       "); sb_pad(&b, total_kb, 8); sb_puts(&b, " kB\n");
     sb_puts(&b, "MemFree:        "); sb_pad(&b, free_kb, 8); sb_puts(&b, " kB\n");
-    sb_puts(&b, "MemAvailable:   "); sb_pad(&b, free_kb, 8); sb_puts(&b, " kB\n");
+    sb_puts(&b, "MemAvailable:   "); sb_pad(&b, avail_kb, 8); sb_puts(&b, " kB\n");
     sb_puts(&b, "Buffers:               0 kB\n");
-    sb_puts(&b, "Cached:         "); sb_pad(&b, heap_big_used() / 1024, 8); sb_puts(&b, " kB\n");   /* file data */
+    sb_puts(&b, "Cached:         "); sb_pad(&b, cached_kb, 8); sb_puts(&b, " kB\n");
     sb_puts(&b, "SwapCached:            0 kB\n");
     sb_puts(&b, "KernelHeap:     "); sb_pad(&b, heap_total() / 1024, 8); sb_puts(&b, " kB\n");
     sb_puts(&b, "FileArena:      "); sb_pad(&b, heap_big_total() / 1024, 8); sb_puts(&b, " kB\n");
     sb_puts(&b, "UserPool:       "); sb_pad(&b, pmm_total_frames() * 4, 8); sb_puts(&b, " kB\n");
-    sb_puts(&b, "SwapTotal:             0 kB\nSwapFree:              0 kB\nShmem:                 0 kB\n");
+    sb_puts(&b, "PageCache:      "); sb_pad(&b, pc_pages() * 4, 8); sb_puts(&b, " kB\n");
+    sb_puts(&b, "SwapTotal:      "); sb_pad(&b, swap_total() * 4, 8); sb_puts(&b, " kB\n");
+    sb_puts(&b, "SwapFree:       "); sb_pad(&b, swap_free() * 4, 8); sb_puts(&b, " kB\n");
+    sb_puts(&b, "Shmem:                 0 kB\n");
     sb_puts(&b, "SReclaimable:          0 kB\n");
     put(proc_root, "meminfo", &b);
+
+    b = (sb_t){ mem, 0, cap };
+    sb_puts(&b, "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n");
+    for (int i = 0; i < SWAP_AREAS; i++) {
+        char nm[16]; uint64_t sz, us; int pr;
+        if (!swap_info(i, nm, &sz, &us, &pr)) continue;
+        sb_puts(&b, nm); sb_puts(&b, "\t\t\t\tpartition\t"); sb_int(&b, (int)sz); sb_puts(&b, "\t\t");
+        sb_int(&b, (int)us); sb_puts(&b, "\t\t"); sb_int(&b, pr); sb_putc(&b, '\n');
+    }
+    put(proc_root, "swaps", &b);
 
     uint32_t up = pit_uptime_ms() / HZ_DIV;
     b = (sb_t){ mem, 0, cap };

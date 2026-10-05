@@ -1,3 +1,5 @@
+#include "core/pcache.h"
+#include "core/swap.h"
 #include "gui/uwin.h"
 #include "proc/proc.h"
 #include "proc/uring.h"
@@ -174,6 +176,20 @@ typedef struct {
     uint64_t base, start;    // interp base + where to actually jump
 } image_t;
 
+/* copy part of a segment into private pages. a page that an earlier segment
+   already mapped (maybe a cache frame) is made private first */
+static int seg_copy(uint64_t pd, const fs_node_t* n, const elf_phdr_t* p, uint64_t va, uint64_t x, uint64_t y) {
+    if (x >= y) return 0;
+    if (vmm_alloc_range(pd, x, y - x, true) < 0) return -ENOMEM;
+    vmm_set_writable(pd, x, y - x, true);
+    uint64_t fe = va + p->filesz, lo = x > va ? x : va, hi = y < fe ? y : fe;
+    if (lo < hi) vmm_copy_to(pd, lo, n->data + p->offset + (lo - va), hi - lo);
+    lo = x > fe ? x : fe;
+    hi = y < va + p->memsz ? y : va + p->memsz;
+    if (lo < hi) vmm_copy_to(pd, lo, NULL, hi - lo);
+    return 0;
+}
+
 static int load_elf(uint64_t pd, const fs_node_t* n, image_t* img, uint64_t bias) {
     const elf_ehdr_t* h = (const elf_ehdr_t*)n->data;
     const elf_phdr_t* ph = (const elf_phdr_t*)(n->data + h->phoff);
@@ -182,22 +198,6 @@ static int load_elf(uint64_t pd, const fs_node_t* n, image_t* img, uint64_t bias
     uint64_t lim = bias >= USER_MMAP_BASE ? USER_STACK_TOP - USER_STACK_MAX : USER_MMAP_BASE;
     if (h->type != 3) bias = 0;
     img->phdr = 0;
-    for (int i = 0; i < h->phnum; i++) {
-        const elf_phdr_t* p = &ph[i];
-        uint64_t va = p->vaddr + bias;
-        if (p->type == PT_PHDR) img->phdr = va;
-        if (p->type != PT_LOAD || p->memsz == 0) continue;
-        if (va < USER_BASE || va + p->memsz > lim ||
-            p->filesz > p->memsz || p->offset + p->filesz > n->size) return -ENOEXEC;
-        if (vmm_alloc_range(pd, va, p->memsz, true) < 0) return -ENOMEM;
-        vmm_copy_to(pd, va, n->data + p->offset, p->filesz);
-        vmm_copy_to(pd, va + p->filesz, NULL, p->memsz - p->filesz);
-        if (va + p->memsz > top) top = va + p->memsz;
-        if (!img->phdr && p->offset == 0) img->phdr = va + h->phoff;
-    }
-    /* Text read-only (so fork can share it), then re-open writable segments
-       in case one shares a page with text. A static-pie writes its own
-       relocations into RELRO data, which lives in a writable segment. */
     // DT_TEXTREL (22) or DF_TEXTREL in DT_FLAGS: ld.so patches the text, leave it rw.
     // non-PIC .a in a pie does that (htop + ncurses crashed on it)
     bool textrel = false;
@@ -207,6 +207,27 @@ static int load_elf(uint64_t pd, const fs_node_t* n, image_t* img, uint64_t bias
         for (uint64_t k = 0; k + 1 < ph[i].filesz / 8 && d[k]; k += 2)
             if (d[k] == 22 || (d[k] == 30 && (d[k + 1] & 4))) textrel = true;
     }
+    for (int i = 0; i < h->phnum; i++) {
+        const elf_phdr_t* p = &ph[i];
+        uint64_t va = p->vaddr + bias;
+        if (p->type == PT_PHDR) img->phdr = va;
+        if (p->type != PT_LOAD || p->memsz == 0) continue;
+        if (va < USER_BASE || va + p->memsz > lim ||
+            p->filesz > p->memsz || p->offset + p->filesz > n->size) return -ENOEXEC;
+        /* whole pages of file bytes come from the page cache, the edges and bss are private */
+        uint64_t s = va & ~0xFFFul, e = (va + p->memsz + 0xFFF) & ~0xFFFul;
+        uint64_t cs = (va + 0xFFF) & ~0xFFFul, ce = (va + p->filesz) & ~0xFFFul;
+        if ((p->offset ^ va) & 0xFFF || cs >= ce || !vmm_range_unmapped(pd, cs, ce - cs)) cs = ce = s;
+        if (seg_copy(pd, n, p, va, s, cs) < 0) return -ENOMEM;
+        if (ce > cs && pc_map(pd, cs, (fs_node_t*)n, p->offset + (cs - va), ce - cs,
+                              ((p->flags & PF_W) || textrel) ? PCM_W : 0) < 0) return -ENOMEM;
+        if (seg_copy(pd, n, p, va, ce, e) < 0) return -ENOMEM;
+        if (va + p->memsz > top) top = va + p->memsz;
+        if (!img->phdr && p->offset == 0) img->phdr = va + h->phoff;
+    }
+    /* Text read-only (so fork can share it), then re-open writable segments
+       in case one shares a page with text. A static-pie writes its own
+       relocations into RELRO data, which lives in a writable segment. */
     for (int i = 0; i < h->phnum && !textrel; i++)
         if (ph[i].type == PT_LOAD && !(ph[i].flags & PF_W))
             vmm_set_writable(pd, ph[i].vaddr + bias, ph[i].memsz, false);
@@ -614,6 +635,7 @@ static void teardown(proc_t* p, int status) {
         if (p->vfork_shared) p->vfork_shared = false; /* borrowed from the parent */
         else if (heir) heir->vfork_shared = false;
         else vmm_destroy_space(p->pd);
+        pc_sync_all();
         p->pd = 0;
     }
     /* Orphans: children lose their parent; finished ones go away. */
@@ -765,17 +787,27 @@ bool proc_interrupted(void) {
 bool proc_handle_fault(uint64_t addr, uint64_t err) {
     proc_t* p = proc_current();
     if (!p) return false;
-    if ((err & 3) == 3 && addr >= USER_BASE && addr < USER_TOP && vmm_cow(p->pd, addr)) { pf_cow++; return true; }   /* fork's cow */
+    bool bkl = true;
+    if (pmm_free_frames() < mem_low()) mem_reclaim();
+    if ((err & 3) == 3 && addr >= USER_BASE && addr < USER_TOP) {
+        if (vmm_cow(p->pd, addr)) { pf_cow++; return true; }   /* fork's cow */
+        if (bkl && (vmm_pte(p->pd, addr) & PTE_COW) && mem_oom() && vmm_cow(p->pd, addr)) return true;
+    }
     if (err & 1) return false;                           /* protection faults are real */
     /* lazy anon page: frame now. PROT_NONE (no US) and writes to read-only
        ones stay faults, java counts on those SIGSEGVs */
     uint64_t pte = vmm_pte(p->pd, addr & ~(PAGE_SIZE - 1));
     /* another thread faulted the same page in a moment ago, just retry (llvmpipe threads die without it) */
     if ((pte & PTE_P) && (pte & PTE_US) && (!(err & 2) || (pte & PTE_RW))) return true;
+    if ((pte & (PTE_P | PTE_SWAP)) == PTE_SWAP) {
+        if ((err & 2) && !(pte & PTE_RW)) return false;
+        pf_swapin++;
+        return vmm_swap_in(p->pd, addr) || (mem_oom() && vmm_swap_in(p->pd, addr));
+    }
     if (pte & PTE_LAZY) {
         if (!(pte & PTE_US) || ((err & 2) && !(pte & PTE_RW))) return false;
         pf_anon++;
-        return vmm_fault_in(p->pd, addr);
+        return vmm_fault_in(p->pd, addr) || (bkl && mem_oom() && vmm_fault_in(p->pd, addr));
     }
     if (addr < USER_STACK_TOP - USER_STACK_MAX || addr >= USER_STACK_TOP) return false;
     return vmm_alloc_range(p->pd, addr & ~(PAGE_SIZE - 1), PAGE_SIZE, true) == 0;
@@ -940,7 +972,7 @@ int futex_op(uint64_t uaddr, int op, uint32_t val, uint64_t tmo, uint64_t uaddr2
         int w = p - procs, b = FBK(p->pd, uaddr), ret;
         task_t* t = task_current();
         uint64_t f = spin_lock(&fbl[b]);
-        if (!fut_read(p->pd, uaddr, &cur)) { spin_unlock(&fbl[b], f); return -EFAULT; }
+        if (!fut_read(p->pd, uaddr, &cur)) { spin_unlock(&fbl[b], f); return -EAGAIN; }
         if (cur != val) { spin_unlock(&fbl[b], f); return -EAGAIN; }
         fwq[w].woken = false; fwq[w].pd = p->pd; fwq[w].addr = uaddr; fwq[w].bk = b;
         __atomic_store_n(&fwq[w].active, true, __ATOMIC_RELEASE);

@@ -1,3 +1,4 @@
+#include "core/swap.h"
 #include "boot/apic.h"
 #include "boot/acpi.h"
 #include "core/smp.h"
@@ -298,6 +299,7 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
             if (s <= 0x100000 && e > 0x100000) { s = pool_start; e = pool_end - big; }
             if (e > s) pmm_add(s, e);
         }
+        mem_init();
         vga_printf("ok (%u KB, files %u KB, modules %d)\n", (uint32_t)(pmm_total_frames() * 4), (uint32_t)(heap_big_total() / 1024),
                    n_bootmods);
     }

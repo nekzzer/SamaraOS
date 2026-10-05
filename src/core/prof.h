@@ -3,7 +3,7 @@
 #include "core/types.h"
 
 extern int prof_on, prof_gen;
-extern uint64_t pf_anon, pf_cow, pf_file, pf_kern, tlb_ipis, tlb_rounds, uwin_bytes, bkl_wait, bkl_takes, bkl_slow;
+extern uint64_t pf_swapin, pf_anon, pf_cow, pf_file, pf_kern, tlb_ipis, tlb_rounds, uwin_bytes, bkl_wait, bkl_takes, bkl_slow;
 
 static inline uint64_t prof_tsc(void) {
     uint32_t a, d;

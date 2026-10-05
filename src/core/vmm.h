@@ -34,7 +34,10 @@ static inline bool dma_ok(const void* v) {
 #define PTE_US 0x004ul
 #define PTE_SHARED 0x200ul         /* avl bit: MAP_SHARED / shmat page, fork shares it */
 #define PTE_LAZY   0x400ul         /* avl bit, P=0: anon mmap page that gets a frame on first touch */
+#define PTE_SWAP   0x100ul         /* P=0: page is in swap, slot in the address bits, RW/US kept */
 #define PTE_COW    0x800ul         /* avl bit, P=1, RW=0: writable page whose frame is shared after fork, copied on the write fault */
+#define PTE_A  0x020ul
+#define PTE_USED   (PTE_P | PTE_LAZY | PTE_SWAP)
 #define PTE_WR(e)  ((e) & (PTE_RW | PTE_COW))
 #define PTE_ADDR   0x000FFFFFFFFFF000ul
 
@@ -45,6 +48,7 @@ uint64_t pmm_alloc(void);             /* zeroed frame, 0 when exhausted */
 uint64_t pmm_alloc_run(uint64_t n);   /* contiguous, zeroed, 0 when there is no such run */
 void     pmm_ref(uint64_t frame);
 void     pmm_unref(uint64_t frame);
+int      pmm_refcnt(uint64_t frame);
 uint64_t pmm_free_frames(void);
 uint64_t pmm_total_frames(void);
 
@@ -63,9 +67,20 @@ uint64_t vmm_pte(uint64_t pd, uint64_t va);            /* 0 = not mapped */
 void     vmm_set_writable(uint64_t pd, uint64_t va, uint64_t len, bool writable);
 void     vmm_set_user(uint64_t pd, uint64_t va, uint64_t len, bool user);
 int      vmm_map_frame(uint64_t pd, uint64_t va, uint64_t fr, bool rw);    /* takes a ref on fr */
+/* page cache frame into a user page, takes a ref. w: private writable (cow) or, with `shared`, plain rw */
+int      vmm_map_cache(uint64_t pd, uint64_t va, uint64_t fr, bool w, bool shared);
 /* anon memory without frames yet: they come on first touch (vmm_fault_in) */
 int      vmm_lazy_range(uint64_t pd, uint64_t va, uint64_t len, bool rw, bool user);
-bool     vmm_fault_in(uint64_t pd, uint64_t va);   /* a lazy page gets its frame; false = not lazy / oom */
+bool     vmm_fault_in(uint64_t pd, uint64_t va);   /* a lazy page gets its frame, a swapped one comes back; false = not lazy / oom */
+bool     vmm_swap_in(uint64_t pd, uint64_t va);    /* may sleep on the disk, no locks held */
+
+/* reclaim, see mem.c. one swap-out batch: pages picked, write protected, not yet written */
+typedef struct { uint64_t pd, va, fr, fl; int slot; } swb_t;
+#define SWB_MAX 16
+int      vmm_swap_scan(uint64_t pd, uint64_t* hand, int budget, swb_t* b, int* n);   /* 1 = reached the end of the space */
+uint64_t vmm_swap_find(uint64_t pd, uint64_t from, int area);
+int      vmm_swap_commit(swb_t* b, int n);                                    /* after the write, returns pages freed */
+
 
 /* Copy into / zero another space through the direct map (no CR3 switch). */
 int      vmm_copy_to(uint64_t pd, uint64_t va, const void* src, uint64_t len);
