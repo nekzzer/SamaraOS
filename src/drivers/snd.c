@@ -1,6 +1,7 @@
 #include "drivers/snd.h"
 #include "drivers/hda.h"
 #include "core/heap.h"
+#include "core/vmm.h"
 #include "core/io.h"
 #include "fs/fs.h"
 #include "core/string.h"
@@ -11,6 +12,7 @@
 #include "proc/proc.h"
 
 #define EPERM_ 1
+#define ENOMEM 12
 #define EINTR  4
 #define EAGAIN 11
 #define EBUSY  16
@@ -80,6 +82,7 @@ static int open_pcm;       // somebody has the playback node
 static int state;
 static uint32_t rate, bufb, perb, bfr, pfr;     // bytes and frames
 static uint64_t appl, hw, boundary;
+static bool mmapd;
 static uint64_t avail_min, start_th, stop_th;
 static uint32_t last_lpib;
 static uint32_t drain_at;
@@ -164,6 +167,7 @@ struct snd_fd* snd_open(int pcm) {
         if (tone_run) { hda_run(false); tone_run = false; }
         spin_unlock(&lk, f);
         open_pcm = 1;
+        mmapd = false;
         state = S_OPEN;
         rate = 0;
     }
@@ -286,11 +290,15 @@ static void iv_and(iv_t* v, uint64_t lo, uint64_t hi) {
 
 static int hw_refine(hwp_t* p) {
     hwp_t old = *p;
-    p->masks[0].bits[0] &= 1 << 3;       // rw interleaved
+    p->masks[0].bits[0] &= (1 << 3) | 1;       // rw + mmap interleaved
     p->masks[1].bits[0] &= 1 << 2;       // s16le
     p->masks[2].bits[0] &= 1;
     if (!p->masks[0].bits[0] || !p->masks[1].bits[0] || !p->masks[2].bits[0]) return -EINVAL;
-    for (int i = 0; i < 12; i++) if (iv_norm(&p->iv[i])) return -EINVAL;
+    uint32_t tfl[2] = {0, 0};
+    for (int i = 0; i < 12; i++) {
+        if (i == I_PT || i == I_BT) { tfl[i == I_BT] = p->iv[i].fl; p->iv[i].fl = 0; continue; }   // time is not integer, keep raw bounds
+        if (iv_norm(&p->iv[i])) return -EINVAL;
+    }
     iv_t* v = p->iv;
     iv_and(&v[I_SB], 16, 16); iv_and(&v[I_FB], 32, 32); iv_and(&v[I_CH], 2, 2);
     iv_and(&v[I_TICK], 0, 0xFFFFFFFF);
@@ -305,8 +313,14 @@ static int hw_refine(hwp_t* p) {
         uint64_t r0 = v[I_RATE].min, r1 = v[I_RATE].max;
         iv_and(&v[I_PS], (v[I_PB].min + 3) / 4, v[I_PB].max / 4);
         iv_and(&v[I_BS], (v[I_BB].min + 3) / 4, v[I_BB].max / 4);
-        iv_and(&v[I_PS], (v[I_PT].min * r0 + 999999) / 1000000, v[I_PT].max * r1 / 1000000);
-        iv_and(&v[I_BS], (v[I_BT].min * r0 + 999999) / 1000000, v[I_BT].max * r1 / 1000000);
+        for (int k = 0; k < 2; k++) {
+            iv_t* t = &v[k ? I_BT : I_PT];
+            uint64_t lo = (uint64_t)t->min * r0, hi = (uint64_t)t->max * r1;
+            lo = (tfl[k] & 1) ? lo / 1000000 + 1 : (lo + 999999) / 1000000;
+            hi = (tfl[k] & 2) ? (hi + 999999) / 1000000 - 1 : hi / 1000000;
+            if (hi > 0xFFFFFFF0ull && t->max == 0xFFFFFFFFu) hi = 0xFFFFFFFFull;
+            iv_and(k ? &v[I_BS] : &v[I_PS], lo, hi);
+        }
         iv_and(&v[I_PS], ((uint64_t)v[I_BS].min + v[I_PN].max - 1) / v[I_PN].max, v[I_BS].max / v[I_PN].min);
         iv_and(&v[I_PN], ((uint64_t)v[I_BS].min + v[I_PS].max - 1) / v[I_PS].max, v[I_BS].max / v[I_PS].min);
         iv_and(&v[I_BS], (uint64_t)v[I_PS].min * v[I_PN].min, (uint64_t)v[I_PS].max * v[I_PN].max);
@@ -321,6 +335,21 @@ static int hw_refine(hwp_t* p) {
         iv_and(&v[I_BT], (uint64_t)v[I_BS].min * 1000000 / r1, ((uint64_t)v[I_BS].max * 1000000 + r0 - 1) / r0);
     }
     for (int i = 0; i < 12; i++) if (v[i].min > v[i].max) return -EINVAL;
+    // time is ps * 1e6 / rate, alsa-lib wants the open bounds like the real kernel gives
+    {
+        uint64_t r0 = v[I_RATE].min, r1 = v[I_RATE].max;
+        iv_t* t = &v[I_PT];
+        for (int k = 0; k < 2; k++, t = &v[I_BT]) {
+            uint64_t a = (uint64_t)(k ? v[I_BS].min : v[I_PS].min) * 1000000, b = (uint64_t)(k ? v[I_BS].max : v[I_PS].max) * 1000000;
+            uint32_t fl = 0;
+            if (a % r1) fl |= 1;
+            if (b % r0) fl |= 2;
+            if (a / r1 > t->min) t->min = a / r1;
+            if ((b + r0 - 1) / r0 < t->max) t->max = (b + r0 - 1) / r0;
+            t->fl = fl;
+            if (t->min > t->max || (t->min == t->max && fl)) return -EINVAL;
+        }
+    }
     p->rate_num = v[I_RATE].min; p->rate_den = 1;
     p->msbits = 16;
     p->info = 0x100 | 0x10000 | 0x80000;
@@ -473,6 +502,8 @@ static int pcm_ioctl(uint32_t nr, void* arg, bool nb) {
         hda_run(false);
         state = S_SETUP;
         avail_min = pfr; start_th = 1; stop_th = bfr;
+        boundary = bfr;
+        while (boundary * 2 <= 0x7FFFFFFFFFFFFFFFull - bfr) boundary *= 2;
         spin_unlock(&lk, f);
         return 0;
     case 0x12:
@@ -514,12 +545,19 @@ static int pcm_ioctl(uint32_t nr, void* arg, bool nb) {
         sync_t* y = arg;
         f = spin_lock(&lk);
         hw_update();
-        if (y->flags & 2) {
+        if (!(y->flags & 2)) {     // flag set = kernel to user, backwards but thats how it is
             uint64_t a = *(uint64_t*)y->c;
-            // only believe it if it is sane, alsa-lib sends stale appl_ptr when we write() instead of mmap
-            (void)a;
+            // only believe it when the app mmaped the ring, with write() alsa-lib sends stale appl_ptr
+            if (mmapd) {
+                uint64_t bn0 = boundary ? boundary : 1ull << 62;
+                uint64_t d = (a + bn0 - appl % bn0) % bn0;
+                if (d <= bfr - (appl - hw)) {
+                    appl += d;
+                    if (state == S_PREP && appl >= (start_th < bfr ? start_th : bfr)) do_start();
+                }
+            }
         }
-        if (y->flags & 4) { avail_min = *(uint64_t*)(y->c + 8); if (!avail_min) avail_min = 1; }
+        if (!(y->flags & 4)) { avail_min = *(uint64_t*)(y->c + 8); if (!avail_min) avail_min = 1; }
         uint64_t bn = boundary ? boundary : 1ull << 62;
         memset(y->s, 0, 64);
         *(int32_t*)y->s = state;
@@ -529,7 +567,15 @@ static int pcm_ioctl(uint32_t nr, void* arg, bool nb) {
         spin_unlock(&lk, f);
         return 0;
     }
-    case 0x32: return -ENOSYS;
+    case 0x32: {
+        uint8_t* c = arg;
+        uint32_t ch = *(uint32_t*)c;
+        if (ch > 1) return -EINVAL;
+        *(int64_t*)(c + 8) = 0;
+        *(uint32_t*)(c + 16) = ch * 16;
+        *(uint32_t*)(c + 20) = 32;
+        return 0;
+    }
     case 0x40:
         f = spin_lock(&lk);
         if (state == S_OPEN) r = -EBADFD;
@@ -581,11 +627,21 @@ static int pcm_ioctl(uint32_t nr, void* arg, bool nb) {
     return -ENOTTY;
 }
 
+int snd_mmap(struct snd_fd* s, uint64_t pd, uint64_t addr, uint64_t len, uint64_t off) {
+    if (!s->pcm || off || len > HDA_BUF) return -EINVAL;     // status/control pages: alsa-lib falls back to sync_ptr
+    uint64_t pa = V2P(hda_ring());
+    for (uint64_t i = 0; i < len; i += PAGE_SIZE)
+        if (vmm_map_frame(pd, addr + i, pa + i, true) < 0) return -ENOMEM;
+    mmapd = true;
+    return 0;
+}
+
 int snd_ioctl(struct snd_fd* s, uint32_t req, void* arg, bool nb) {
     uint32_t type = (req >> 8) & 255, nr = req & 255;
-    if (s->pcm && type == 'A') return pcm_ioctl(nr, arg, nb);
-    if (type == 'U') return ctl_ioctl(nr, arg);
-    return -ENOTTY;
+    int r = -ENOTTY;
+    if (s->pcm && type == 'A') r = pcm_ioctl(nr, arg, nb);
+    else if (type == 'U') r = ctl_ioctl(nr, arg);
+    return r;
 }
 
 int snd_kopen(uint32_t hz) {

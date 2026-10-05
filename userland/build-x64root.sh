@@ -44,6 +44,11 @@ printf 'repository=%s\n' "$REPO" > etc/xbps.d/00-repository-main.conf
 mkdir -p var/cache/xbps root etc/dropbear tmp
 chmod 1777 tmp
 printf 'SamaraOS\n' > etc/issue
+# no sysv ipc yet, so no dmix: default straight to the hda
+printf 'pcm.!default {\n    type plug\n    slave.pcm "hw:0,0"\n}\nctl.!default {\n    type hw\n    card 0\n}\n' > etc/asound.conf
+# mpv asks for float first and our plug path chokes on that
+mkdir -p etc/mpv
+printf 'ao=alsa\naudio-format=s16\n' > etc/mpv/mpv.conf
 # wayland side of the desktop (userland/samara-wl/build.sh)
 [ -x $ROOT/build/samara-wl ] && install -m755 $ROOT/build/samara-wl usr/bin/samara-wl
 

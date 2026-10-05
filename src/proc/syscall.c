@@ -965,7 +965,7 @@ static int64_t do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd,
     if (!(flags & MAP_ANON)) {
         f = getf(fd);
         if (!f) return -EBADF;
-        if (f->type != F_NODE && f->type != F_ZERO && f->type != F_FB && f->type != F_DRM && f->type != F_URING) return -EACCES;
+        if (f->type != F_NODE && f->type != F_ZERO && f->type != F_FB && f->type != F_DRM && f->type != F_URING && f->type != F_SND) return -EACCES;
     }
     uint64_t lo = USER_MMAP_BASE, hi = USER_STACK_TOP - USER_STACK_MAX;
     if (flags & MAP_FIXED) {
@@ -991,6 +991,12 @@ static int64_t do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd,
         if (!fr) return -ENOMEM;
         for (uint64_t k = 0; k < np; k++)
             vmm_map_frame(p->pd, addr + k * PAGE_SIZE, fr[first + k], (prot & PROT_WRITE) != 0);
+        vmm_flush();
+        return (int64_t)addr;
+    }
+    if (f && f->type == F_SND) {
+        int r = snd_mmap(f->snd, p->pd, addr, len, off);
+        if (r < 0) { vmm_free_range(p->pd, addr, len); vmm_flush(); return r; }
         vmm_flush();
         return (int64_t)addr;
     }

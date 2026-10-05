@@ -13,6 +13,7 @@ void  snd_close(struct snd_fd* s);
 int   snd_ioctl(struct snd_fd* s, uint32_t req, void* arg, bool nb);
 bool  snd_writable(struct snd_fd* s);
 
+int   snd_mmap(struct snd_fd* s, uint64_t pd, uint64_t addr, uint64_t len, uint64_t off);
 bool  snd_tone(uint32_t hz);                 /* square wave for the mediaplayer, 0 = off. false: no hda or busy */
 
 /* for the kernel's own wav player, stereo s16 at 44100 or 48000 */
