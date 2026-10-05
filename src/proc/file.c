@@ -393,6 +393,31 @@ uint32_t file_gen(file_t* f) {
     return 0;
 }
 
+/* eventfd readers sleep here, every write wakes all of them */
+static spin_t efl;
+static task_t* ewq[16];
+
+void efd_wake(void) {
+    uint64_t fl = spin_lock(&efl);
+    for (int i = 0; i < 16; i++)
+        if (ewq[i]) { task_ready(ewq[i]); ewq[i] = NULL; }
+    spin_unlock(&efl, fl);
+}
+
+static void efd_sleep(file_t* f) {
+    task_t* t = task_current();
+    if (!t->proc || !t->id) { task_sleep_ms(1); return; }
+    uint64_t fl = spin_lock(&efl);
+    if (f->cnt) { spin_unlock(&efl, fl); return; }
+    int i = 0;
+    while (i < 16 && ewq[i]) i++;
+    if (i < 16) ewq[i] = t;
+    t->wake_ms = pit_uptime_ms() + 10;
+    t->state = T_BLOCKED;
+    spin_unlock(&efl, fl);
+    while (t->state == T_BLOCKED) task_yield();
+}
+
 int file_read(file_t* f, char* buf, uint32_t n) {
     switch (f->type) {
         case F_URING: return -22;
@@ -401,9 +426,10 @@ int file_read(file_t* f, char* buf, uint32_t n) {
             if (n < 8) return -22;
             uint64_t v;
             for (;;) {
-                if (f->type == F_EVENTFD && f->cnt) {
-                    v = (f->flags & 0x10000000) ? 1 : f->cnt;  /* EFD_SEMAPHORE, kept in a spare flag bit */
-                    f->cnt -= v;
+                uint64_t cur = f->type == F_EVENTFD ? __atomic_load_n(&f->cnt, __ATOMIC_ACQUIRE) : 0;
+                if (cur) {
+                    v = (f->flags & 0x10000000) ? 1 : cur;  /* EFD_SEMAPHORE, kept in a spare flag bit */
+                    if (!__atomic_compare_exchange_n(&f->cnt, &cur, cur - v, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
                     break;
                 }
                 if (f->type == F_TIMERFD && f->t_next && (int32_t)(pit_uptime_ms() - f->t_next) >= 0) {
@@ -414,7 +440,8 @@ int file_read(file_t* f, char* buf, uint32_t n) {
                 }
                 if (f->flags & O_NONBLOCK) return -11;
                 if (proc_interrupted()) return -4;
-                task_sleep_ms(1);
+                if (f->type == F_EVENTFD) efd_sleep(f);
+                else task_sleep_ms(1);
             }
             memcpy(buf, &v, 8);
             return 8;
@@ -481,7 +508,8 @@ int file_write(file_t* f, const char* buf, uint32_t n) {
             uint64_t v;
             memcpy(&v, buf, 8);
             if (v == ~0ull) return -22;
-            f->cnt += v;
+            __atomic_add_fetch(&f->cnt, v, __ATOMIC_ACQ_REL);
+            efd_wake();
             return 8;
         }
         case F_TIMERFD: case F_SIGNALFD: return -22;

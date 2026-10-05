@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/mman.h>
+#include <sys/eventfd.h>
 #include <sys/syscall.h>
 #include <linux/futex.h>
 
@@ -69,6 +70,12 @@ static void* wrap(void* v) {
             sh->turn = 1 - me;
             fx(&sh->turn, FUTEX_WAKE_PRIVATE, 1);
         }
+    } else if (a->kind == 2) {
+        uint64_t v = 1;
+        for (int i = 0; i < iters; i++) {
+            if (me == 0) { write(sh->fd[0], &v, 8); read(sh->fd[1], &v, 8); }
+            else { read(sh->fd[0], &v, 8); write(sh->fd[1], &v, 8); }
+        }
     } else {
         char c = 'x';
         for (int i = 0; i < iters; i++) {
@@ -84,7 +91,11 @@ static void runp(const char* name, int kind) {
     static struct pp pp[8];
     static struct arg ar[16];
     int n = nt / 2 ? nt / 2 : 1;
-    for (int i = 0; i < n; i++) { pp[i].turn = 0; pipe(pp[i].fd); pipe(pp[i].fd + 2); }
+    for (int i = 0; i < n; i++) {
+        pp[i].turn = 0;
+        if (kind == 2) { pp[i].fd[0] = eventfd(0, 0); pp[i].fd[1] = eventfd(0, 0); }
+        else { pipe(pp[i].fd); pipe(pp[i].fd + 2); }
+    }
     long t0 = now_ms();
     for (int i = 0; i < n * 2; i++) {
         ar[i].p = &pp[i / 2]; ar[i].id = i & 1; ar[i].kind = kind;
@@ -105,5 +116,6 @@ int main(int argc, char** argv) {
     if (!strcmp(w, "clock") || !strcmp(w, "all")) run("clock", t_clock, iters * 5L);
     if (!strcmp(w, "futex") || !strcmp(w, "all")) runp("futex", 0);
     if (!strcmp(w, "pipe") || !strcmp(w, "all")) runp("pipe", 1);
+    if (!strcmp(w, "efd") || !strcmp(w, "all")) runp("efd", 2);
     return 0;
 }

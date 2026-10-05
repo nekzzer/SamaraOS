@@ -53,6 +53,7 @@ uint32_t file_gen(file_t* f);
 file_t* file_open_node(fs_node_t* n, int flags);   /* handles device nodes */
 void    file_ref(file_t* f);
 void    file_close(file_t* f);
+void    efd_wake(void);                            /* an eventfd counter went up */
 
 int     file_read(file_t* f, char* buf, uint32_t n);
 int     file_write(file_t* f, const char* buf, uint32_t n);

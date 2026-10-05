@@ -2905,9 +2905,9 @@ int64_t syscall_nobkl(regs_t* r) {
             break;
         }
         case 202: ret = do_futex(a, (uint32_t)b, (uint32_t)c, r->r10, r->r8, (uint32_t)r->r9); break;
-        case 0: case 1: {                            /* pipes only */
+        case 0: case 1: {                            /* pipes and eventfd only */
             file_t* f = getf_ref((int)a);
-            if (!f || (f->type != F_PIPE_R && f->type != F_PIPE_W)) { file_close(f); ret = NB_SLOW; break; }
+            if (!f || (f->type != F_PIPE_R && f->type != F_PIPE_W && f->type != F_EVENTFD)) { file_close(f); ret = NB_SLOW; break; }
             if (nr == 0 ? f->type == F_PIPE_W : f->type == F_PIPE_R) ret = -EBADF;
             else if (!uok((void*)b, c)) ret = -EFAULT;
             else ret = nr == 0 ? file_read(f, (char*)b, c) : file_write(f, (const char*)b, c);
