@@ -16,6 +16,7 @@
 #include "drivers/keyboard.h"
 #include "drivers/mouse.h"
 #include "proc/proc.h"
+#include "apps/pterm.h"
 #include "boot/pit.h"
 #include "core/io.h"
 
@@ -254,10 +255,30 @@ static void u_click(window_t* w, int rx, int ry) {
     u->hover_x = x; u->hover_y = y;
 }
 
+static char dnd_buf[4096];
+static int dnd_n;
+static bool dnd_on;
+static void u_paint(window_t* w);
+
 static void u_release(window_t* w) {
     uwin_t* u = of(w);
     if (u->flags & SM_F_WL) return;
     u->pressed = false;
+    if (dnd_on) {
+        // fm dragged something out, whoever is under the pointer gets it
+        int mx, my;
+        uint8_t b;
+        mouse_get(&mx, &my, &b);
+        window_t* t = wm_window_at(mx, my);
+        dnd_on = false;
+        if (t && t != w) {
+            if (t->on_paint == u_paint && !(of(t)->flags & SM_F_WL)) {
+                int x, y;
+                u_map(of(t), t, mx, my, &x, &y);
+                push(of(t), SM_EV_DROP, x, y, 0);
+            } else if (pterm_drop(t, dnd_buf, dnd_n)) {}
+        }
+    }
     push(u, SM_EV_MOUSE_UP, u->hover_x, u->hover_y, 0);
 }
 
@@ -499,6 +520,20 @@ int32_t uwin_syscall(uint32_t op, uint64_t a, uint64_t b, uint64_t c) {
         if (!uok(a, b)) return -EFAULT;
         clip_set((const char*)a, (int)b);
         return 0;
+    }
+    if (op == SM_OP_DND_SET) {
+        if (b > sizeof(dnd_buf)) b = sizeof(dnd_buf);
+        if (!uok(a, b)) return -EFAULT;
+        memcpy(dnd_buf, (const void*)a, b);
+        dnd_n = (int)b;
+        dnd_on = b > 0;
+        return 0;
+    }
+    if (op == SM_OP_DND_GET) {
+        if (!uok(a, b)) return -EFAULT;
+        int n = dnd_n < (int)b ? dnd_n : (int)b;
+        memcpy((void*)a, dnd_buf, n);
+        return n;
     }
     if (op == SM_OP_NOTIFY) {
         char s[96];

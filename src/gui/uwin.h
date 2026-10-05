@@ -22,12 +22,12 @@ enum {
     SM_OP_CLIP_GET,      /* ecx = buf, edx = cap             -> bytes (utf-8, not NUL-terminated) */
     SM_OP_CLIP_SET,      /* ecx = buf, edx = len                                  */
     SM_OP_NOTIFY,        /* ecx = "title\nbody"              popup in the corner  */
-    SM_OP_CTL,           /* ecx = SM_CTL_*, edx = arg                             */
+    SM_OP_CTL, SM_OP_DND_SET, SM_OP_DND_GET,           /* ecx = SM_CTL_*, edx = arg                             */
 };
 
 enum { SM_EV_NONE, SM_EV_KEY, SM_EV_MOUSE_DOWN, SM_EV_MOUSE_UP, SM_EV_MOUSE_MOVE, SM_EV_CLOSE,
        SM_EV_WHEEL, SM_EV_RDOWN, SM_EV_RESIZE,
-       SM_EV_RAWKEY, SM_EV_PENTER, SM_EV_PLEAVE, SM_EV_PMOVE, SM_EV_PBTN, SM_EV_FOCUS };
+       SM_EV_RAWKEY, SM_EV_PENTER, SM_EV_PLEAVE, SM_EV_PMOVE, SM_EV_PBTN, SM_EV_FOCUS, SM_EV_DROP };
 /* SM_EV_KEY: b = modifiers (1 shift, 2 ctrl, 4 alt). SM_EV_RDOWN: a, b = x, y of a right click.
    SM_EV_RESIZE: a, b = new client size (SM_F_RESIZE windows) */
 /* SM_F_WL windows (samara-wl): resizable, scale 1, and raw input instead of the old events:

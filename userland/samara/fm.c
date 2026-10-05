@@ -98,6 +98,7 @@ static int flt_on;
 static char tabs[8][1024];
 static int ntabs = 1, tab_cur;
 static int click_idx = -1;
+static int drag_i = -1, drag_x, drag_y, drag_on;
 static uint32_t click_ms;
 static int rb_on, rb_x0, rb_y0, rb_x1, rb_y1;
 static int sb_drag;
@@ -2268,6 +2269,7 @@ static void on_down(FmEv *e) {
         }
         click_idx = i;
         click_ms = t;
+        drag_i = i; drag_x = px; drag_y = py; drag_on = 0;
         return;
     }
     click_idx = -1;
@@ -2275,6 +2277,20 @@ static void on_down(FmEv *e) {
     rb_on = 1;
     rb_x0 = rb_x1 = px - cont_x();
     rb_y0 = rb_y1 = py - cont_y() + scroll;
+}
+
+static void drop_in(void) {
+    char b[4096];
+    int n = be_dnd_get(b, sizeof b - 1);
+    FILE *f;
+    if (n <= 0 || mode != M_BROWSE) return;
+    b[n] = 0;
+    f = fopen("/tmp/.fm-clip", "w");
+    if (!f) return;
+    fprintf(f, "copy\n%s\n", b);
+    fclose(f);
+    paste();
+    load_dir();
 }
 
 static void on_move(FmEv *e) {
@@ -2287,6 +2303,14 @@ static void on_move(FmEv *e) {
         scroll = (long)(my - cont_y()) * (total_h() - cont_h()) / cont_h();
         clamp_scroll();
         return;
+    }
+    if (drag_i >= 0 && !drag_on && (abs(mx - drag_x) > 8 || abs(my - drag_y) > 8)) {
+        char b[4096] = "", p[1024];
+        int i;
+        for (i = 0; i < n_ents; i++)
+            if (ents[i].sel && strlen(b) < 3000) { join(p, cwd, ents[i].name); if (b[0]) strcat(b, "\n"); strcat(b, p); }
+        if (b[0]) { be_dnd_set(b, strlen(b)); drag_on = 1; say("drop it on a window"); }
+        else drag_i = -1;
     }
     if (rb_on) {
         if (my < cont_y()) scroll -= 24;
@@ -2376,7 +2400,8 @@ int main(int argc, char **argv) {
             case EV_RESIZE: clamp_scroll(); dirty = 1; break;
             case EV_KEY: on_key(&e); break;
             case EV_DOWN: on_down(&e); break;
-            case EV_UP: sb_drag = 0; rb_on = 0; dirty = 1; break;
+            case EV_UP: sb_drag = 0; rb_on = 0; drag_i = -1; drag_on = 0; dirty = 1; break;
+            case EV_DROP: drop_in(); break;
             case EV_MOVE: on_move(&e); break;
             case EV_WHEEL: on_wheel(e.a); break;
             }

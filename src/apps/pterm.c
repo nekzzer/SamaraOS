@@ -551,3 +551,23 @@ fail:
     memset(t, 0, sizeof *t);
     return NULL;
 }
+
+bool pterm_drop(window_t* w, const char* s, int n) {
+    for (int i = 0; i < PT_MAX; i++) {
+        if (!pts[i].used || pts[i].win != w) continue;
+        char o[4200];
+        int k = 0;
+        // one path per line -> 'path' 'path'
+        o[k++] = '\'';
+        for (int j = 0; j < n && k < 4190; j++) {
+            if (s[j] == '\n') { o[k++] = '\''; o[k++] = ' '; o[k++] = '\''; }
+            else if (s[j] == '\'') { o[k++] = '\''; o[k++] = '\\'; o[k++] = '\''; o[k++] = '\''; }
+            else o[k++] = s[j];
+        }
+        o[k++] = '\'';
+        o[k++] = ' ';
+        pty_write(pts[i].pty, true, o, k, true);
+        return true;
+    }
+    return false;
+}

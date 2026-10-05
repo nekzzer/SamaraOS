@@ -1313,6 +1313,16 @@ int edit_main(int argc, char **argv) {
             case EV_DOWN: if (e.c == 1) on_down(&e); mx = e.a; my = e.b; break;
             case EV_UP: dragging = sbdrag = 0; break;
             case EV_MOVE: on_move(&e); break;
+            case EV_DROP: {
+                char b[4096], *p, *nl;
+                int n = sm_dnd_get(b, sizeof b - 1);
+                if (n > 0) for (b[n] = 0, p = b; *p; p = nl) {
+                    nl = strchr(p, '\n');
+                    if (nl) *nl++ = 0; else nl = p + strlen(p);
+                    if (*p) tab_open(p);
+                }
+                break;
+            }
             case EV_WHEEL: D->top += e.a * 3; if (D->top < 0) D->top = 0; if (D->top >= D->nl) D->top = D->nl - 1; break;
             }
         } while (be_wait(&e, 0) > 0);

@@ -4,12 +4,13 @@
    fm_samara.c now, a wl_shm one later */
 #include <stdint.h>
 
-enum { EV_NONE, EV_KEY, EV_DOWN, EV_UP, EV_MOVE, EV_WHEEL, EV_RESIZE, EV_CLOSE };
+enum { EV_NONE, EV_KEY, EV_DOWN, EV_UP, EV_MOVE, EV_WHEEL, EV_RESIZE, EV_CLOSE, EV_DROP };
 
 /* EV_KEY: a = unicode codepoint or FK_*, b = mods
    EV_DOWN/UP/MOVE: a, b = x, y; c = button (1 left, 2 right)
    EV_WHEEL: a = notches, > 0 down
-   EV_RESIZE: a, b = new size */
+   EV_RESIZE: a, b = new size
+   EV_DROP: files dropped from another window at a, b, paths via be_dnd_get */
 enum { FK_UP = 0x200000, FK_DOWN, FK_LEFT, FK_RIGHT, FK_HOME, FK_END, FK_DEL, FK_PGUP, FK_PGDN,
        FK_ENTER, FK_BACK, FK_ESC, FK_TAB, FK_F2, FK_F5 };
 #define MOD_SHIFT 1
@@ -32,6 +33,8 @@ void be_text(int x, int y, const char *s, uint32_t c, int font);
 int  be_text_w(const char *s, int font);
 int  be_font_h(int font);
 void be_blit(int x, int y, int w, int h, const uint32_t *src, int sw, int sh);   /* scaled to w x h */
+void be_dnd_set(const char *paths, int n);       /* newline separated, picked up by whatever window the button is released over */
+int  be_dnd_get(char *buf, int cap);
 void be_clip_set(const char *s, int n);        /* system clipboard, utf-8 */
 int  be_flip(void);                            /* < 0: window gone */
 
