@@ -14,7 +14,8 @@ PKGS="base-files musl busybox coreutils findutils grep sed gawk tar gzip xz bash
       font-misc-misc dejavu-fonts-ttf fontconfig \
       mesa-dri mesa-demos xclock xeyes xcalc xev xclip xsel xdotool wl-clipboard wayland-utils \
       xcursor-themes adwaita-icon-theme gtk+3-demo \
-      alsa-utils alsa-lib mpg123 mpv SDL2"
+      alsa-utils alsa-lib mpg123 mpv SDL2 \
+      runit runit-void cronie e2fsprogs dosfstools strace"
 
 # everything inside a user namespace: files end up owned by root:root without sudo
 if [ -z "$IN_NS" ]; then
@@ -49,6 +50,9 @@ printf 'pcm.!default {\n    type plug\n    slave.pcm "hw:0,0"\n}\nctl.!default {
 # mpv asks for float first and our plug path chokes on that
 mkdir -p etc/mpv
 printf 'ao=alsa\naudio-format=s16\n' > etc/mpv/mpv.conf
+# installer (needs the iso for grub images)
+sh $ROOT/userland/x64cc.sh -w $ROOT/userland/samara/mkdisk.c -o usr/bin/samara-mkdisk
+install -m755 $ROOT/userland/samara-install usr/bin/samara-install
 # wayland side of the desktop (userland/samara-wl/build.sh)
 [ -x $ROOT/build/samara-wl ] && install -m755 $ROOT/build/samara-wl usr/bin/samara-wl
 

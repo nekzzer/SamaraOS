@@ -36,6 +36,7 @@ int      ata_write(int idx, uint32_t lba, int count, const void* buf);
 int      ata_primary(void);                                         /* -1 if none */
 const char* ata_drive_name(int idx);
 void     ata_usb_added(int i);                                      /* usb disk i is up: partitions, /dev nodes */
+void     ata_part_clear(int parent);
 int      ata_part_add(int parent, uint32_t start, uint32_t len, int num);   /* index or -1 */
 int      ata_part_info(int idx, int* parent, uint32_t* start, int* num);     /* 0 if idx is a partition */
 int      ata_rdev(int idx);                                                  /* major<<8 | minor */                                /* "hda", "sda", ... */

@@ -140,6 +140,10 @@ int ata_part_add(int parent, uint32_t start, uint32_t len, int num) {
     return -1;
 }
 
+void ata_part_clear(int parent) {
+    for (int i = 0; i < DISK_MAX - DISK_PART_BASE; i++) if (parts[i].used && parts[i].parent == parent) parts[i].used = false;
+}
+
 int ata_part_info(int idx, int* parent, uint32_t* start, int* num) {
     if (idx < DISK_PART_BASE || idx >= DISK_MAX || !parts[idx - DISK_PART_BASE].used) return -1;
     part_t* p = &parts[idx - DISK_PART_BASE];

@@ -19,7 +19,9 @@
 #include "drivers/input.h"
 
 #define O_ACCMODE  3
+#define O_RDONLY   0
 #define O_WRONLY   1
+#define O_RDWR     2
 #define O_APPEND   02000
 #define O_NONBLOCK 04000
 
@@ -170,10 +172,50 @@ void file_close(file_t* f) {
         if (f->pipe->readers <= 0 && f->pipe->writers <= 0) { wq_drain(&f->pipe->wq); kfree(f->pipe); }
         if (f->pipe2->readers <= 0 && f->pipe2->writers <= 0) { wq_drain(&f->pipe2->wq); kfree(f->pipe2); }
     } else if (f->pipe) {
-        if (pipe_end(f->pipe, f->type == F_PIPE_R ? -1 : 0, f->type == F_PIPE_R ? 0 : -1)) kfree(f->pipe);
+        bool rw = (f->flags & O_ACCMODE) == O_RDWR;
+        if (pipe_end(f->pipe, f->type == F_PIPE_R ? -1 : 0, f->type == F_PIPE_R ? (rw ? -1 : 0) : -1)) {
+            if (f->node) f->node->data = NULL;
+            kfree(f->pipe);
+        }
+        if (f->node) fs_release(f->node);
     }
     if (f->type != F_NODE) io_wake();     // hup for whoever polls the other end
     kfree(f);
+}
+
+/* named pipe: the pipe lives in n->data while anybody has it open. O_RDWR is a reader that also
+   counts as a writer (never blocks, no EOF for itself) */
+int fifo_open(fs_node_t* n, int flags, file_t** out) {
+    int acc = flags & O_ACCMODE;
+    pipe_t* p = (pipe_t*)n->data;
+    if (acc == O_WRONLY && (flags & O_NONBLOCK) && (!p || p->readers <= 0)) return -6;     // ENXIO
+    if (!p) {
+        p = (pipe_t*)kmalloc(sizeof(pipe_t));
+        if (!p) return -ENOMEM;
+        memset(p, 0, sizeof(*p));
+        n->data = (char*)p;
+    }
+    file_t* f = file_new(acc == O_WRONLY ? F_PIPE_W : F_PIPE_R, flags & ~02000000);
+    if (!f) return -ENOMEM;
+    f->pipe = p;
+    f->node = n;
+    n->refs++;
+    int wo = p->wopens;
+    uint64_t fl = spin_lock(&p->lk);
+    if (acc != O_WRONLY) p->readers++;
+    if (acc != O_RDONLY) { p->writers++; p->wopens++; }
+    spin_unlock(&p->lk, fl);
+    wq_wake(&p->wq);
+    io_wake();
+    if (!(flags & O_NONBLOCK) && acc != O_RDWR) {
+        // blocking open: wait for the other end, same polling as the drm read
+        while (acc == O_RDONLY ? (p->writers <= 0 && p->wopens == wo) : p->readers <= 0) {
+            if (proc_interrupted()) { file_close(f); return -4; }
+            task_sleep_ms(2);
+        }
+    }
+    *out = f;
+    return 0;
 }
 
 int pipe_create(file_t** rd, file_t** wr) {
@@ -334,9 +376,8 @@ int node_truncate(fs_node_t* n, uint32_t len) {
 
 /* ---------------- block devices ---------------- */
 
-uint32_t file_disk_size(file_t* f) {
-    uint32_t s = ata_drive_sectors(f->disk);
-    return s >= 0x800000u ? 0xFFFFFE00u : s * 512;           /* clamp to 4 GiB */
+uint64_t file_disk_size(file_t* f) {
+    return (uint64_t)ata_drive_sectors(f->disk) * 512;
 }
 
 /* /proc/<pid>/mem: pread/pwrite at a user address of the other process */
@@ -363,7 +404,7 @@ static int pmem_rw(file_t* f, char* buf, uint32_t n, bool write) {
 
 /* Byte-granular access through a one-sector bounce buffer. */
 static int disk_rw(file_t* f, char* buf, uint32_t n, bool write) {
-    uint32_t size = file_disk_size(f);
+    uint64_t size = file_disk_size(f);
     if (f->off >= size) return 0;
     if (n > size - f->off) n = size - f->off;
     uint8_t* sec = (uint8_t*)kmalloc(512);

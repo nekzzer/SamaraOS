@@ -137,6 +137,7 @@ static int n_reg;
 static uint64_t ram_top_g;                /* end of the highest usable range */
 static uint64_t low_end;                  /* end of the range that holds the kernel, below 4 GiB */
 
+extern char _heap_start[];
 static void read_memmap(multiboot_info_t* mbi) {
     if (mbi->flags & 64) {
         uint8_t* p = (uint8_t*)P2V(mbi->mmap_addr);
@@ -158,7 +159,9 @@ static void read_memmap(multiboot_info_t* mbi) {
     }
     for (int i = 0; i < n_reg; i++) {
         if (reg[i].end > ram_top_g) ram_top_g = reg[i].end;
-        if (reg[i].start <= 0x100000 && reg[i].end > 0x100000) low_end = reg[i].end;
+        // region with the heap, not the one at 1M: uefi has holes right after the kernel start
+        uint64_t hs = V2P(_heap_start);
+        if (reg[i].start <= hs && reg[i].end > hs) low_end = reg[i].end;
     }
     if (low_end > 0x100000000ull) low_end = 0x100000000ull;
 }
@@ -204,6 +207,7 @@ static void relocate_modules(multiboot_info_t* mbi) {
 void kmain(uint32_t magic, uint32_t mb_info_addr) {
     multiboot_info_t* mbi = (multiboot_info_t*)P2V(mb_info_addr);
     bool mb = magic == MB1_BOOTED_MAGIC && mb_info_addr;
+    if (magic == 0x36d76289 && mb_info_addr) { extern multiboot_info_t* mb2_convert(uint32_t); mbi = mb2_convert(mb_info_addr); mb = true; }
     if (mb) { read_memmap(mbi); relocate_modules(mbi); }
     else { low_end = ram_top_g = 0x8000000; mods_floor = low_end; reg[0].start = 0x100000; reg[0].end = low_end; n_reg = 1; }
     if (mb) {
@@ -299,7 +303,8 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
         pmm_init(ram_top_g);
         for (int i = 0; i < n_reg; i++) {
             uint64_t s = reg[i].start, e = reg[i].end;
-            if (s <= 0x100000 && e > 0x100000) { s = pool_start; e = pool_end - big; }
+            if (s <= pool_start && e > pool_start) e = pool_end - big;
+            if (s < pool_start) s = pool_start;   // kernel image and the heap
             if (e > s) pmm_add(s, e);
         }
         mem_init();
@@ -391,6 +396,8 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
 
     mnt_tmpfs_boot("/tmp");
     mnt_tmpfs_boot("/dev/shm");
+    if (!fs_resolve(fs_root(), "/run")) fs_create(fs_root(), "/run", FS_DIR);
+    mnt_tmpfs_boot("/run");               // runit wants fifos in supervise/, those only live in ram
 
     /* Background services from /etc/rc: the dropbear ssh server and telnetd
        (both on a pty per session). Skipped with "noservices". */
@@ -440,7 +447,7 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
     while (*m1) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, *m1++); }
 
     /* Pass multiboot info to desktop (used as last-resort FB source). */
-    if (magic == MB1_BOOTED_MAGIC && mb_info_addr) {
+    if (mb) {
         desktop_install_mbi(mbi);
     }
     /* Try loading DOOM WAD from disk so user sees it on boot if attached. */

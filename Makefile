@@ -62,6 +62,7 @@ KERN_SRC := \
     src/core/string.c \
     src/drivers/vga.c \
     src/boot/acpi.c \
+    src/boot/mb2.c \
     src/boot/apic.c \
     src/boot/gdt.c \
     src/core/smp.c \
@@ -428,11 +429,23 @@ INSTALL_TAR := build/install.tar
 $(GRUB_CORE): iso/early.cfg | build
 	grub-mkimage -O i386-pc -o $@ -p /boot/grub -c iso/early.cfg biosdisk fat multiboot
 
-$(INSTALL_TAR): $(KERNEL) $(GRUB_CORE)
+# core + efi image for samara-install (gpt disk, ext2 root labeled /)
+GRUB_GPT := build/grub-core-gpt.img
+GRUB_EFI := build/BOOTX64.EFI
+
+$(GRUB_GPT): iso/inst-bios.cfg | build
+	grub-mkimage -O i386-pc -o $@ -p /boot/grub -c iso/inst-bios.cfg biosdisk part_gpt ext2 multiboot search search_label
+
+$(GRUB_EFI): iso/inst-efi.cfg | build
+	grub-mkimage -O x86_64-efi -o $@ -p /boot/grub -c iso/inst-efi.cfg part_gpt ext2 fat multiboot2 search search_label all_video efi_gop efi_uga normal
+
+$(INSTALL_TAR): $(KERNEL) $(GRUB_CORE) $(GRUB_GPT) $(GRUB_EFI)
 	@mkdir -p build/instdir/boot/grub
 	cp $(KERNEL) build/instdir/boot/samara.elf
 	cp $(GRUB_CORE) build/instdir/boot/grub/core.img
 	cp /usr/lib/grub/i386-pc/boot.img build/instdir/boot/grub/boot.img
+	cp $(GRUB_GPT) build/instdir/boot/grub/core-gpt.img
+	cp $(GRUB_EFI) build/instdir/boot/grub/BOOTX64.EFI
 	tar --format=ustar --owner=0 --group=0 -C build/instdir -cf $@ boot
 
 $(ISO): $(KERNEL) $(INSTALL_TAR) iso/grub.cfg
@@ -450,6 +463,18 @@ run-iso: $(ISO)
 	@mkdir -p $(MUSIC_DIR)
 	$(QEMU) -cdrom $(ISO) -boot d -m 256 -vga std -serial stdio $(AUDIO) \
 	    -drive file=fat:$(MUSIC_DIR),format=raw,if=ide,index=3,snapshot=on $(NET_DRIVE)
+
+# same iso through OVMF (uefi): grub-efi -> multiboot2, framebuffer from gop.
+# OVMF_VARS is a scratch copy, nvram lives there
+OVMF_CODE ?= /usr/share/qemu/edk2-x86_64-code.fd
+OVMF_VARS ?= build/ovmf-vars.fd
+$(OVMF_VARS): | build
+	cp /usr/share/qemu/edk2-i386-vars.fd $@
+
+run-uefi: $(ISO) $(OVMF_VARS)
+	$(QEMU) $(ACCEL) -smp $(SMP) -m 1024 -vga std $(QDISPLAY) -serial stdio $(USB) $(NET_DRIVE) \
+	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) -drive if=pflash,format=raw,file=$(OVMF_VARS) \
+	    -cdrom $(ISO)
 
 # Installer test: ISO + an empty 512 MB ide disk (build/hd.img), then
 # `make run-hd` boots what got installed, no CD.
@@ -483,6 +508,7 @@ clean:
 	rm -rf build
 
 .PHONY: run-internet fm
+.PHONY: run-uefi
 .PHONY: all run run-doom run-sata run-debug iso run-iso run-install run-hd clean build compile_commands.json
 
 # header dependencies (gcc -MMD): editing a .h rebuilds who includes it

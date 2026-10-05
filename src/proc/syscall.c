@@ -23,6 +23,7 @@
 #include "boot/gdt.h"
 #include "boot/pit.h"
 #include "drivers/ata.h"
+#include "fs/part.h"
 #include "net/sock.h"
 #include "fs/fatfs.h"
 #include "fs/ext2.h"
@@ -274,6 +275,8 @@ static void fill_stat_node(kstat64_t* st, fs_node_t* n) {
         st->st_size = (int64_t)ata_drive_sectors(idx) * 512;
     } else if (n->dev == FS_DEV_SOCK) {
         st->st_mode = 0140000 | (n->mode & 07777);                 /* S_IFSOCK */
+    } else if (n->dev == FS_DEV_FIFO) {
+        st->st_mode = S_IFIFO | (n->mode & 07777);
     } else if (n->dev) {
         st->st_mode = S_IFCHR | (n->mode & 07777);
         st->st_rdev = n->dev == FS_DEV_TTY  ? (5u << 8) :
@@ -311,7 +314,11 @@ static void fill_stat_file(kstat64_t* st, file_t* f) {
     st->st_blksize = 4096;
     if (f->type == F_PIPE_R || f->type == F_PIPE_W) st->st_mode = S_IFIFO | 0600;
     else if (f->type == F_SOCKET || f->type == F_SPAIR || f->type == F_NETLINK || f->type == F_USOCK || f->type == F_ULISTEN) st->st_mode = 0140000 | 0777;          /* S_IFSOCK */
-    else {
+    else if (f->type == F_DISK) {
+        st->st_mode = 0060660;
+        st->st_rdev = (uint32_t)ata_rdev(f->disk);
+        st->st_size = (int64_t)ata_drive_sectors(f->disk) * 512;
+    } else {
         st->st_mode = S_IFCHR | 0666;
         /* input: major 13, minor 64+n like /dev/input/eventN. evdev compares
            st_rdev and threw the mouse out as a duplicate of the keyboard */
@@ -406,7 +413,13 @@ static int do_open(int dirfd, const char* path, int flags, int mode) {
     if (n->type == FS_DIR && (flags & O_ACCMODE) != 0) return -EISDIR;
     if (!n->dev && n->type == FS_FILE && ((flags & O_ACCMODE) || (flags & O_TRUNC)) && mnt_ro(n)) return -EROFS;
     if ((flags & O_TRUNC) && n->type == FS_FILE && !n->dev && (flags & O_ACCMODE)) { uint32_t os = n->size; node_truncate(n, 0); if (os) ino_node(n, 2); }
-    file_t* f = file_open_node(n, flags & ~(O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC));
+    file_t* f;
+    if (n->dev == FS_DEV_FIFO) {
+        int fr = fifo_open(n, flags & ~(O_CREAT | O_EXCL | O_TRUNC), &f);
+        if (fr < 0) return fr;
+        return install_fd(f, 0, (flags & O_CLOEXEC) != 0);
+    }
+    f = file_open_node(n, flags & ~(O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC));
     if (!f) return n->dev == FS_DEV_TTY ? -ENXIO : -ENOMEM;     // xterm dies on ENOMEM here
     ino_node(n, 0x20);
     return install_fd(f, 0, (flags & O_CLOEXEC) != 0);
@@ -461,7 +474,7 @@ static int64_t do_lseek(int fd, int64_t off, int whence) {
     }
     if (f->type == F_PMEM) { f->off = whence == 1 ? (int64_t)f->off + off : off; return f->off; }
     if (f->type != F_NODE && f->type != F_DISK) return f->type == F_NULL || f->type == F_ZERO ? 0 : -ESPIPE;
-    uint32_t end = f->type == F_DISK ? file_disk_size(f) : f->node->size;
+    uint64_t end = f->type == F_DISK ? file_disk_size(f) : f->node->size;
     int64_t base = whence == 0 ? 0 : whence == 1 ? (int64_t)f->off :
                    whence == 2 ? (int64_t)end : -1;
     if (base < 0) return -EINVAL;
@@ -821,10 +834,20 @@ static int do_ioctl(int fd, uint32_t req, uint64_t arg) {
         return -ENOTTY;
     }
     if (f->type == F_DISK) {
-        if (req == 0x1260) {                                  /* BLKGETSIZE (sectors) */
-            UCHK((void*)arg, 4); *(uint32_t*)arg = ata_drive_sectors(f->disk); return 0;
+        if (req == 0x125F) {                                  /* BLKRRPART, installer wrote a new table */
+            if (f->disk >= DISK_PART_BASE) return -EINVAL;
+            ata_part_clear(f->disk);
+            part_scan(f->disk);
+            fs_add_disk_nodes();
+            return 0;
         }
-        if (req == 0x80041272) {                              /* BLKGETSIZE64 */
+        if (req == 0x1260) {                                  /* BLKGETSIZE (sectors) */
+            UCHK((void*)arg, 8); *(uint64_t*)arg = ata_drive_sectors(f->disk); return 0;      // unsigned long
+        }
+        if (req == 0x125E || req == 0x1261) return 0;         /* BLKROGET, BLKFLSBUF */
+        if (req == 0x127B) { UCHK((void*)arg, 4); *(int*)arg = 512; return 0; }   /* BLKPBSZGET */
+        if (req == 0x1278 || req == 0x1279 || req == 0x127A) { UCHK((void*)arg, 4); *(int*)arg = 0; return 0; }   /* io min/opt, align */
+        if (req == 0x80041272 || req == 0x80081272) {                              /* BLKGETSIZE64 */
             UCHK((void*)arg, 8);
             uint64_t b = (uint64_t)ata_drive_sectors(f->disk) * 512;
             memcpy((void*)arg, &b, 8);
@@ -2494,7 +2517,7 @@ static int64_t dispatch(regs_t* r) {
         case 17: case 18: {                                          /* pread64/pwrite64 */
             file_t* fl = getf((int)a);
             if (!fl) return -EBADF;
-            if (fl->type != F_NODE && fl->type != F_PMEM) return -ESPIPE;
+            if (fl->type != F_NODE && fl->type != F_PMEM && fl->type != F_DISK) return -ESPIPE;
             uint64_t save = fl->off;
             fl->off = d;
             int res = r->rax == 17 ? do_read((int)a, (char*)b, c) : do_write((int)a, (const char*)b, c);
@@ -2506,7 +2529,7 @@ static int64_t dispatch(regs_t* r) {
             if (!fl) return -EBADF;
             bool w = r->rax == 296 || r->rax == 328;
             if (r->rax > 300 && (int64_t)d == -1) return do_rwv((int)a, (iovec_t*)b, (int)c, w);
-            if (fl->type != F_NODE) return -ESPIPE;
+            if (fl->type != F_NODE && fl->type != F_DISK) return -ESPIPE;
             uint64_t save = fl->off;
             fl->off = d;
             int64_t res = do_rwv((int)a, (iovec_t*)b, (int)c, w);
@@ -2541,7 +2564,24 @@ static int64_t dispatch(regs_t* r) {
         }
         case 86:  return do_link(AT_FDCWD, (const char*)a, AT_FDCWD, (const char*)b, 0);
         case 265: return do_link((int)a, (const char*)b, (int)c, (const char*)d, (int)e);
-        case 133: case 259: return -EPERM;                            /* mknod */
+        case 133: case 259: {                                         /* mknod: fifos only */
+            bool at = r->rax == 259;
+            const char* pt = (const char*)(at ? b : a);
+            int md = (int)(at ? c : b);
+            UCHK(pt, 1);
+            if ((md & 0170000) != 0010000) return -EPERM;
+            char name[FS_NAME_MAX];
+            fs_node_t* par = lookup_parent(at ? (int)a : AT_FDCWD, pt, name, &err);
+            if (!par) return err;
+            if (fs_child(par, name)) return -EEXIST;
+            if (mnt_ro(par)) return -EROFS;
+            if ((err = mnt_newnode(par)) < 0) return err;
+            fs_node_t* nn = fs_create(par, name, FS_FILE);
+            if (!nn) return -ENOMEM;
+            nn->dev = FS_DEV_FIFO;
+            nn->mode = (uint16_t)(md & ~me()->sh->umask & 0777);
+            return 0;
+        }
         case 87:  return do_unlink(AT_FDCWD, (const char*)a, 0);
         case 263: return do_unlink((int)a, (const char*)b, (int)c);
         case 84:  return do_unlink(AT_FDCWD, (const char*)a, AT_REMOVEDIR);
@@ -2568,7 +2608,7 @@ static int64_t dispatch(regs_t* r) {
             if (a) { UCHK((void*)a, 8); *(int64_t*)a = t; }
             return t;
         }
-        case 90: case 268:
+        case 90: case 268: case 452:
             UCHK((void*)(r->rax == 90 ? a : b), 1);
             n = r->rax == 90 ? lookup_peek(AT_FDCWD, (const char*)a, &err, true) : lookup_peek((int)a, (const char*)b, &err, true);
             if (!n) return err;
@@ -3348,7 +3388,7 @@ static bool changes_fs(uint64_t nr, uint64_t a) {
         }
         case 2: case 85: case 257: case 87: case 263: case 82: case 264: case 316:
         case 83: case 258: case 84: case 88: case 266: case 86: case 265:
-        case 76: case 90: case 268: case 132: case 235: case 280: case 326: case 275:
+        case 76: case 90: case 268: case 452: case 132: case 235: case 280: case 326: case 275:
             return true;
     }
     return false;

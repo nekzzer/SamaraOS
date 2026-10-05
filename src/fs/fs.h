@@ -34,7 +34,9 @@ typedef struct fs_node {
 enum { FS_DEV_NONE = 0, FS_DEV_NULL, FS_DEV_ZERO, FS_DEV_TTY, FS_DEV_RANDOM, FS_DEV_FB, FS_DEV_INPUT,
        FS_DEV_PTMX, FS_DEV_SOCK,       /* SOCK: a bound AF_UNIX path, /tmp/.X11-unix/X0 */
        FS_DEV_EVKBD, FS_DEV_EVMOUSE,
-       FS_DEV_DRM, FS_DEV_DRMR, FS_DEV_SNDC, FS_DEV_SNDP, FS_DEV_PMEM, FS_DEV_RTC };   /* /dev/dri/card0, renderD128 */   /* /dev/input-kbd, /dev/input-mouse: evdev for xorg */
+       FS_DEV_DRM, FS_DEV_DRMR, FS_DEV_SNDC, FS_DEV_SNDP,
+       FS_DEV_PMEM = 100, FS_DEV_RTC,  /* past the disk/pts/event ranges, they ran into FS_DEV_DISK */
+       FS_DEV_FIFO };                  /* mkfifo: data = the pipe_t while somebody has it open */
 #define FS_DEV_DISK 16                 /* FS_DEV_DISK + ata index: /dev/hda.. /dev/sda.. */
 #define FS_DEV_PTS  64                 /* FS_DEV_PTS + n: /dev/pts/n (pty slaves) */
 #define FS_DEV_EVENT 80                /* FS_DEV_EVENT + n: /dev/input/eventN */

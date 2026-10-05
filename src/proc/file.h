@@ -25,6 +25,7 @@ typedef struct pipe {
     struct file* fds[8];    /* SCM_RIGHTS in flight (unix sockets) */
     int  nfds;
     wq_t wq;
+    int  wopens;            /* fifo: writer opens so far, a blocked reader open waits for it to move */
     uint32_t wgen;          /* bumped on every write, io_uring multishot poll looks at it */
     spin_t lk;              /* buf, head/tail/count, readers/writers */
 } pipe_t;
@@ -74,10 +75,11 @@ bool    file_readable(file_t* f);
 bool    file_writable(file_t* f);
 
 int     pipe_create(file_t** rd, file_t** wr);
+int     fifo_open(fs_node_t* n, int flags, file_t** out);
 int     pipe_tee(file_t* a, file_t* b, uint32_t len);
 int     spair_create(file_t** a, file_t** b);
 int     spair_shutdown(file_t* f, int how);
-uint32_t file_disk_size(file_t* f);
+uint64_t file_disk_size(file_t* f);
 void    ux_release(file_t* f);                     /* syscall.c: unbind, drop the backlog */
 bool    ux_pending(file_t* f);                     /* a connection waits for accept() */
 
