@@ -2386,9 +2386,7 @@ static int64_t dispatch(regs_t* r) {
                 fl->node->size = b;
                 return 0;
             }
-            int tr = node_truncate(fl->node, b);
-            if (tr < 0) { klog("ftruncate fail "); klog_num(b); klog("\r\n"); }
-            return tr;
+            return node_truncate(fl->node, b);
         }
         case 137: {                                                  /* statfs */
             UCHK((void*)a, 1);
@@ -2477,7 +2475,14 @@ static int64_t dispatch(regs_t* r) {
         case 194: case 195: case 196: return 0;                      /* listxattr: empty (ls -l, cp -a, xbps) */
         case 197: case 198: case 199: return -95;                    /* removexattr */
         case 444: case 445: case 446: return -ENOSYS;                /* landlock, xz asks */
-        case 285: return -95;                                        /* fallocate, apk asks. EOPNOTSUPP and it just writes */
+        case 285: {                                                  /* fallocate */
+            file_t* fl = getf((int)a);
+            if (fl && fl->type == F_NODE && b == 0 && is_shm(fl->node)) {   /* xwayland posix_fallocate on memfd, musl has no fallback */
+                if (c + d > fl->node->size && node_truncate(fl->node, c + d) < 0) return -ENOMEM;
+                return 0;
+            }
+            return -95;                                              /* apk asks. EOPNOTSUPP and it just writes */
+        }
         // membarrier, rseq: not here yet. glib/qemu fall back
         // to pipes and poll on ENOSYS, so just say no without spamming the log
         case 332: return sys_statx((int)a, (const char*)b, (int)c, (uint32_t)d, (void*)e);

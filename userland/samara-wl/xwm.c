@@ -1,5 +1,6 @@
 #include "swl.h"
 #include <xcb/xcb.h>
+#include <xcb/composite.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/eventfd.h>
@@ -170,7 +171,7 @@ static void ev_configure_request(xcb_configure_request_event_t *e) {
 static void ev_client_message(xcb_client_message_event_t *e) {
     if (e->type != a_surf) return;
     struct wl_resource *r = wl_client_get_object(xcl, e->data.data32[0]);
-    if (!r || !wl_resource_instance_of(r, &wl_surface_interface, NULL)) return;
+    if (!r || strcmp(wl_resource_get_class(r), "wl_surface")) return;
     struct surf *s = wl_resource_get_user_data(r);
     struct xw *w = xw_find(e->window);
     if (!w) return;
@@ -195,7 +196,12 @@ static int xwm_readable(int fd, uint32_t mask, void *d) {
         switch (e->response_type & 0x7f) {
         case XCB_CREATE_NOTIFY: {
             xcb_create_notify_event_t *c = (void *)e;
-            if (c->parent == root) xw_new(c->window, c->override_redirect, c->x, c->y, c->width, c->height);
+            if (c->parent == root) {
+                uint32_t m = XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_FOCUS_CHANGE;
+                xw_new(c->window, c->override_redirect, c->x, c->y, c->width, c->height);
+                xcb_change_window_attributes(xc, c->window, XCB_CW_EVENT_MASK, &m);
+                xcb_flush(xc);
+            }
             break;
         }
         case XCB_DESTROY_NOTIFY: {
@@ -207,6 +213,7 @@ static int xwm_readable(int fd, uint32_t mask, void *d) {
             xcb_map_request_event_t *m = (void *)e;
             struct xw *w = xw_find(m->window);
             if (w) w->mapped = true;
+            xcb_composite_redirect_window(xc, m->window, XCB_COMPOSITE_REDIRECT_MANUAL);
             xcb_map_window(xc, m->window);
             xcb_flush(xc);
             break;
@@ -269,6 +276,7 @@ static int conn_done(int fd, uint32_t mask, void *d) {
     xcb_void_cookie_t ck = xcb_change_window_attributes_checked(xc, root, XCB_CW_EVENT_MASK, &em);
     xcb_generic_error_t *er = xcb_request_check(xc, ck);
     if (er) { fprintf(stderr, "samara-wl: another wm on the x server?\n"); free(er); return 0; }
+    xcb_composite_redirect_subwindows(xc, root, XCB_COMPOSITE_REDIRECT_MANUAL);   /* without it rootless xwayland never makes surfaces */
     wmwin = xcb_generate_id(xc);
     xcb_create_window(xc, 0, wmwin, root, 0, 0, 1, 1, 0, XCB_WINDOW_CLASS_INPUT_ONLY, XCB_COPY_FROM_PARENT, 0, NULL);
     xcb_change_property(xc, XCB_PROP_MODE_REPLACE, root, a_check, XCB_ATOM_WINDOW, 32, 1, &wmwin);
