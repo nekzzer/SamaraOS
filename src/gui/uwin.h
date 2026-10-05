@@ -18,6 +18,7 @@ enum {
     SM_OP_MOUSE,         /* ecx = handle, edx = int[3] x,y,buttons -> 1 if inside */
     SM_OP_TITLE,         /* ecx = handle, edx = title                           */
     SM_OP_FONT_H,        /* ecx = font                       -> line height      */
+    SM_OP_SCREEN,        /*                                  -> screen w<<16|h   */
 };
 
 enum { SM_EV_NONE, SM_EV_KEY, SM_EV_MOUSE_DOWN, SM_EV_MOUSE_UP, SM_EV_MOUSE_MOVE, SM_EV_CLOSE,

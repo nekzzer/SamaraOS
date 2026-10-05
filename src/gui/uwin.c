@@ -468,6 +468,7 @@ static int32_t op_event(uwin_t* u, uint64_t ev, int32_t timeout) {
 int32_t uwin_syscall(uint32_t op, uint64_t a, uint64_t b, uint64_t c) {
     if (op == SM_OP_OPEN) return op_open(a);
     if (op == SM_OP_FONT_H) return uif_height_any((int)a);
+    if (op == SM_OP_SCREEN) return (gfx_w() << 16) | gfx_h();
     if (op == SM_OP_TEXT) {
         if (!uok(a, sizeof(sm_text_t))) return -EFAULT;
         sm_text_t t = *(const sm_text_t*)a;
