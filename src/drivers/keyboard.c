@@ -79,6 +79,7 @@ static bool is_ignored(uint8_t sc) {
 }
 
 static volatile bool     ru_layout = false;
+static volatile int      hot_mode, lock_count, prtsc_count;   // hot_mode 1: ctrl+shift
 static volatile uint32_t ru_epoch  = 0;
 static volatile uint32_t f11_count = 0;     /* F11 presses: the WM toggles fullscreen */
 
@@ -145,6 +146,7 @@ static void kbd_byte(uint8_t sc) {
         ext = false;
         if (!released) {
             switch (sc) {
+                case 0x37: prtsc_count++; break;
                 case 0x48: buf_push((char)K_UP); break;
                 case 0x50: buf_push((char)K_DOWN); break;
                 case 0x4B: buf_push((char)K_LEFT); break;
@@ -167,9 +169,11 @@ static void kbd_byte(uint8_t sc) {
     switch (sc) {
         /* Alt+Shift (either order) toggles RU/EN, fired on the second key. */
         case 0x2A: case 0x36:
-            if (!released && !shift && alt) { ru_layout = !ru_layout; ru_epoch++; }
+            if (!released && !shift && (hot_mode ? ctrl : alt)) { ru_layout = !ru_layout; ru_epoch++; }
             shift = !released; return;
-        case 0x1D: ctrl  = !released; return;
+        case 0x1D:
+            if (!released && !ctrl && hot_mode && shift) { ru_layout = !ru_layout; ru_epoch++; }
+            ctrl  = !released; return;
         case 0x38:
             if (!released && !alt && shift) { ru_layout = !ru_layout; ru_epoch++; }
             alt   = !released; return;
@@ -177,6 +181,9 @@ static void kbd_byte(uint8_t sc) {
     }
 
     if (released) { return; }
+
+    // super+l, keybits is already updated above
+    if (sc == 0x26 && ((keybits[125 >> 3] >> (125 & 7)) & 1 || (keybits[126 >> 3] >> (126 & 7)) & 1)) { lock_count++; return; }
 
     if (sc >= 0x3B && sc <= 0x44) {
         buf_push((char)(K_F1 + (sc - 0x3B)));
@@ -248,6 +255,9 @@ void kbd_feed_key(uint16_t lk, bool down) {
         case 96: sc = 0x1C; break;
         case 98: sc = 0x35; break;
         case 127: sc = 0x5D; break;
+        case 125: sc = 0x5B; break;
+        case 126: sc = 0x5C; break;
+        case 99: sc = 0x37; break;
         default: x = false; if (lk && lk < 0x59) sc = lk;
     }
     if (!sc) return;
@@ -279,6 +289,10 @@ char kbd_getc(void) {
 }
 
 bool     kbd_is_ru(void)         { return ru_layout; }
+void     kbd_set_hotkey(int m)   { hot_mode = m; }
+int      kbd_hotkey(void)        { return hot_mode; }
+int      kbd_lock_take(void)     { int n = lock_count; lock_count = 0; return n; }
+int      kbd_prtsc_take(void)    { int n = prtsc_count; prtsc_count = 0; return n; }
 void     kbd_set_ru(bool ru)     { if (ru != ru_layout) { ru_layout = ru; ru_epoch++; } }
 uint32_t kbd_layout_epoch(void)  { return ru_epoch; }
 

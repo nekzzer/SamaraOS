@@ -23,6 +23,10 @@ char kbd_getc(void);          /* blocking */
 char kbd_trygetc(void);       /* non-blocking, 0 if empty */
 bool kbd_is_ru(void);         /* current layout: true = RU (ЙЦУКЕН), false = EN */
 void kbd_set_ru(bool ru);
+void kbd_set_hotkey(int m);   /* 0 alt+shift, 1 ctrl+shift */
+int  kbd_hotkey(void);
+int  kbd_lock_take(void);     /* super+l presses since last call */
+int  kbd_prtsc_take(void);
 /* Monotonically increases on every RU/EN toggle — callers (the WM) sample
    this each frame to know they should redraw the layout indicator. */
 uint32_t kbd_layout_epoch(void);

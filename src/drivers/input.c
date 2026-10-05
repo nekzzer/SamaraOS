@@ -86,6 +86,9 @@ uint16_t input_linux_key(uint8_t sc, bool ext) {
         case 0x38: return 100;  /* right alt */
         case 0x1C: return 96;   /* keypad enter */
         case 0x35: return 98;   /* keypad slash */
+        case 0x5B: return 125;  /* left super */
+        case 0x5C: return 126;
+        case 0x37: return 99;   /* printscreen */
     }
     return 0;
 }
