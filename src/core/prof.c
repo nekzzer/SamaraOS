@@ -1,6 +1,8 @@
 #include "core/prof.h"
 #include "core/string.h"
 #include "core/smp.h"
+#include "core/heap.h"
+#include "core/io.h"
 
 int prof_on, prof_gen;
 uint64_t pf_anon, pf_cow, pf_file, pf_kern, tlb_ipis, tlb_rounds, uwin_bytes, bkl_wait, bkl_takes, bkl_slow;
@@ -40,6 +42,13 @@ void prof_cmd(const char* s, uint32_t n) {
     prof_gen++;
     if (n >= 5 && !strncmp(s, "start", 5)) prof_on = 1;
     else if (n >= 4 && !strncmp(s, "stop", 4)) prof_on = 0;
+    else if (n >= 4 && !strncmp(s, "dump", 4)) {        // straight to COM1, for detached stuff
+        char* b = kmalloc(300000);
+        if (!b) return;
+        int l = prof_dump(b, 300000);
+        for (int i = 0; i < l; i++) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, b[i]); }
+        kfree(b);
+    }
     else if (n >= 5 && !strncmp(s, "reset", 5)) {
         memset(ktab, 0, sizeof(ktab));
         memset(utab, 0, sizeof(utab));

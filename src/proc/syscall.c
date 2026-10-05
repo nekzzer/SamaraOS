@@ -360,7 +360,7 @@ static int do_open(int dirfd, const char* path, int flags, int mode) {
     if (n->type == FS_DIR && (flags & O_ACCMODE) != 0) return -EISDIR;
     if ((flags & O_TRUNC) && n->type == FS_FILE && !n->dev && (flags & O_ACCMODE)) node_truncate(n, 0);
     file_t* f = file_open_node(n, flags & ~(O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC));
-    if (!f) return -ENOMEM;
+    if (!f) return n->dev == FS_DEV_TTY ? -ENXIO : -ENOMEM;     // xterm dies on ENOMEM here
     return install_fd(f, 0, (flags & O_CLOEXEC) != 0);
 }
 
@@ -2786,6 +2786,9 @@ void syscall_dispatch(regs_t* r) {
     }
     int64_t ret;
     uint64_t t0 = prof_tsc();
+    if (g_ftrace && nr == 59 && ustr_ok((const char*)r->rdi)) {
+        klog("[x] "); klog_num(pit_uptime_ms()); klog(" exec "); klog((const char*)r->rdi); klog("\r\n");
+    }
     proc_t* pc = proc_current();
     if (pc && !setjmp((void*)pc->ujb)) {
         pc->ujb_on = true;
