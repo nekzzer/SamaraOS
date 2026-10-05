@@ -756,6 +756,26 @@ static int do_ioctl(int fd, uint32_t req, uint64_t arg) {
         *(int*)arg = n;
         return 0;
     }
+    if (f->type == F_DRM && (req & 0xffff) == 0x642d) {            /* prime handle -> fd */
+        UCHK((void*)arg, 12);
+        uint32_t* pa = (uint32_t*)arg;
+        struct drm_fd* nd = drm_prime_export(f->drm, pa[0]);
+        if (!nd) return -ENOENT;
+        file_t* nf = file_new(F_DRM, 2);
+        if (!nf) { drm_close(nd); return -ENOMEM; }
+        nf->drm = nd; nf->disk = 1;
+        int fd = install_fd(nf, 0, (pa[1] & 02000000) != 0);
+        if (fd < 0) return fd;
+        pa[2] = (uint32_t)fd;
+        return 0;
+    }
+    if (f->type == F_DRM && (req & 0xffff) == 0x642e) {            /* prime fd -> handle */
+        UCHK((void*)arg, 12);
+        uint32_t* pa = (uint32_t*)arg;
+        file_t* sf = getf((int)pa[2]);
+        if (!sf || sf->type != F_DRM) return -EBADF;
+        return drm_prime_import(f->drm, sf->drm, &pa[0]);
+    }
     if (f->type == F_DRM) return drm_ioctl(f->drm, req, (void*)arg);
     if (f->type == F_SND) {
         uint32_t len = (req >> 16) & 0x3FFF;
