@@ -3196,7 +3196,7 @@ int64_t syscall_nobkl(regs_t* r) {
     if (!p || g_strace || g_ftrace || p->alarm_at || p->tracer) return NB_SLOW;
     int64_t ret;
     if (setjmp((void*)p->ujb)) {
-        proc_current()->ujb_on = false;
+        p->ujb_on = false;
         return -EFAULT;
     }
     p->ujb_on = true;
@@ -3272,7 +3272,7 @@ int64_t syscall_nobkl(regs_t* r) {
             break;
         default: ret = NB_SLOW;
     }
-    proc_current()->ujb_on = false;
+    p->ujb_on = false;      /* proc_current() can be NULL here when the kill got us mid syscall */
     return ret;
 }
 
