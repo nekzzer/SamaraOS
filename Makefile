@@ -195,7 +195,7 @@ USERLAND_BINS := userland/busybox userland/busybox.applets userland/sysroot.tar 
 USERLAND_OBJS := $(addsuffix .bin.o,$(USERLAND_BINS))
 # fm is a static x86_64 musl binary, committed like busybox. `make fm` rebuilds it
 # from userland/samara/ against musl-devel from void: XBPS_ARCH=x86_64-musl xbps-install -S -r $(MUSL64) -R <void repo>/current/musl musl-devel
-MUSL64 ?= /tmp/int-x64sdk
+MUSL64 ?= toolchain/x64sdk
 fm:
 	gcc -O2 -s -w -static -nostdinc -isystem $$(gcc -print-file-name=include) -isystem $(MUSL64)/usr/include -nostdlib \
 	    -fno-stack-protector -fno-pie -no-pie -Iuserland/samara -o userland/fm \
