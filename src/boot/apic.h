@@ -14,6 +14,7 @@ extern int hpet_on;
 void apic_init(void);                  /* bsp: lapic, ioapic, pic off */
 void apic_cpu_init(void);              /* every cpu, after its gdt/idt */
 void apic_timer_start(void);           /* this cpu, 1 kHz */
+void apic_timer_oneshot(uint32_t us);  /* this cpu, tickless idle */
 void lapic_eoi(void);
 int  lapic_id(void);
 void lapic_ipi(int apic_id, int vec);

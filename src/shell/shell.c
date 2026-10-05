@@ -162,7 +162,7 @@ static char console_getc(int *py) {
     int dz = mouse_wheel_take();
     if (dz && vga_is_gfx())
       gfx_term_view_scroll(-dz * 3);
-    cpu_wait();
+    cpu_wait_to(20);
   }
 }
 

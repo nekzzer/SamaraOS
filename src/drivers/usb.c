@@ -37,6 +37,7 @@ static char status[48] = "no uhci";
 
 // mouse state
 static int m_addr, m_ep, m_ls, m_len, m_tog, m_port = -1;
+static uint32_t m_last;
 #define itd (&tds[23])
 
 void slog(const char* s) {
@@ -213,9 +214,10 @@ static void usb_task(void) {
                 m_tog ^= 1;
                 arm();
                 mouse_feed(dx, -dy, dz, b);
+                m_last = pit_uptime_ms();
             }
         }
-        task_sleep_ms(4);
+        task_sleep_ms(pit_uptime_ms() - m_last > 1000 ? 16 : 4);
     }
 }
 

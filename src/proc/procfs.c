@@ -292,6 +292,8 @@ static void fill_globals(char* mem, uint32_t cap) {
         sb_num(&b, i2); sb_puts(&b, " 0 0 0 0 0 0\n");
     }
     sb_puts(&b, "intr "); sb_num(&b, pit_ticks());
+    sb_puts(&b, "\ntmr");
+    for (int k = 0; k < ncpu; k++) { sb_putc(&b, ' '); sb_num(&b, cpus[k].n_tmr); sb_putc(&b, '/'); sb_num(&b, cpus[k].n_one); }
     sb_puts(&b, "\nctxt "); sb_num(&b, cpu_ctxt);
     sb_puts(&b, "\nbtime "); sb_num(&b, clock_epoch() - pit_uptime_ms() / 1000);
     sb_puts(&b, "\nprocesses "); sb_int(&b, last);

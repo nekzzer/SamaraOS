@@ -24,6 +24,7 @@ bool net_ifinfo(int i, const char** name, const uint8_t** mac, uint32_t* ip, uin
 
 /* Pump RX: dispatch ARP, ICMP, TCP. Call this in any loop that waits. */
 void net_poll(void);
+uint32_t net_rx_gen(void);              /* bumped when a packet came in, netd backs off when quiet */
 
 /* ICMP echo. Returns round-trip ms (0..timeout), -1 on timeout. */
 int  net_ping(uint32_t ip, uint32_t timeout_ms);

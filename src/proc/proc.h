@@ -155,6 +155,7 @@ int     proc_sigaltstack(const uint64_t* ss, uint64_t* old, uint64_t rsp);
 void    proc_check_alarm(proc_t* p, bool from_irq);   /* fire SIGALRM when due */
 void    proc_account_tick(proc_t* p, bool user);
 void    proc_timers_tick(uint32_t now);
+uint32_t proc_next_timer(uint32_t now);
 int64_t sys_timer(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d);
 
 /* ptrace.c */

@@ -274,7 +274,7 @@ char kbd_trygetc(void) {
 
 char kbd_getc(void) {
     char c = 0;
-    while (!buf_pop(&c)) cpu_wait();
+    while (!buf_pop(&c)) cpu_wait_to(20);
     return c;
 }
 

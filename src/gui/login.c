@@ -1,4 +1,5 @@
 #include "boot/acpi.h"
+#include "boot/pit.h"
 #include "gui/login.h"
 #include "gui/theme.h"
 #include "gui/wm.h"
@@ -256,7 +257,7 @@ static char wait_key(void) {
     for (;;) {
         if (kbd_has_key()) return kbd_trygetc();
         draw_clock(false);
-        task_yield();
+        task_yield_until(pit_uptime_ms() + 10);
     }
 }
 

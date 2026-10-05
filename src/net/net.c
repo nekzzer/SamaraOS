@@ -579,6 +579,9 @@ static void on_ipv4(const uint8_t* pkt, int len) {
     }
 }
 
+static volatile uint32_t rx_gen;
+uint32_t net_rx_gen(void) { return rx_gen; }
+
 void net_poll(void) {
     uint32_t irq = irq_save();
     uint8_t buf[PKT_BUF];                  /* on the stack: net_poll can nest via ARP */
@@ -614,7 +617,7 @@ void net_poll(void) {
         }
     ip6_poll();
     if (npkt_socks) sock_pkt_flush();
-    if (got) io_wake();
+    if (got) { rx_gen++; io_wake(); }
     irq_restore(irq);
 }
 

@@ -37,6 +37,9 @@ struct cpu {
     volatile uint32_t unload;   /* leave the address space you have, it is going away */
     uint32_t t_user, t_sys, t_idle;
     int dr_on;
+    int oneshot;           /* lapic timer is in one-shot mode (tickless idle) */
+    uint64_t idle_us;      /* when the one-shot sleep began */
+    uint32_t n_tmr, n_one; /* timer irqs, one-shot sleeps (/proc/stat tmr) */
 };
 extern struct cpu cpus[MAX_CPUS];
 extern int ncpu;                        /* started */

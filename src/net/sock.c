@@ -1138,9 +1138,12 @@ static void ser(const char* m) { while (*m) { while (!(inb(0x3F8 + 5) & 0x20)) {
 static void netd(void) {
     net_init();                                        /* NIC may be absent: loopback still works */
     ser("samara: "); ser(net_status()); ser("\r\n");
+    uint32_t idle = 0, last = 0;
     for (;;) {
         pump();
-        task_sleep_ms(2);
+        uint32_t g = net_rx_gen();
+        if (g != last) { last = g; idle = 0; } else idle++;
+        task_sleep_ms(idle < 500 ? 2 : 10);          // quiet for a second: poll less, the cpu can sleep
     }
 }
 

@@ -184,3 +184,11 @@ void apic_timer_start(void) {
     lwr(0x320, VEC_TIMER | 0x20000);          /* periodic */
     lwr(0x380, lapic_khz);                    /* 1 kHz */
 }
+
+/* idle cpu: wake me in us microseconds instead of every ms */
+void apic_timer_oneshot(uint32_t us) {
+    lwr(0x3E0, 3);
+    lwr(0x320, VEC_TIMER);
+    uint64_t n = (uint64_t)lapic_khz * us / 1000;
+    lwr(0x380, n ? (uint32_t)n : 1);
+}

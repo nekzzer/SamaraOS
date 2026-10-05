@@ -1972,7 +1972,7 @@ void wm_run(void) {
 
     while (!exit_requested) {
         uint32_t due = t0 + frame * FRAME_NUM / FRAME_DEN;
-        while ((int32_t)(pit_uptime_ms() - due) < 0) task_yield();   /* lets user programs run */
+        while ((int32_t)(pit_uptime_ms() - due) < 0) task_yield_until(due);   /* lets user programs run */
         uint32_t now = pit_uptime_ms();
         frame++;
         if ((int32_t)(now - due) > 100) { t0 = now; frame = 1; }   /* fell behind: resync */

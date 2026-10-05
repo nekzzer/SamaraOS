@@ -67,6 +67,39 @@ void task_ready(task_t* t) {
     kick_idle();
 }
 
+static int has_mwait;                   /* cpuid says monitor/mwait with irq break */
+int idle_mode;                          /* 0 hlt, 1 mwait (for /proc) */
+static int tickless = 1;
+
+static void idle_cpuid(void) {
+    uint32_t a, b, c, d;
+    __asm__ volatile ("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+    if (!(c & 8)) return;
+    __asm__ volatile ("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(5), "c"(0));
+    if ((c & 3) == 3) has_mwait = idle_mode = 1;      // ext + irq as break event
+}
+
+static void timer_periodic(struct cpu* c) {
+    c->oneshot = 0;
+    apic_timer_start();
+}
+
+/* how long this cpu can sleep without a tick, 0 = don't bother */
+static uint32_t idle_ms(void) {
+    uint32_t now = pit_uptime_ms();
+    int32_t best = 50;
+    for (int i = 0; i < n_tasks; i++) {
+        task_t* t = &tasks[i];
+        if (t->state == T_BLOCKED && t->wake_ms) {
+            int32_t d = (int32_t)(t->wake_ms - now);
+            if (d < best) best = d;
+        }
+    }
+    uint32_t pt = proc_next_timer(now);
+    if (pt < (uint32_t)best) best = pt;
+    return best < 2 ? 0 : (uint32_t)best;
+}
+
 /* sti; hlt, but the other cpus get the kernel meanwhile. when an irq
    switched us away and later back we already hold it again */
 void cpu_wait(void) {
@@ -74,8 +107,28 @@ void cpu_wait(void) {
     struct cpu* c = this_cpu();
     c->in_idle = 1;
     if (c->bkl) bkl_drop(c);
-    __asm__ volatile ("sti; hlt; cli" : : : "memory");
+    uint32_t ms = 0;
+    // only the real idle task: a task that yields in a loop waits for the next tick
+    uint32_t cap = c->cur->hint;
+    c->cur->hint = 0;
+    if (tickless && apic_on && tsc_khz && (c->cur == c->idle || cap || c->cur->state == T_BLOCKED) && !prof_on && (ms = idle_ms())) {
+        if (cap && cap < ms) ms = cap;
+        c->oneshot = 1;
+        c->n_one++;
+        c->idle_us = tsc_us();
+        apic_timer_oneshot(ms * 1000);
+    }
+    if (has_mwait) {
+        __asm__ volatile ("monitor" : : "a"(&c->in_idle), "c"(0), "d"(0));
+        __asm__ volatile ("sti; mwait; cli" : : "a"(0), "c"(0) : "memory");
+    } else
+        __asm__ volatile ("sti; hlt; cli" : : : "memory");
     c = this_cpu();
+    if (c->oneshot) {
+        uint32_t el = (uint32_t)((tsc_us() - c->idle_us) / 1000);
+        if (el > 1) c->t_idle += el - 1;
+        timer_periodic(c);
+    }
     c->in_idle = 0;
     if (!c->bkl) bkl_take(c);
     /* killed from another cpu while we waited: never go on with it */
@@ -226,6 +279,7 @@ static regs_t* switch_to(struct cpu* c, task_t* next, regs_t* saved) {
     c->prev = prev;                 // on_cpu goes away in isr_leave, when we are off its stack
     c->cur = next;
     c->in_idle = 0;
+    if (c->oneshot && next != c->idle) timer_periodic(c);
     next->on_cpu = 1;
     next->cpu = c->id;
     if (next->fpu) __asm__ volatile ("fxrstor64 (%0)" : : "r"(next->fpu) : "memory");
@@ -269,6 +323,12 @@ regs_t* task_reap(regs_t* f) { return finish(this_cpu(), f); }
 /* lapic timer, every cpu */
 static regs_t* schedule(regs_t* saved) {
     struct cpu* c = this_cpu();
+    c->n_tmr++;
+    if (c->oneshot) {
+        uint32_t el = (uint32_t)((tsc_us() - c->idle_us) / 1000);
+        if (el > 1) c->t_idle += el - 1;
+        timer_periodic(c);
+    }
     pic_send_eoi(0);
     if (!c->id) {
         pit_tick_inc();
@@ -359,6 +419,23 @@ void task_yield(void) {
     irq_restore(f);
 }
 
+void cpu_wait_to(uint32_t ms) {
+    uint64_t f = irq_save();
+    task_current()->hint = ms;
+    cpu_wait();
+    irq_restore(f);
+}
+
+void task_yield_until(uint32_t t) {
+    uint64_t f = irq_save();
+    task_t* me = task_current();
+    int32_t d = (int32_t)(t - pit_uptime_ms());
+    if (d > 1) me->hint = d;
+    task_yield();
+    me->hint = 0;
+    irq_restore(f);
+}
+
 void task_yield_fast(void) {
     uint64_t f = irq_save();
     __asm__ volatile ("int $0x81" : : : "memory");
@@ -418,6 +495,10 @@ void task_init(void) {
     memset(tasks, 0, sizeof(tasks));
     kernel_cr3 = paging_cr3();
     cpus[0].cr3 = kernel_cr3;
+    idle_cpuid();
+    extern const char* kernel_cmdline(void);
+    if (strstr(kernel_cmdline(), "notickless")) tickless = 0;
+    if (strstr(kernel_cmdline(), "nomwait")) has_mwait = idle_mode = 0;
 
     fpu_clean = align16(fpu_clean_raw);
     __asm__ volatile ("fninit");

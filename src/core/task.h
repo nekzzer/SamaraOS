@@ -38,6 +38,7 @@ typedef struct task {
     uint64_t      vrt;         /* virtual runtime, lowest goes first */
     uint8_t       policy;      /* 0 other, 1 fifo, 2 rr, 3 batch, 5 idle */
     uint8_t       rtprio;      /* fifo/rr priority 1..99 */
+    uint32_t      hint;        /* ms this task may sleep without a tick the next time it idles */
 } task_t;
 
 /* Frame built by every entry path (isr stubs, syscall_entry, see boot/entry.S),
@@ -67,6 +68,8 @@ void  io_wake(void);                /* something readable/writable/closed happen
 task_t* task_current(void);
 void  task_ready(task_t* t);        /* blocked -> ready, wakes a parked cpu */
 regs_t* task_reap(regs_t* f);        /* dead task in ring 3: send the cpu elsewhere */
+void  cpu_wait_to(uint32_t ms);     /* same, but an irq or ms later wakes us, no 1 kHz tick needed */
+void  task_yield_until(uint32_t t); /* yield loop that only needs to run again at uptime t (or when something happens) */
 void  cpu_wait(void);               /* sti; hlt without holding the big lock */
 void  task_ap_start(int id);        /* an ap becomes its cpu's idle task */
 void  task_dump(void (*emit)(const char*));

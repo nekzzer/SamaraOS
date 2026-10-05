@@ -65,6 +65,22 @@ void proc_timers_tick(uint32_t now) {
     }
 }
 
+/* ms until the first alarm / posix timer fires, for the tickless idle */
+uint32_t proc_next_timer(uint32_t now) {
+    int32_t best = 0x7fffffff;
+    for (int i = 0; i < proc_count(); i++) {
+        proc_t* p = proc_at(i);
+        if (!p || p->state != P_ALIVE) continue;
+        if (p->alarm_at && (int32_t)(p->alarm_at - now) < best) best = (int32_t)(p->alarm_at - now);
+        if (p->is_thread) continue;
+        for (int k = 0; k < 16; k++) {
+            struct ptimer* t = &p->sh->tm[k];
+            if (t->used && t->armed && (int32_t)(t->at - now) < best) best = (int32_t)(t->at - now);
+        }
+    }
+    return best < 0 ? 0 : (uint32_t)best;
+}
+
 /* cpu time itimers, called every tick for the running process */
 void proc_cpu_timers(proc_t* p, bool user) {
     if (user && p->itv_at && --p->itv_at == 0) {
