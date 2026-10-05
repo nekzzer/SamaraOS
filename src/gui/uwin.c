@@ -12,15 +12,20 @@
 #include "core/string.h"
 #include "core/task.h"
 #include "core/vmm.h"
+#include "core/prof.h"
 #include "drivers/keyboard.h"
 #include "drivers/mouse.h"
 #include "proc/proc.h"
 #include "boot/pit.h"
+#include "core/io.h"
 
 #define UWIN_MAX   8
 #define EVQ        128
 #define MAX_PIXELS (1600 * 1000)
 
+extern bool g_ftrace;
+static void com_str(const char* s) { while (*s) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, *s++); } }
+static void com_num(uint32_t v) { char b[12]; utoa(v, b, 10); com_str(b); }
 enum { U_FREE, U_PENDING, U_OPEN, U_CLOSING, U_FAILED };
 
 /* Text the program drew into its window buffer, kept as text: the WM draws
@@ -49,6 +54,7 @@ typedef struct {
     sm_event_t q[EVQ];
     volatile int qh, qt;
     bool pressed;
+    bool shown;
     int hover_x, hover_y;
     uint32_t* row;                   /* scaled-row scratch */
     int row_cap;                     /* pixels in row */
@@ -432,6 +438,7 @@ static int32_t op_open(uint64_t a) {
     u->flags = o.flags;
     u->hover_x = u->hover_y = -1;
     if (!o.title || !ustr(o.title, u->title, sizeof(u->title))) strcpy(u->title, p->name);
+    u->shown = false;
     u->cap = o.w * o.h;
     if (o.flags & SM_F_RESIZE) u->cap = gfx_w() * gfx_h();
     u->pix = (uint32_t*)kmalloc((size_t)u->cap * 4);
@@ -500,6 +507,11 @@ int32_t uwin_syscall(uint32_t op, uint64_t a, uint64_t b, uint64_t c) {
         if (c && (c >> 16 != (uint32_t)u->w || (c & 0xFFFF) != (uint32_t)u->h)) return 0;   /* stale size after a resize */
         if (!uok(b, (uint32_t)u->w * u->h * 4)) return -EFAULT;
         memcpy(u->pix, (const void*)b, (size_t)u->w * u->h * 4);
+        uwin_bytes += (uint64_t)u->w * u->h * 4;
+        if (g_ftrace && !u->shown) {
+            u->shown = true;
+            com_str("[uw] "); com_num(pit_uptime_ms()); com_str(" first frame "); com_str(u->title); com_str("\r\n");
+        }
         if (u->buf == b) {                    /* frame's text goes live with its pixels */
             int nx = 1 - u->ovl_cur;
             memcpy(u->ovl[nx], u->ovl_next, (size_t)u->n_next * sizeof(ovl_t));

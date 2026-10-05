@@ -7,6 +7,7 @@
 #include "core/vmm.h"
 #include "fs/fs.h"
 #include "boot/pit.h"
+#include "core/wq.h"
 
 #define EIO      5
 #define ENXIO    6
@@ -35,6 +36,7 @@ typedef struct {
     uint16_t   rows, cols;
     int        pgrp, sid;          /* foreground job / session of the slave */
     fs_node_t* node;               /* /dev/pts/N */
+    wq_t       wq;
 } pty_t;
 
 static pty_t ptys[NPTY];
@@ -204,6 +206,7 @@ void pty_master_close(int i) {
         p->mrefs = 0;
         signal_fg(p, 1);                                 /* SIGHUP: the line is gone */
         if (p->sid) proc_signal_group(p->sid, 1);
+        wq_wake(&p->wq);
     }
     release(p, i);
 }
@@ -228,7 +231,7 @@ void pty_slave_close(int i) {
     pty_t* p = get(i);
     if (!p) return;
     if (--p->srefs < 0) p->srefs = 0;
-    if (p->srefs == 0) { p->sid = 0; p->pgrp = 0; }
+    if (p->srefs == 0) { p->sid = 0; p->pgrp = 0; wq_wake(&p->wq); }
     release(p, i);
 }
 
@@ -239,6 +242,8 @@ static bool slave_input_ready(pty_t* p) {
     if (p->in.n > 0) return true;
     return (p->tio.c_lflag & TTY_ICANON) && p->eof > 0;
 }
+
+wq_t* pty_wq(int i) { pty_t* p = get(i); return p ? &p->wq : NULL; }
 
 bool pty_readable(int i, bool master) {
     pty_t* p = get(i);
@@ -262,6 +267,7 @@ int pty_read(int i, bool master, char* buf, int n, bool nonblock) {
     pty_t* p = get(i);
     if (!p) return -EIO;
     if (n <= 0) return 0;
+    WQ_W(w);
     if (master) {
         for (;;) {
             uint32_t f = irq_save();
@@ -269,13 +275,14 @@ int pty_read(int i, bool master, char* buf, int n, bool nonblock) {
                 int k = 0;
                 while (k < n && p->out.n > 0) buf[k++] = ring_get(&p->out);
                 irq_restore(f);
+                wq_wake(&p->wq);
                 return k;
             }
             irq_restore(f);
             if (p->slave_seen && p->srefs <= 0) return -EIO;   /* shell gone */
             if (nonblock) return -EAGAIN;
             if (proc_interrupted()) return -EINTR;
-            task_sleep_ms(2);
+            wq_wait(&p->wq, &w, 0);
         }
     }
     /* slave */
@@ -291,6 +298,7 @@ int pty_read(int i, bool master, char* buf, int n, bool nonblock) {
                 if (canon && c == '\n') break;           /* one line per read */
             }
             irq_restore(f);
+            wq_wake(&p->wq);
             return k;
         }
         if (canon && p->eof > 0) { p->eof--; irq_restore(f); return 0; }
@@ -302,7 +310,7 @@ int pty_read(int i, bool master, char* buf, int n, bool nonblock) {
             if (pit_uptime_ms() - start >= tmo) return 0;
         }
         if (proc_interrupted()) return -EINTR;
-        task_sleep_ms(2);                                 /* idle shells used to spin here */
+        wq_wait(&p->wq, &w, !canon && p->tio.c_cc[VMIN] == 0 ? 50 : 0);
     }
 }
 
@@ -310,6 +318,7 @@ int pty_write(int i, bool master, const char* buf, int n, bool nonblock) {
     pty_t* p = get(i);
     if (!p) return -EIO;
     int done = 0;
+    WQ_W(w);
     while (done < n) {
         uint32_t f = irq_save();
         if (master) {
@@ -323,11 +332,13 @@ int pty_write(int i, bool master, const char* buf, int n, bool nonblock) {
             while (done < n && ring_space(&p->out) > 2) out_char(p, buf[done++]);
         }
         irq_restore(f);
+        wq_wake(&p->wq);
         if (done == n) break;
         if (nonblock) return done ? done : -EAGAIN;
         if (proc_interrupted()) return done ? done : -EINTR;
-        task_yield();
+        wq_wait(&p->wq, &w, 0);
     }
+    io_wake();
     return done;
 }
 

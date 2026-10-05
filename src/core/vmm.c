@@ -10,6 +10,10 @@
 /* refcnt per frame, indexed by pfn. 0xFF = not ours (kernel, holes, mmio) */
 static uint8_t* refcnt;
 static uint64_t max_pfn, pool_frames, pool_free, hint;
+static spin_t pl;
+/* page tables of one address space, hashed by pd. never nested */
+static spin_t mml[16];
+#define MML(pd) (&mml[((pd) >> 12) & 15])
 
 void pmm_init(uint64_t top) {
     max_pfn = top >> 12;
@@ -32,7 +36,7 @@ uint64_t pmm_free_frames(void)  { return pool_free; }
 uint64_t pmm_total_frames(void) { return pool_frames; }
 
 uint64_t pmm_alloc(void) {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&pl);
     uint64_t frame = 0;
     for (uint64_t n = 0; n < max_pfn; n++) {
         uint64_t i = (hint + n) % max_pfn;
@@ -43,14 +47,14 @@ uint64_t pmm_alloc(void) {
         frame = i << 12;
         break;
     }
-    irq_restore(f);
+    spin_unlock(&pl, f);
     if (frame) memset(P2V(frame), 0, PAGE_SIZE);
     return frame;
 }
 
 /* n frames in a row (io_uring rings want one flat kernel view of them) */
 uint64_t pmm_alloc_run(uint64_t n) {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock(&pl);
     uint64_t base = 0;
     for (uint64_t i = 0, run = 0; i < max_pfn; i++) {
         run = refcnt[i] ? 0 : run + 1;
@@ -61,7 +65,7 @@ uint64_t pmm_alloc_run(uint64_t n) {
         base = s << 12;
         break;
     }
-    irq_restore(f);
+    spin_unlock(&pl, f);
     if (base) memset(P2V(base), 0, n * PAGE_SIZE);
     return base;
 }
@@ -73,14 +77,15 @@ static bool ours(uint64_t frame) {
 
 /* 254 is sticky: stays, never freed (too many forks of one page) */
 void pmm_ref(uint64_t frame) {
+    uint64_t f = spin_lock(&pl);
     if (ours(frame) && refcnt[frame >> 12] < 254) refcnt[frame >> 12]++;
+    spin_unlock(&pl, f);
 }
 
 void pmm_unref(uint64_t frame) {
-    if (!ours(frame) || !refcnt[frame >> 12] || refcnt[frame >> 12] == 254) return;
-    uint64_t f = irq_save();
-    if (--refcnt[frame >> 12] == 0) pool_free++;
-    irq_restore(f);
+    uint64_t f = spin_lock(&pl);
+    if (ours(frame) && refcnt[frame >> 12] && refcnt[frame >> 12] != 254 && --refcnt[frame >> 12] == 0) pool_free++;
+    spin_unlock(&pl, f);
 }
 
 /* ---------------- page tables ---------------- */
@@ -97,17 +102,27 @@ static uint64_t* pte_slot(uint64_t pd, uint64_t va, bool create);
 
 /* every change of a live leaf pte goes through here. other cpus may hold the old pte
    (threads of one process), so they get a shootdown too. range loops batch it: sd_defer */
-static int sd_defer, sd_need;
+static int sd_defer[MAX_CPUS], sd_need[MAX_CPUS];
+static uint64_t sd_pd[MAX_CPUS];       /* space the locked section works on */
+#define SD_DEFER sd_defer[this_cpu()->id]
+#define SD_NEED sd_need[this_cpu()->id]
+#define SD_PD sd_pd[this_cpu()->id]
 
 static void tlb_inval(uint64_t va) {
     __asm__ volatile ("invlpg (%0)" : : "r"(va) : "memory");
     if (ncpu < 2) return;
-    if (sd_defer) sd_need = 1;
-    else tlb_shootdown();
+    if (SD_DEFER) SD_NEED = 1;
+    else tlb_shootdown_pd(SD_PD);
+}
+
+static uint64_t MMLOCK(uint64_t pd) {
+    uint64_t f = spin_lock(MML(pd));
+    SD_PD = pd;
+    return f;
 }
 
 static void sd_end(void) {
-    if (--sd_defer == 0 && sd_need) { sd_need = 0; tlb_shootdown(); }
+    if (--SD_DEFER == 0 && SD_NEED) { SD_NEED = 0; tlb_shootdown_pd(SD_PD); }
 }
 
 /* not present before: nobody can have it cached */
@@ -127,7 +142,7 @@ static void make_writable(uint64_t* p, uint64_t va) {
         pte_put(p, va, (e & ~PTE_COW) | PTE_RW);
 }
 
-bool vmm_cow(uint64_t pd, uint64_t va) {
+static bool vmm_cow_nl(uint64_t pd, uint64_t va) {
     va &= ~(PAGE_SIZE - 1);
     uint64_t* p = pte_slot(pd, va, false);
     if (!p || !(*p & PTE_P) || !(*p & PTE_COW)) return false;
@@ -142,6 +157,13 @@ bool vmm_cow(uint64_t pd, uint64_t va) {
     }
     pte_put(p, va, (e & ~PTE_COW) | PTE_RW);
     return true;
+}
+
+bool vmm_cow(uint64_t pd, uint64_t va) {
+    uint64_t f = MMLOCK(pd);
+    bool r = vmm_cow_nl(pd, va);
+    spin_unlock(MML(pd), f);
+    return r;
 }
 
 uint64_t vmm_new_space(void) {
@@ -177,10 +199,10 @@ uint64_t vmm_pte(uint64_t pd, uint64_t va) {
     return p ? *p : 0;
 }
 
-int vmm_alloc_range(uint64_t pd, uint64_t va, uint64_t len, bool writable) {
+static int vmm_alloc_range_nl(uint64_t pd, uint64_t va, uint64_t len, bool writable) {
     uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     int ret = 0;
-    sd_defer++;
+    SD_DEFER++;
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
         if (!uaddr(a)) { ret = -1; break; }
         uint64_t* p = pte_slot(pd, a, true);
@@ -197,9 +219,16 @@ int vmm_alloc_range(uint64_t pd, uint64_t va, uint64_t len, bool writable) {
     return ret;
 }
 
-void vmm_set_writable(uint64_t pd, uint64_t va, uint64_t len, bool writable) {
+int vmm_alloc_range(uint64_t pd, uint64_t va, uint64_t len, bool writable) {
+    uint64_t f = MMLOCK(pd);
+    int r = vmm_alloc_range_nl(pd, va, len, writable);
+    spin_unlock(MML(pd), f);
+    return r;
+}
+
+static void vmm_set_writable_nl(uint64_t pd, uint64_t va, uint64_t len, bool writable) {
     uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    sd_defer++;
+    SD_DEFER++;
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
         uint64_t* p = pte_slot(pd, a, false);
         if (!p || !(*p & (PTE_P | PTE_LAZY))) continue;
@@ -210,7 +239,13 @@ void vmm_set_writable(uint64_t pd, uint64_t va, uint64_t len, bool writable) {
     sd_end();
 }
 
-int vmm_map_frame(uint64_t pd, uint64_t va, uint64_t fr, bool rw) {
+void vmm_set_writable(uint64_t pd, uint64_t va, uint64_t len, bool writable) {
+    uint64_t f = MMLOCK(pd);
+    vmm_set_writable_nl(pd, va, len, writable);
+    spin_unlock(MML(pd), f);
+}
+
+static int vmm_map_frame_nl(uint64_t pd, uint64_t va, uint64_t fr, bool rw) {
     uint64_t* p = pte_slot(pd, va, true);
     if (!p) return -1;
     pmm_ref(fr);
@@ -219,13 +254,20 @@ int vmm_map_frame(uint64_t pd, uint64_t va, uint64_t fr, bool rw) {
     return 0;
 }
 
+int vmm_map_frame(uint64_t pd, uint64_t va, uint64_t fr, bool rw) {
+    uint64_t f = MMLOCK(pd);
+    int r = vmm_map_frame_nl(pd, va, fr, rw);
+    spin_unlock(MML(pd), f);
+    return r;
+}
+
 /* java reserves hundreds of MB (heap, metaspace, thread stacks, code cache)
    and touches a fraction. every byte of it used to be a real frame up
    front: minecraft ran the box out of memory while making the world */
-int vmm_lazy_range(uint64_t pd, uint64_t va, uint64_t len, bool rw, bool user) {
+static int vmm_lazy_range_nl(uint64_t pd, uint64_t va, uint64_t len, bool rw, bool user) {
     uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     int ret = 0;
-    sd_defer++;
+    SD_DEFER++;
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
         if (!uaddr(a)) { ret = -1; break; }
         uint64_t* p = pte_slot(pd, a, true);
@@ -237,7 +279,14 @@ int vmm_lazy_range(uint64_t pd, uint64_t va, uint64_t len, bool rw, bool user) {
     return ret;
 }
 
-bool vmm_fault_in(uint64_t pd, uint64_t va) {
+int vmm_lazy_range(uint64_t pd, uint64_t va, uint64_t len, bool rw, bool user) {
+    uint64_t f = MMLOCK(pd);
+    int r = vmm_lazy_range_nl(pd, va, len, rw, user);
+    spin_unlock(MML(pd), f);
+    return r;
+}
+
+static bool vmm_fault_in_nl(uint64_t pd, uint64_t va) {
     uint64_t* p = pte_slot(pd, va & ~(PAGE_SIZE - 1), false);
     if (!p) return false;
     uint64_t old = *p;
@@ -250,10 +299,17 @@ bool vmm_fault_in(uint64_t pd, uint64_t va) {
     return true;
 }
 
+bool vmm_fault_in(uint64_t pd, uint64_t va) {
+    uint64_t f = MMLOCK(pd);
+    bool r = vmm_fault_in_nl(pd, va);
+    spin_unlock(MML(pd), f);
+    return r;
+}
+
 // PROT_NONE = present but supervisor only, so user access faults
-void vmm_set_user(uint64_t pd, uint64_t va, uint64_t len, bool user) {
+static void vmm_set_user_nl(uint64_t pd, uint64_t va, uint64_t len, bool user) {
     uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    sd_defer++;
+    SD_DEFER++;
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
         uint64_t* p = pte_slot(pd, a, false);
         if (!p || !(*p & (PTE_P | PTE_LAZY))) continue;
@@ -262,9 +318,15 @@ void vmm_set_user(uint64_t pd, uint64_t va, uint64_t len, bool user) {
     sd_end();
 }
 
-void vmm_free_range(uint64_t pd, uint64_t va, uint64_t len) {
+void vmm_set_user(uint64_t pd, uint64_t va, uint64_t len, bool user) {
+    uint64_t f = MMLOCK(pd);
+    vmm_set_user_nl(pd, va, len, user);
+    spin_unlock(MML(pd), f);
+}
+
+static void vmm_free_range_nl(uint64_t pd, uint64_t va, uint64_t len) {
     uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    sd_defer++;
+    SD_DEFER++;
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
         if (!uaddr(a)) continue;
         uint64_t* p = pte_slot(pd, a, false);
@@ -273,6 +335,12 @@ void vmm_free_range(uint64_t pd, uint64_t va, uint64_t len) {
         pte_put(p, a, 0);
     }
     sd_end();
+}
+
+void vmm_free_range(uint64_t pd, uint64_t va, uint64_t len) {
+    uint64_t f = MMLOCK(pd);
+    vmm_free_range_nl(pd, va, len);
+    spin_unlock(MML(pd), f);
 }
 
 bool vmm_range_unmapped(uint64_t pd, uint64_t va, uint64_t len) {
@@ -317,6 +385,17 @@ uint64_t vmm_find_free(uint64_t pd, uint64_t from, uint64_t limit, uint64_t len)
         if (run >= len) return start;
     }
     return 0;
+}
+
+/* anon mmap for the threads that mmap at once: find the hole and claim it under one lock */
+uint64_t vmm_map_anon(uint64_t pd, uint64_t addr, bool fixed, uint64_t lo, uint64_t hi, uint64_t len, bool rw, bool user) {
+    uint64_t f = MMLOCK(pd);
+    if (fixed) vmm_free_range_nl(pd, addr, len);
+    else if (!(addr && !(addr & 0xFFF) && addr >= lo && addr + len <= hi && vmm_range_unmapped(pd, addr, len)))
+        addr = vmm_find_free(pd, lo, hi, len);
+    if (addr && vmm_lazy_range_nl(pd, addr, len, rw, user) < 0) { vmm_free_range_nl(pd, addr, len); addr = 0; }
+    spin_unlock(MML(pd), f);
+    return addr;
 }
 
 static void free_tables(uint64_t tbl, int lvl) {
@@ -373,7 +452,8 @@ uint64_t vmm_clone_space(uint64_t pd) {
     if (!npd) return 0;
     uint64_t* s = (uint64_t*)P2V(pd);
     uint64_t* d = (uint64_t*)P2V(npd);
-    sd_defer++;
+    uint64_t fl = MMLOCK(pd);
+    SD_DEFER++;
     for (int i = 0; i < 256; i++) {
         if (!(s[i] & PTE_P)) continue;
         uint64_t n = pmm_alloc();
@@ -382,9 +462,11 @@ uint64_t vmm_clone_space(uint64_t pd) {
         if (!clone_level(s[i] & PTE_ADDR, n, 2, (uint64_t)i << 39)) goto fail;
     }
     sd_end();      /* siblings of the parent on other cpus must not write through a stale RW */
+    spin_unlock(MML(pd), fl);
     return npd;
 fail:
     sd_end();
+    spin_unlock(MML(pd), fl);
     vmm_destroy_space(npd);
     return 0;
 }

@@ -5,6 +5,7 @@
 #include "boot/pic.h"
 #include "boot/apic.h"
 #include "core/smp.h"
+#include "core/prof.h"
 #include "core/io.h"
 #include "boot/gdt.h"
 #include "boot/paging.h"
@@ -250,6 +251,10 @@ static regs_t* schedule(regs_t* saved) {
         else if (user) c->t_user++;
         else c->t_sys++;
         if (cur->proc && !c->in_idle) proc_account_tick(cur->proc, user);
+        if (prof_on) {
+            if (ncpu < 2) prof_sample(saved->rip, user, c->in_idle || cur == c->idle, cur->proc ? cur->proc->name : "?");
+            else for (int i = 0; i < ncpu; i++) if (i != c->id) lapic_ipi_raw(cpus[i].apic_id, 0x4400);
+        }
     }
 
     /* 1 kHz tick, 10 ms time slice. A task that is no longer runnable gives
@@ -302,6 +307,12 @@ void task_yield(void) {
     irq_restore(f);
 }
 
+void task_yield_fast(void) {
+    uint64_t f = irq_save();
+    __asm__ volatile ("int $0x81" : : : "memory");
+    irq_restore(f);
+}
+
 void task_sleep_ms(uint32_t ms) {
     uint32_t f = irq_save();
     task_t* t = task_current();
@@ -312,6 +323,32 @@ void task_sleep_ms(uint32_t ms) {
     } else {
         task_yield();
     }
+    irq_restore(f);
+}
+
+// poll/pipe/pty/socket waiters sleep here instead of 1ms naps or yield spins.
+// the ms is only for things nobody calls io_wake for (nic rx, timers, input irqs)
+void task_wait_io(uint32_t ms) {
+    uint32_t f = irq_save();
+    task_t* t = task_current();
+    if (t->id != 0) {
+        t->io_wait = 1;
+        t->wake_ms = pit_uptime_ms() + (ms ? ms : 1);
+        t->state = T_BLOCKED;
+        while (t->state == T_BLOCKED) task_yield();
+        t->io_wait = 0;
+    } else {
+        task_yield();
+    }
+    irq_restore(f);
+}
+
+void io_wake(void) {
+    uint32_t f = irq_save();
+    int woke = 0;
+    for (int i = 0; i < n_tasks; i++)
+        if (tasks[i].io_wait && tasks[i].state == T_BLOCKED) { tasks[i].wake_ms = 0; tasks[i].state = T_READY; woke++; }
+    if (woke) kick_idle();
     irq_restore(f);
 }
 
@@ -382,9 +419,28 @@ void task_ap_start(int id) {
 }
 
 void syscall_dispatch(regs_t* r);
+int64_t syscall_nobkl(regs_t* r);
+extern uint8_t nobkl_tab[512];
 void syscall_enter(regs_t* r) {
     struct cpu* c = this_cpu();
-    bkl_take(c);
+    uint64_t nr = r->rax;
+    if (nr < 512 && nobkl_tab[nr] && c->cur->state != T_DEAD) {
+        task_t* t = c->cur;
+        t->nobkl = 1;
+        int64_t ret = syscall_nobkl(r);
+        t->nobkl = 0;
+        if (ret != NB_SLOW) {
+            r->rax = (uint64_t)ret;
+            if (t->proc && proc_signal_deliverable(t->proc)) {
+                if (!this_cpu()->bkl) bkl_take(this_cpu());
+                proc_deliver_signal(r, (int)nr, (int32_t)ret);
+            }
+            return;
+        }
+        r->rax = nr;
+    }
+    c = this_cpu();
+    if (!c->bkl) bkl_take(c);
     /* killed from another cpu while it was in ring 3: it never does anything again */
     while (c->cur->state == T_DEAD) { task_yield(); c = this_cpu(); }
     syscall_dispatch(r);

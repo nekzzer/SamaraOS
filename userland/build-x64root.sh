@@ -46,8 +46,11 @@ printf 'SamaraOS\n' > etc/issue
 # wayland side of the desktop (userland/samara-wl/build.sh)
 [ -x $ROOT/build/samara-wl ] && install -m755 $ROOT/build/samara-wl usr/bin/samara-wl
 
-# the kernel fs has no hard links: every link becomes its own file
-find . -type f -links +1 | while read f; do cp -p "$f" "$f.hl" && mv "$f.hl" "$f"; done
+# fontconfig cache, else every font app scans all fonts at start (works in userns chroot, musl binary)
+chroot $D /usr/bin/fc-cache -f 2>/dev/null || echo "fc-cache failed, skipped"
+# xkbcomp output cache for Xwayland, must be writable
+mkdir -p var/lib/xkb
+chmod 1777 var/lib/xkb
 
 rm -f $IMG
 truncate -s $SIZE $IMG

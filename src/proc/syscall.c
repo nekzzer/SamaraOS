@@ -26,6 +26,7 @@
 #include "net/net.h"
 #include "drivers/drm.h"
 #include "proc/uring.h"
+#include "core/prof.h"
 
 #define EPERM 1
 #define ENOENT 2
@@ -35,11 +36,13 @@
 #define ECHILD 10
 #define EAGAIN 11
 #define ENOMEM 12
+#define ENXIO 6
 #define EACCES 13
 #define EFAULT 14
 #define EBUSY 16
 #define EEXIST 17
 #define EXDEV 18
+#define EMLINK 31
 #define ENOTDIR 20
 #define EISDIR 21
 #define EINVAL 22
@@ -97,6 +100,7 @@ static bool uok(const void* p, uint64_t len) {
     return true;
 }
 bool user_ok(const void* p, uint32_t len) { return uok(p, len); }
+#define UCHK2(p, n) do { if (!uok((p), (n))) { proc_current()->ujb_on = false; return -EFAULT; } } while (0)
 #define UCHK(p, n) do { if (!uok((p), (n))) return -EFAULT; } while (0)
 
 /* user string: walk it page by page till the NUL */
@@ -112,6 +116,27 @@ static bool ustr_ok(const char* s) {
 /* ---------------- fds + paths ---------------- */
 
 static proc_t* me(void) { return proc_current(); }
+
+/* slot changes (close, dup2) and the nobkl lookups, so a file can't die between
+   the lookup and the ref */
+static spin_t fdl;
+
+static file_t* getf_ref(int fd) {
+    if (fd < 0 || fd >= MAX_FDS) return NULL;
+    uint64_t fl = spin_lock(&fdl);
+    file_t* f = proc_current()->sh->fds[fd];
+    file_ref(f);
+    spin_unlock(&fdl, fl);
+    return f;
+}
+
+static file_t* fd_swap(int fd, file_t* nf) {
+    uint64_t fl = spin_lock(&fdl);
+    file_t* old = me()->sh->fds[fd];
+    me()->sh->fds[fd] = nf;
+    spin_unlock(&fdl, fl);
+    return old;
+}
 
 static file_t* getf(int fd) {
     if (fd < 0 || fd >= MAX_FDS) return NULL;
@@ -181,6 +206,19 @@ static fs_node_t* lookup_peek(int dirfd, const char* path, int* err, bool follow
     return n;
 }
 
+/* the name itself: a hard link name is not followed to its node */
+static fs_node_t* lookup_dent(int dirfd, const char* path, int* err) {
+    *err = -ENOENT;
+    if (!ustr_ok(path)) { *err = -EFAULT; return NULL; }
+    if (!path[0]) return NULL;
+    fs_node_t* base = dir_base(dirfd, path, err);
+    if (!base) return NULL;
+    maybe_refresh_proc(base, path);
+    fs_node_t* n = fs_peek_d(base, path);
+    if (!n) *err = -ENOENT;
+    return n;
+}
+
 /* Split "a/b/c/" into parent node of "c" and the name "c". */
 static fs_node_t* lookup_parent(int dirfd, const char* path, char* name, int* err) {
     char tmp[256];
@@ -222,7 +260,7 @@ static void fill_stat_node(kstat64_t* st, fs_node_t* n) {
     int vol = fatfs_owner(n);
     st->st_dev = vol ? (8u << 8) | (uint32_t)vol : 1;            /* distinct per volume (df) */
     st->st_ino = ((uint64_t)n >> 4) & 0x0FFFFFFF;
-    st->st_nlink = n->type == FS_DIR ? 2 : 1;
+    st->st_nlink = n->type == FS_DIR ? 2 : n->unlinked ? 0 : 1 + n->xl;
     if (FS_DEV_IS_DISK(n->dev)) {
         int idx = n->dev - FS_DEV_DISK;
         st->st_mode = 0060000 | (n->mode & 07777);            /* S_IFBLK */
@@ -359,7 +397,7 @@ static int do_open(int dirfd, const char* path, int flags, int mode) {
     if (n->type == FS_DIR && (flags & O_ACCMODE) != 0) return -EISDIR;
     if ((flags & O_TRUNC) && n->type == FS_FILE && !n->dev && (flags & O_ACCMODE)) node_truncate(n, 0);
     file_t* f = file_open_node(n, flags & ~(O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC));
-    if (!f) return -ENOMEM;
+    if (!f) return n->dev == FS_DEV_TTY ? -ENXIO : -ENOMEM;     // xterm dies on ENOMEM here
     return install_fd(f, 0, (flags & O_CLOEXEC) != 0);
 }
 
@@ -376,6 +414,7 @@ static int do_write(int fd, const char* buf, uint64_t n) {
     if (!f) return -EBADF;
     if ((f->flags & O_ACCMODE) == 0 && f->type == F_NODE) return -EBADF;
     UCHK(buf, n);
+    if (f->type == F_NODE && !strcmp(f->node->name, "prof")) { prof_cmd(buf, n); return n; }
     return file_write(f, buf, n);
 }
 
@@ -461,7 +500,7 @@ static int do_getdents64(int fd, uint8_t* buf, uint64_t n) {
         else if (idx == 1) { name = ".."; node = dir->parent ? dir->parent : dir; }
         else {
             if (!c) break;
-            name = c->name; node = c; c = c->next;
+            name = c->name; node = c->hl ? c->hl : c; c = c->next;
         }
         if (idx < f->off) continue;
         uint32_t nl = strlen(name);
@@ -488,7 +527,7 @@ static void shm_drop(fs_node_t* n);
 static int do_unlink(int dirfd, const char* path, int flags) {
     UCHK(path, 1);
     int err;
-    fs_node_t* n = lookup_peek(dirfd, path, &err, false);
+    fs_node_t* n = lookup_dent(dirfd, path, &err);
     if (!n) return err;
     if (flags & AT_REMOVEDIR) {
         if (n->type != FS_DIR) return -ENOTDIR;
@@ -503,10 +542,8 @@ static int do_unlink(int dirfd, const char* path, int flags) {
     }
     fs_node_t* parent = n->parent;
     if (!parent) return -EBUSY;
-    if (is_shm(n)) shm_drop(n);       // mappings keep their own refs
-    fs_detach(n);
-    if (n->refs > 0) n->unlinked = true;
-    else { fs_data_free(n); kfree(n); }
+    if (is_shm(n) && !n->xl && !n->hl) shm_drop(n);       // mappings keep their own refs
+    fs_drop_name(n);
     return 0;
 }
 
@@ -531,16 +568,18 @@ static bool is_ancestor(fs_node_t* a, fs_node_t* n) {
 static int do_rename(int ofd, const char* from, int nfd, const char* to) {
     UCHK(from, 1); UCHK(to, 1);
     int err;
-    fs_node_t* src = lookup_peek(ofd, from, &err, false);
+    fs_node_t* src = lookup_dent(ofd, from, &err);
     if (!src) return err;
     char name[FS_NAME_MAX];
     fs_node_t* parent = lookup_parent(nfd, to, name, &err);
     if (!parent) return err;
+    if ((src->hl || src->xl) && fs_owner(src->parent) != fs_owner(parent)) return -EXDEV;
     // to another volume: lazy ext2 files have to come along in memory, fat sync reads ->data
     if (fs_owner(src->parent) != fs_owner(parent)) fs_need_tree(src);
     if (src->type == FS_DIR && is_ancestor(src, parent)) return -EINVAL;
     fs_node_t* dst = fs_child(parent, name);
     if (dst == src) return 0;
+    if (dst && (dst->hl ? dst->hl : dst) == (src->hl ? src->hl : src)) return 0;   /* two names of one file */
     if (dst) {
         if (dst->type == FS_DIR && src->type != FS_DIR) return -EISDIR;
         if (dst->type != FS_DIR && src->type == FS_DIR) return -ENOTDIR;
@@ -556,25 +595,28 @@ static int do_rename(int ofd, const char* from, int nfd, const char* to) {
     return 0;
 }
 
-/* no real hard links, a node has one parent. so link = copy. apk wants it for
-   terminfo (vt220 -> vt220-am and co), nobody here cares the inode differs */
 static int do_link(int ofd, const char* from, int nfd, const char* to, int flags) {
     UCHK(from, 1); UCHK(to, 1);
     int err;
-    fs_node_t* src = lookup_ex(ofd, from, &err, (flags & 0x400) != 0);   /* AT_SYMLINK_FOLLOW */
+    fs_node_t* src;
+    if ((flags & 0x1000) && !from[0]) {                        /* AT_EMPTY_PATH: the fd itself */
+        file_t* f = getf(ofd);
+        if (!f) return -EBADF;
+        if (f->type != F_NODE) return -ENOENT;
+        src = f->node;
+    } else src = lookup_peek(ofd, from, &err, (flags & 0x400) != 0);   /* AT_SYMLINK_FOLLOW */
     if (!src) return err;
     if (src->type == FS_DIR) return -EPERM;
+    if (src->dev || src->unlinked) return src->unlinked ? -ENOENT : -EPERM;
     char name[FS_NAME_MAX];
     fs_node_t* par = lookup_parent(nfd, to, name, &err);
     if (!par) return err;
     if (fs_child(par, name)) return -EEXIST;
-    if (src->type == FS_LINK) return fs_symlink(par, name, src->data) ? 0 : -ENOMEM;
-    fs_node_t* n = fs_create(par, name, FS_FILE);
-    if (!n) return -ENOMEM;
-    if (src->size && fs_write(n, src->data, src->size) < 0) return -ENOMEM;
-    n->mode = src->mode;
-    n->dev = src->dev;
-    return 0;
+    fs_node_t* ow = fs_owner(src);
+    if (ow != fs_owner(par)) return -EXDEV;
+    if (ow->mount_id && ow->mount_id < 8) return -EPERM;       /* fat */
+    if (src->xl > 60000) return -EMLINK;
+    return fs_hlink(src, par, name) < 0 ? -ENOMEM : 0;
 }
 
 static int do_access(int dirfd, const char* path) {
@@ -595,9 +637,9 @@ static int do_dup2(int fd, int nfd, bool cloexec) {
     if (!f) return -EBADF;
     if (nfd < 0 || nfd >= MAX_FDS) return -EBADF;
     if (fd == nfd) return nfd;
-    if (me()->sh->fds[nfd]) file_close(me()->sh->fds[nfd]);
     file_ref(f);
-    me()->sh->fds[nfd] = f;
+    file_t* old = fd_swap(nfd, f);
+    if (old) { flk_close(me()->sh, old); file_close(old); }
     me()->sh->cloexec[nfd] = cloexec;
     return nfd;
 }
@@ -612,8 +654,9 @@ static int do_fcntl(int fd, int cmd, uint64_t arg) {
         case 2:    me()->sh->cloexec[fd] = arg & 1; return 0;       /* F_SETFD */
         case 3:    return f->flags;                              /* F_GETFL */
         case 4:    f->flags = (f->flags & O_ACCMODE) | (int)(arg & (O_APPEND | O_NONBLOCK)); return 0;
-        case 5: case 6: case 7: case 12: case 13: case 14:       /* locks: always granted */
-            return 0;
+        case 5: case 6: case 7: case 12: case 13: case 14: case 36: case 37: case 38:   /* record locks, ofd */
+            UCHK((void*)arg, 32);
+            return flk_fcntl(f, cmd, (uint8_t*)arg);
     }
     return -EINVAL;
 }
@@ -1059,10 +1102,30 @@ static int poll_once(pollfd_t* fds, uint64_t n) {
     return ready;
 }
 
+int file_wqs(file_t* f, wq_t** v);
+
+/* queue the waiter on whatever wakes us for f. 1 = nothing to wait on, tick along */
+static int wait_arm(file_t* f, wq_w_t* w) {
+    if (f->type == F_SOCKET) return sock_wq_add(f->sock, w) ? 0 : 1;
+    wq_t* v[2];
+    int n = file_wqs(f, v);
+    if (n < 0) return 1;
+    for (int i = 0; i < n; i++) if (!wq_add(v[i], w)) return 1;
+    return 0;
+}
+
+/* ms until an armed timerfd fires, 0 = not one. timers don't have a queue */
+static uint32_t timer_ms(file_t* f) {
+    if (f->type != F_TIMERFD || !f->t_next) return 0;
+    int32_t d = (int32_t)(f->t_next - pit_uptime_ms());
+    return d > 0 ? (uint32_t)d : 1;
+}
+
 /* epoll on top of the same readiness checks, level triggered (EPOLLET is
    taken as level, good enough so far). xorg's ospoll has no poll fallback */
 typedef struct ep {
     int n, cap;
+    uint32_t gen;
     struct { int fd; file_t* f; uint32_t ev; uint32_t d0, d1; } it[];
 } ep_t;
 
@@ -1094,6 +1157,8 @@ static int do_epoll_ctl(int epfd, int op, int fd, uint32_t* uev) {
     ep_t* e = f->ep;
     int i = 0;
     while (i < e->n && !(e->it[i].fd == fd && e->it[i].f == x)) i++;
+    e->gen++;
+    wq_wake(&f->wq);
     if (op == 2) {                                                /* DEL */
         if (i == e->n) return -ENOENT;
         e->it[i] = e->it[--e->n];
@@ -1126,8 +1191,12 @@ static int do_epoll_wait(int epfd, uint32_t* out, int max, int timeout_ms) {
     if (f->type != F_EPOLL || max <= 0) return -EINVAL;
     UCHK(out, (uint32_t)max * 12);
     uint32_t start = pit_uptime_ms();
+    WQ_W(w);
+    bool armed = false;
+    int unk = 0;
+    uint32_t gen = 0;
     for (;;) {
-        net_poll();
+        sock_pump();
         ep_t* e = f->ep;
         int got = 0;
         for (int i = 0; i < e->n && got < max; i++) {
@@ -1144,9 +1213,30 @@ static int do_epoll_wait(int epfd, uint32_t* out, int max, int timeout_ms) {
             if (want & (1u << 30)) e->it[i].ev = 1u << 30;        /* EPOLLONESHOT: off until MOD */
         }
         if (got || timeout_ms == 0) return got;
-        if (timeout_ms > 0 && pit_uptime_ms() - start >= (uint32_t)timeout_ms) return 0;
+        uint32_t el = pit_uptime_ms() - start;
+        if (timeout_ms > 0 && el >= (uint32_t)timeout_ms) return 0;
         if (proc_interrupted()) return -EINTR;
-        task_sleep_ms(1);
+        if (armed && gen != e->gen) { wq_waiter_free(w); w = NULL; armed = false; }
+        if (!armed) {
+            armed = true;
+            gen = e->gen;
+            unk = 0;
+            w = wq_waiter();
+            if (!w) unk = 1;
+            else {
+                if (!wq_add(&f->wq, w)) unk = 1;
+                for (int i = 0; i < e->n; i++) unk |= wait_arm(e->it[i].f, w);
+            }
+            continue;
+        }
+        uint32_t ms = timeout_ms > 0 ? (uint32_t)timeout_ms - el : 0;
+        for (int i = 0; i < e->n; i++) {
+            uint32_t t = timer_ms(e->it[i].f);
+            if (t && (!ms || t < ms)) ms = t;
+        }
+        if (unk) ms = 1;
+        if (w) wq_sleep(w, ms);
+        else task_sleep_ms(1);
     }
 }
 
@@ -1154,12 +1244,35 @@ static int do_poll(pollfd_t* fds, uint64_t n, int timeout_ms) {
     if (n > MAX_FDS * 2) return -EINVAL;
     UCHK(fds, n * sizeof(pollfd_t));
     uint32_t start = pit_uptime_ms();
+    WQ_W(w);
+    bool armed = false;
+    int unk = 0;
     for (;;) {
-        net_poll();
+        sock_pump();
         int r = poll_once(fds, n);
         if (r || timeout_ms == 0) return r;
-        if (timeout_ms > 0 && pit_uptime_ms() - start >= (uint32_t)timeout_ms) return 0;
-        task_sleep_ms(1);
+        uint32_t el = pit_uptime_ms() - start;
+        if (timeout_ms > 0 && el >= (uint32_t)timeout_ms) return 0;
+        if (proc_interrupted()) return -EINTR;
+        if (!armed) {
+            armed = true;
+            w = wq_waiter();
+            if (!w) unk = 1;
+            else for (uint64_t i = 0; i < n; i++) {
+                file_t* f = fds[i].fd < 0 ? NULL : getf(fds[i].fd);
+                if (f) unk |= wait_arm(f, w);
+            }
+            continue;
+        }
+        uint32_t ms = timeout_ms > 0 ? (uint32_t)timeout_ms - el : 0;
+        for (uint64_t i = 0; i < n; i++) {
+            file_t* f = fds[i].fd < 0 ? NULL : getf(fds[i].fd);
+            uint32_t t = f ? timer_ms(f) : 0;
+            if (t && (!ms || t < ms)) ms = t;
+        }
+        if (unk) ms = 1;
+        if (w) wq_sleep(w, ms);
+        else task_sleep_ms(1);
     }
 }
 
@@ -1177,8 +1290,11 @@ static int do_select(int n, uint32_t* rd, uint32_t* wr, uint32_t* ex, int timeou
         if (wr) want_w[i] = wr[i];
     }
     uint32_t start = pit_uptime_ms();
+    WQ_W(w);
+    bool armed = false;
+    int unk = 0;
     for (;;) {
-        net_poll();
+        sock_pump();
         int ready = 0;
         uint32_t got_r[FDW] = {0}, got_w[FDW] = {0};
         for (int fd = 0; fd < n; fd++) {
@@ -1199,7 +1315,29 @@ static int do_select(int n, uint32_t* rd, uint32_t* wr, uint32_t* ex, int timeou
             }
             return ready;
         }
-        task_sleep_ms(1);
+        if (proc_interrupted()) return -EINTR;
+        uint32_t el = pit_uptime_ms() - start;
+        uint32_t ms = timeout_ms > 0 ? (uint32_t)timeout_ms - el : 0;
+        if (!armed) {
+            armed = true;
+            w = wq_waiter();
+            if (!w) unk = 1;
+            for (int fd = 0; w && fd < n; fd++) {
+                if (!((want_r[fd >> 5] | want_w[fd >> 5]) & (1u << (fd & 31)))) continue;
+                file_t* f = getf(fd);
+                if (f) unk |= wait_arm(f, w);
+            }
+            continue;
+        }
+        for (int fd = 0; fd < n; fd++) {
+            if (!((want_r[fd >> 5] | want_w[fd >> 5]) & (1u << (fd & 31)))) continue;
+            file_t* f = getf(fd);
+            uint32_t t = f ? timer_ms(f) : 0;
+            if (t && (!ms || t < ms)) ms = t;
+        }
+        if (unk) ms = 1;
+        if (w) wq_sleep(w, ms);
+        else task_sleep_ms(1);
     }
 }
 
@@ -1591,6 +1729,7 @@ typedef struct ux {
     bool bound, listening;
     file_t* q[16];
     int  nq;
+    wq_t wq;
 } ux_t;
 
 static ux_t* ureg[32];
@@ -1633,11 +1772,29 @@ static ux_t* ux_find(const char* name, int nlen) {
 
 bool ux_pending(file_t* f) { return f->ux && f->ux->nq > 0; }
 
+extern wq_t tty_wq;
+
+/* what to sleep on for f: 0..2 queues, -1 = no idea, poll it with ticks. no queue + always ready is 0 */
+int file_wqs(file_t* f, wq_t** v) {
+    switch (f->type) {
+        case F_PIPE_R: case F_PIPE_W: v[0] = &f->pipe->wq; return 1;
+        case F_SPAIR: v[0] = &f->pipe->wq; v[1] = &f->pipe2->wq; return 2;
+        case F_EVENTFD: v[0] = &f->wq; return 1;
+        case F_TTY: v[0] = &tty_wq; return 1;
+        case F_PTM: case F_PTS: v[0] = pty_wq(f->pty); return v[0] ? 1 : 0;
+        case F_ULISTEN: v[0] = &f->ux->wq; return 1;
+        case F_URING: v[0] = uring_wq(f->ur); return 1;
+        case F_NODE: case F_NULL: case F_ZERO: case F_RANDOM: case F_DISK: case F_FB: case F_NETLINK: return 0;
+        default: return -1;
+    }
+}
+
 void ux_release(file_t* f) {
     ux_t* u = f->ux;
     if (!u) return;
     for (int i = 0; i < 32; i++) if (ureg[i] == u) ureg[i] = NULL;
     for (int i = 0; i < u->nq; i++) file_close(u->q[i]);
+    wq_drain(&u->wq);
     kfree(u);
     f->ux = NULL;
 }
@@ -1690,14 +1847,16 @@ static int ux_call(int call, file_t* f, int fd, uint64_t b, uint64_t c, uint64_t
             f->shut = 0;
             kfree(x);
             l->q[l->nq++] = y;
+            wq_wake(&l->wq);
             return 0;
         }
         case 5: case 18: {                                            /* accept(4) */
             if (f->type != F_ULISTEN) return -EINVAL;
+            WQ_W(w);
             while (!u->nq) {
                 if (f->flags & O_NONBLOCK) return -EAGAIN;
                 if (proc_interrupted()) return -EINTR;
-                task_yield();
+                wq_wait(&u->wq, &w, 0);
             }
             file_t* y = u->q[0];
             for (int i = 1; i < u->nq; i++) u->q[i - 1] = u->q[i];
@@ -1996,7 +2155,7 @@ static int64_t sys_socket_call(int call, uint64_t a, uint64_t b, uint64_t c,
             if (a != AF_INET && a != AF_INET6) return -97;
             int type = (int)(b & 0xF);
             if (type == 3) { if (c != (a == AF_INET ? 1 : 58)) return -93; }
-            else if (c && !((type == 1 && c == 6) || (type == 2 && (c == 17 || (c == 58 && a == AF_INET6))))) return -93;  /* EPROTONOSUPPORT */
+            else if (c && !((type == 1 && c == 6) || (type == 2 && (c == 17 || (c == 58 && a == AF_INET6) || (c == 1 && a == AF_INET))))) return -93;  /* EPROTONOSUPPORT */
             s = sock_create((int)a, type, (int)c, &err);
             if (!s) return err ? err : -93;
             fl = file_new(F_SOCKET, 2 | ((b & 04000) ? O_NONBLOCK : 0));
@@ -2057,6 +2216,13 @@ static int64_t sys_socket_call(int call, uint64_t a, uint64_t b, uint64_t c,
             if (b == 41 && c == 26 && d && e >= 4) {                  /* IPV6_V6ONLY */
                 UCHK((void*)d, 4);
                 sock_v6only(s, 1, *(int*)d);
+            } else if (b == 1 && c == 20 && d && e >= 16) {           /* SO_RCVTIMEO */
+                UCHK((void*)d, 16);
+                int64_t* tv = (int64_t*)d;
+                sock_rcvtmo(s, (uint32_t)(tv[0] * 1000 + tv[1] / 1000));
+            } else if (d && e >= 1) {
+                UCHK((void*)d, 1);
+                sock_opt(s, (int)b, (int)c, e >= 4 ? *(int*)d : *(uint8_t*)d);
             }
             return 0;
         case 15: {                                                    /* getsockopt */
@@ -2096,7 +2262,11 @@ static int64_t sys_socket_call(int call, uint64_t a, uint64_t b, uint64_t c,
                 /* was &len on the kernel stack, UCHK said no and the name never got written.
                    musl 1.2.5 dns drops replies without it (apk) */
                 if (m->name) write_addr(m->name, (uint64_t)&m->namelen, sock_af(s), ip, port);
-                m->ctllen = 0; m->flags = 0;
+                m->flags = 0;
+                if (m->ctl && m->ctllen) {
+                    UCHK((void*)m->ctl, m->ctllen);
+                    m->ctllen = total >= 0 ? sock_cmsg(s, (uint8_t*)m->ctl, (int)m->ctllen) : 0;
+                } else m->ctllen = 0;
             }
             return total;
         }
@@ -2155,13 +2325,26 @@ static int64_t dispatch(regs_t* r) {
             fl->off = save;
             return res;
         }
+        case 295: case 296: case 327: case 328: {                    /* preadv/pwritev (+v2) */
+            file_t* fl = getf((int)a);
+            if (!fl) return -EBADF;
+            bool w = r->rax == 296 || r->rax == 328;
+            if (r->rax > 300 && (int64_t)d == -1) return do_rwv((int)a, (iovec_t*)b, (int)c, w);
+            if (fl->type != F_NODE) return -ESPIPE;
+            uint64_t save = fl->off;
+            fl->off = d;
+            int64_t res = do_rwv((int)a, (iovec_t*)b, (int)c, w);
+            fl->off = save;
+            return res;
+        }
         case 2:   return do_open(AT_FDCWD, (const char*)a, (int)b, (int)c);
         case 85:  return do_open(AT_FDCWD, (const char*)a, O_CREAT | O_WRONLY | O_TRUNC, (int)b);
         case 257: return do_open((int)a, (const char*)b, (int)c, (int)d);
         case 3: {
             file_t* fl = getf((int)a);
             if (!fl) return -EBADF;
-            p->sh->fds[a] = NULL;
+            fd_swap((int)a, NULL);
+            flk_close(p->sh, fl);
             file_close(fl);
             return 0;
         }
@@ -2222,8 +2405,19 @@ static int64_t dispatch(regs_t* r) {
             if (b) UCHK((void*)b, 24);
             return proc_sigaltstack((const uint64_t*)a, (uint64_t*)b, r->rsp);
         case 122: case 123: return 0;                                /* setfsuid/gid: zsh. we're root anyway */
-        case 73: return 0;                                           /* flock, apk wants it. nobody fights for locks here */
-        case 162: case 74: case 75: case 306:                        /* sync, fsync, fdatasync, syncfs */
+        case 73: {                                                   /* flock */
+            file_t* fl = getf((int)a);
+            return fl ? flk_flock(fl, (int)b) : -EBADF;
+        }
+        case 74: case 75: case 306: case 277: {                      /* fsync, fdatasync, syncfs, sync_file_range */
+            file_t* fl = getf((int)a);
+            if (!fl) return -EBADF;
+            if (r->rax == 277 && (d & ~7ull)) return -EINVAL;
+            if (r->rax != 306 && fl->type != F_NODE && fl->type != F_DISK) return -EINVAL;
+            ext2_sync_all();
+            return fatfs_sync_all();
+        }
+        case 162:                                                    /* sync */
             ext2_sync_all();
             return fatfs_sync_all();
         case 165: {                                                  /* mount */
@@ -2481,7 +2675,24 @@ static int64_t dispatch(regs_t* r) {
                 if (c + d > fl->node->size && node_truncate(fl->node, c + d) < 0) return -ENOMEM;
                 return 0;
             }
-            return -95;                                              /* apk asks. EOPNOTSUPP and it just writes */
+            if (!fl) return -EBADF;
+            if (fl->type != F_NODE) return -19;
+            fs_node_t* n = fl->node;
+            if (n->type == FS_DIR) return -EISDIR;
+            if (n->type != FS_FILE || n->dev) return -19;
+            if ((fl->flags & 3) == 0) return -EBADF;
+            if ((int64_t)c < 0 || (int64_t)d <= 0) return -EINVAL;
+            if (b & ~(uint64_t)(1 | 2 | 16)) return -95;                 /* EOPNOTSUPP: collapse, insert */
+            if ((b & 2) && !(b & 1)) return -95;                     /* punch hole needs keep size */
+            uint64_t end = c + d;
+            if (end > 0x7FFFFFFF) return -27;                        /* EFBIG, 32 bit sizes in the ramfs */
+            fs_need(n);
+            if (b & (2 | 16)) {                                      /* hole = zeros, the fs has no holes in memory */
+                uint64_t z = c < n->size ? c : n->size, ze = end < n->size ? end : n->size;
+                if (ze > z && n->data) { memset(n->data + z, 0, ze - z); n->mtime = fs_now(); fs_touch(n); }
+            }
+            if (!(b & 1) && end > n->size && node_truncate(n, (uint32_t)end) < 0) return -ENOMEM;
+            return 0;
         }
         // membarrier, rseq: not here yet. glib/qemu fall back
         // to pipes and poll on ENOSYS, so just say no without spamming the log
@@ -2648,7 +2859,7 @@ int16_t sys_revents(file_t* f, int16_t want) { return fd_revents(f, want); }
 int sys_close(int fd) {
     file_t* fl = getf(fd);
     if (!fl) return -EBADF;
-    me()->sh->fds[fd] = NULL;
+    fd_swap(fd, NULL);
     file_close(fl);
     return 0;
 }
@@ -2783,6 +2994,10 @@ void syscall_dispatch(regs_t* r) {
         fs_write_begin();
     }
     int64_t ret;
+    uint64_t t0 = prof_tsc();
+    if (g_ftrace && nr == 59 && ustr_ok((const char*)r->rdi)) {
+        klog("[x] "); klog_num(pit_uptime_ms()); klog(" exec "); klog((const char*)r->rdi); klog("\r\n");
+    }
     proc_t* pc = proc_current();
     if (pc && !setjmp((void*)pc->ujb)) {
         pc->ujb_on = true;
@@ -2794,6 +3009,11 @@ void syscall_dispatch(regs_t* r) {
         ret = -EFAULT;
     } else ret = dispatch(r);
     if (mut) fs_write_end();
+    prof_sys((int)nr, prof_tsc() - t0);
+    switch (nr) {      // io that can make a waiter in poll/read/write ready
+        case 0: case 1: case 3: case 17: case 18: case 19: case 20: case 42: case 43: case 44: case 45:
+        case 46: case 47: case 48: case 53: case 299: case 307: io_wake();
+    }
     if (g_strace && g_strace_pid && proc_current() && proc_current()->pid == g_strace_pid) {
         /* buffered: record now, print when the process exits (timing stays intact) */
         static struct { int32_t nr, a, b, c, ret; } rec[4096];
@@ -2809,7 +3029,7 @@ void syscall_dispatch(regs_t* r) {
         }
     } else if (g_strace && !g_strace_pid) {
         proc_t* p = proc_current();
-        klog("[strace] "); klog_num(p ? p->pid : 0);
+        klog("[strace] "); klog_num(pit_uptime_ms()); klog(" "); klog_num(p ? p->pid : 0);
         klog(" "); klog_num(nr);
         klog("("); klog_num(r->rdi); klog(", "); klog_num(r->rsi);
         klog(", "); klog_num(r->rdx); klog(") = "); klog_num(ret); klog("\r\n");
@@ -2833,6 +3053,98 @@ void syscall_dispatch(regs_t* r) {
     proc_deliver_signal(r, keep ? -1 : (int)nr, keep ? 0 : (int32_t)ret);
 }
 
+/* syscalls that run without the big lock (see syscall_enter). everything in here
+   must be fine with other cpus running in the kernel at the same time */
+uint8_t nobkl_tab[512];
+
+int64_t syscall_nobkl(regs_t* r) {
+    uint64_t nr = r->rax, a = r->rdi, b = r->rsi, c = r->rdx;
+    proc_t* p = proc_current();
+    if (!p || g_strace || g_ftrace || p->alarm_at) return NB_SLOW;
+    int64_t ret;
+    if (setjmp((void*)p->ujb)) {
+        proc_current()->ujb_on = false;
+        return -EFAULT;
+    }
+    p->ujb_on = true;
+    switch (nr) {
+        case 39: ret = p->tgid; break;
+        case 186: ret = p->pid; break;
+        case 102: case 104: case 107: case 108: ret = 0; break;
+        case 96:
+            ret = 0;
+            if (a) {
+                UCHK2((void*)a, 16);
+                uint32_t s, ns; clock_now(&s, &ns);
+                ((int64_t*)a)[0] = s; ((int64_t*)a)[1] = ns / 1000;
+            }
+            if (b) { UCHK2((void*)b, 8); memset((void*)b, 0, 8); }
+            break;
+        case 228: ret = do_clock_gettime((int)a, (int64_t*)b); break;
+        case 229:
+            if (b) { UCHK2((void*)b, 16); memset((void*)b, 0, 16); ((int64_t*)b)[1] = 1000000; }
+            ret = 0;
+            break;
+        case 24: task_yield_fast(); ret = 0; break;
+        case 35: case 230: {
+            const int64_t* ts = (const int64_t*)(nr == 35 ? a : c);
+            UCHK2(ts, 16);
+            uint32_t ms;
+            if (nr == 230 && (b & 1)) {
+                uint32_t s, ns; clock_now(&s, &ns);
+                ms = ts[0] > s ? (ts[0] - s) * 1000 : 0;
+            } else ms = ts[0] * 1000 + ts[1] / 1000000;
+            uint32_t end = pit_uptime_ms() + ms;
+            ret = 0;
+            while ((int32_t)(pit_uptime_ms() - end) < 0) {
+                if (proc_signal_deliverable(p)) { ret = -EINTR; break; }
+                uint32_t left = end - pit_uptime_ms();
+                task_sleep_ms(left > 20 ? 20 : left);
+            }
+            break;
+        }
+        case 202: ret = do_futex(a, (uint32_t)b, (uint32_t)c, r->r10, r->r8, (uint32_t)r->r9); break;
+        case 0: case 1: {                            /* pipes and eventfd only */
+            file_t* f = getf_ref((int)a);
+            if (!f || (f->type != F_PIPE_R && f->type != F_PIPE_W && f->type != F_EVENTFD)) { file_close(f); ret = NB_SLOW; break; }
+            if (nr == 0 ? f->type == F_PIPE_W : f->type == F_PIPE_R) ret = -EBADF;
+            else if (!uok((void*)b, c)) ret = -EFAULT;
+            else ret = nr == 0 ? file_read(f, (char*)b, c) : file_write(f, (const char*)b, c);
+            file_close(f);
+            break;
+        }
+        case 9: {                                    /* anon only, the rest keeps the lock */
+            if (!(r->r10 & MAP_ANON)) { ret = NB_SLOW; break; }
+            uint64_t len = (b + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+            if (!b) { ret = -EINVAL; break; }
+            bool fx = r->r10 & MAP_FIXED;
+            if (fx && ((a & (PAGE_SIZE - 1)) || a < USER_BASE || a + len > USER_TOP || a + len < a)) { ret = -EINVAL; break; }
+            uint64_t m = vmm_map_anon(p->pd, a, fx, USER_MMAP_BASE, USER_STACK_TOP - USER_STACK_MAX, len, (c & PROT_WRITE) != 0, c != 0);
+            ret = m ? (int64_t)m : -ENOMEM;
+            break;
+        }
+        case 11:
+            if ((a & (PAGE_SIZE - 1)) || !b) ret = -EINVAL;
+            else { if (a >= USER_BASE && a < USER_TOP) vmm_free_range(p->pd, a, b); ret = 0; }
+            break;
+        case 10:
+            if (a & (PAGE_SIZE - 1)) ret = -EINVAL;
+            else {
+                if (a >= USER_BASE && a < USER_TOP) {
+                    vmm_set_writable(p->pd, a, b, (c & PROT_WRITE) != 0);
+                    vmm_set_user(p->pd, a, b, c != 0);
+                }
+                ret = 0;
+            }
+            break;
+        default: ret = NB_SLOW;
+    }
+    proc_current()->ujb_on = false;
+    return ret;
+}
+
 void syscall_init(void) {
     fs_free_hook = shm_drop;
+    static const uint16_t nb[] = { 0, 1, 9, 10, 11, 39, 186, 102, 104, 107, 108, 96, 228, 229, 24, 35, 230, 202 };
+    for (unsigned i = 0; i < sizeof(nb) / sizeof(nb[0]); i++) nobkl_tab[nb[i]] = 1;
 }

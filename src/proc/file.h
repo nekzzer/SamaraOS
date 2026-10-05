@@ -2,6 +2,8 @@
 #define SAMARA_FILE_H
 #include "core/types.h"
 #include "fs/fs.h"
+#include "core/wq.h"
+#include "core/smp.h"
 
 /* Open file descriptions, shared between fds after dup()/fork(). */
 
@@ -22,7 +24,9 @@ typedef struct pipe {
     int  readers, writers;
     struct file* fds[8];    /* SCM_RIGHTS in flight (unix sockets) */
     int  nfds;
+    wq_t wq;
     uint32_t wgen;          /* bumped on every write, io_uring multishot poll looks at it */
+    spin_t lk;              /* buf, head/tail/count, readers/writers */
 } pipe_t;
 
 typedef struct file {
@@ -42,6 +46,7 @@ typedef struct file {
     struct ep* ep;          /* F_EPOLL */
     struct uring* ur;       /* F_URING */
     uint64_t   cnt;         /* F_EVENTFD counter */
+    wq_t       wq;          /* F_EVENTFD */
     uint32_t   t_next, t_int;   /* F_TIMERFD: uptime ms of the next expiry (0 = off), interval */
 } file_t;
 
@@ -50,6 +55,7 @@ uint32_t file_gen(file_t* f);
 file_t* file_open_node(fs_node_t* n, int flags);   /* handles device nodes */
 void    file_ref(file_t* f);
 void    file_close(file_t* f);
+void    efd_wake(void);                            /* an eventfd counter went up */
 
 int     file_read(file_t* f, char* buf, uint32_t n);
 int     file_write(file_t* f, const char* buf, uint32_t n);
@@ -62,6 +68,13 @@ int     spair_shutdown(file_t* f, int how);
 uint32_t file_disk_size(file_t* f);
 void    ux_release(file_t* f);                     /* syscall.c: unbind, drop the backlog */
 bool    ux_pending(file_t* f);                     /* a connection waits for accept() */
+
+int     flk_flock(file_t* f, int op);
+int     flk_fcntl(file_t* f, int cmd, uint8_t* u);
+void    flk_close(void* sh, file_t* f);     /* a process closed an fd of f: its posix locks go */
+void    flk_exit(void* sh);
+void    flk_release(file_t* f);             /* last close */
+int     flk_text(char* b, int cap);
 
 /* ramfs helpers */
 int     node_write_at(fs_node_t* n, uint32_t off, const char* buf, uint32_t len);

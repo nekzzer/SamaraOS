@@ -1,6 +1,7 @@
 #include "core/clock.h"
 #include "core/io.h"
 #include "boot/pit.h"
+#include "boot/apic.h"
 
 static uint32_t boot_epoch, boot_ms;
 
@@ -30,9 +31,24 @@ void clock_init(void) {
 }
 
 void clock_now(uint32_t* sec, uint32_t* nsec) {
+    uint64_t us = tsc_us();
+    if (us) {                                  // tsc: real microseconds
+        us -= (uint64_t)boot_ms * 1000;
+        *sec = boot_epoch + (uint32_t)(us / 1000000);
+        if (nsec) *nsec = (uint32_t)(us % 1000000) * 1000;
+        return;
+    }
     uint32_t ms = pit_uptime_ms() - boot_ms;
     *sec = boot_epoch + ms / 1000;
     if (nsec) *nsec = (ms % 1000) * 1000000u;
+}
+
+void clock_now_us(uint32_t* sec, uint32_t* usec) {
+    uint64_t us = tsc_us();
+    if (!us) { clock_now(sec, usec); *usec /= 1000; return; }
+    us -= (uint64_t)boot_ms * 1000;
+    *sec = boot_epoch + (uint32_t)(us / 1000000);
+    *usec = (uint32_t)(us % 1000000);
 }
 
 uint32_t clock_epoch(void) { uint32_t s; clock_now(&s, 0); return s; }

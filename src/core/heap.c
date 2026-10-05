@@ -1,6 +1,7 @@
 #include "core/heap.h"
 #include "core/string.h"
 #include "core/task.h"
+#include "core/smp.h"
 
 /* First-fit free-list allocator, one list per arena. Each block is preceded
    by a header; blocks are chained in address order.
@@ -25,6 +26,7 @@ typedef struct {
 } arena_t;
 
 static arena_t low, big;
+static spin_t hl;
 
 #define ALIGN8(x) (((x) + 15ul) & ~15ul)
 
@@ -64,29 +66,29 @@ static void* arena_alloc(arena_t* a, size_t n) {
 /* User processes run syscalls on their own tasks, so the allocator can be
    entered from two tasks at once: keep every list walk atomic. */
 void* kmalloc(size_t n) {
-    uint32_t f = irq_save();
+    uint64_t f = spin_lock(&hl);
     void* p = arena_alloc(&low, n);
-    irq_restore(f);
+    spin_unlock(&hl, f);
     return p;
 }
 
 void (*heap_reclaim)(size_t need);
 
 void* kmalloc_big(size_t n) {
-    uint32_t f = irq_save();
+    uint64_t f = spin_lock(&hl);
     void* p = arena_alloc(&big, n);
-    irq_restore(f);
+    spin_unlock(&hl, f);
     /* full: let ext2 throw out files it can read again, before eating the kernel heap */
     if (!p && heap_reclaim && big.head) {
         heap_reclaim(n);
-        f = irq_save();
+        f = spin_lock(&hl);
         p = arena_alloc(&big, n);
-        irq_restore(f);
+        spin_unlock(&hl, f);
     }
     /* the kernel heap only if plenty stays free: apk filled the file arena,
        file data ate the kernel heap and everything after that went bad */
     if (!p && (!big.head || low.size - low.used > n + (24u << 20))) {
-        f = irq_save(); p = arena_alloc(&low, n); irq_restore(f);
+        f = spin_lock(&hl); p = arena_alloc(&low, n); spin_unlock(&hl, f);
     }
     return p;
 }
@@ -99,7 +101,7 @@ static arena_t* arena_of(void* p) {
 
 void kfree(void* p) {
     if (!p) return;
-    uint32_t f = irq_save();
+    uint64_t f = spin_lock(&hl);
     arena_t* a = arena_of(p);
     block_t* b = (block_t*)((uint8_t*)p - sizeof(block_t));
     b->free = 1;
@@ -114,7 +116,7 @@ void kfree(void* p) {
         }
         it = it->next;
     }
-    irq_restore(f);
+    spin_unlock(&hl, f);
 }
 
 /* grow a block in place if the one after it is free. a file written in
@@ -122,7 +124,7 @@ void kfree(void* p) {
    once, and that never fit in the file arena */
 bool kgrow(void* p, size_t n) {
     if (!p) return false;
-    uint32_t f = irq_save();
+    uint64_t f = spin_lock(&hl);
     arena_t* a = arena_of(p);
     block_t* b = (block_t*)((uint8_t*)p - sizeof(block_t));
     n = ALIGN8(n);
@@ -143,7 +145,7 @@ bool kgrow(void* p, size_t n) {
         a->used += b->size + sizeof(block_t);
         ok = true;
     }
-    irq_restore(f);
+    spin_unlock(&hl, f);
     return ok;
 }
 

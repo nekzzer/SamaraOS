@@ -8,6 +8,7 @@
 #include "gfx/termfont.h"
 #include "boot/pit.h"
 #include "core/io.h"
+#include "core/wq.h"
 
 #define IN_SZ   2048
 #define OUT_SZ  16384
@@ -20,6 +21,7 @@ static int      line_len;                   /* canonical edit buffer */
 static int      eof_pending;
 static char     out_buf[OUT_SZ];
 static volatile int out_head, out_tail;
+wq_t tty_wq;
 static ktermios_t tio;
 static int      fg_pgrp;
 static int      reader_pid;                 /* last process blocked in read() */
@@ -92,6 +94,7 @@ void tty_set_termios(const ktermios_t* t) {
     if (was_canon && !(tio.c_lflag & TTY_ICANON)) {
         for (int i = 0; i < line_len; i++) in_push(line[i]);
         line_len = 0;
+        wq_wake(&tty_wq);
     }
     irq_restore(f);
 }
@@ -109,6 +112,7 @@ int tty_read(char* buf, int n, bool nonblock) {
     if (me && me->tty_detached) return 0;          /* background job: EOF */
     if (me) reader_pid = me->tgid;
     uint32_t deadline = 0;
+    WQ_W(w);
     for (;;) {
         uint32_t f = irq_save();
         bool canon = tio.c_lflag & TTY_ICANON;
@@ -134,7 +138,7 @@ int tty_read(char* buf, int n, bool nonblock) {
             else if ((int32_t)(pit_uptime_ms() - deadline) >= 0) return 0;
         }
         if (proc_interrupted()) return -4;               /* EINTR */
-        task_sleep_ms(2);
+        { int32_t left = (int32_t)(deadline - pit_uptime_ms()); wq_wait(&tty_wq, &w, !deadline ? 0 : left > 0 ? (uint32_t)left : 1); }
     }
 }
 
@@ -238,6 +242,7 @@ void tty_key(char ch) {
 
     if (!canon) {
         for (int i = 0; i < nu; i++) { in_push(u8[i]); if (echo_on) echo(u8[i]); }
+        wq_wake(&tty_wq);
         irq_restore(f);
         return;
     }
@@ -258,10 +263,12 @@ void tty_key(char ch) {
         if (line_len == 0) eof_pending = 1;
         for (int i = 0; i < line_len; i++) in_push(line[i]);
         line_len = 0;
+        wq_wake(&tty_wq);
     } else if (c == '\n') {
         for (int i = 0; i < line_len; i++) in_push(line[i]);
         in_push('\n');
         line_len = 0;
+        wq_wake(&tty_wq);
         if (echo_on || (tio.c_lflag & 0x40 /*ECHONL*/)) echo('\n');
     } else if ((c >= 0x20 && c != 0x7F) && line_len < LINE_SZ - nu) {
         for (int i = 0; i < nu; i++) { line[line_len++] = u8[i]; if (echo_on) echo(u8[i]); }

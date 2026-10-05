@@ -8,6 +8,7 @@
    of exited processes are unlinked (open descriptors keep them alive). */
 
 #include "proc/proc.h"
+#include "proc/file.h"
 #include "core/heap.h"
 #include "core/string.h"
 #include "core/vmm.h"
@@ -15,6 +16,7 @@
 #include "boot/pit.h"
 #include "fs/fatfs.h"
 #include "net/net.h"
+#include "core/prof.h"
 
 extern uint32_t cpu_ticks_user, cpu_ticks_sys, cpu_ticks_idle, cpu_ctxt;
 
@@ -244,6 +246,10 @@ static void fill_globals(char* mem, uint32_t cap) {
     sb_int(&b, nproc); sb_putc(&b, ' '); sb_int(&b, last); sb_putc(&b, '\n');
     put(proc_root, "loadavg", &b);
 
+    b = (sb_t){ mem, 0, cap };
+    b.len = (uint32_t)flk_text(mem, (int)cap);
+    put(proc_root, "locks", &b);
+
     uint32_t us = 0, sy = 0, id = 0;
     for (int i = 0; i < ncpu; i++) { us += cpus[i].t_user; sy += cpus[i].t_sys; id += cpus[i].t_idle; }
     us /= HZ_DIV; sy /= HZ_DIV; id /= HZ_DIV;
@@ -331,6 +337,13 @@ static void fill_globals(char* mem, uint32_t cap) {
         sb_num(&b, rx); sb_puts(&b, " 0 0 0 0 0 0 0 "); sb_num(&b, tx); sb_puts(&b, " 0 0 0 0 0 0\n");
     }
     put(nd, "dev", &b);
+
+    fs_node_t* sn = ensure(proc_root, "sys", FS_DIR, 0555);
+    if (sn && (sn = ensure(sn, "net", FS_DIR, 0555)) && (sn = ensure(sn, "ipv4", FS_DIR, 0555))) {
+        b = (sb_t){ mem, 0, cap };
+        sb_puts(&b, "0\t2147483647\n");
+        put(sn, "ping_group_range", &b);
+    }
 }
 
 /* ---------------- refresh ---------------- */
@@ -377,5 +390,26 @@ void procfs_refresh(void) {
 
     fill_globals(mem, cap);
     kfree(mem);
+    {
+        fs_node_t* sd = ensure(proc_root, "samara", FS_DIR, 0555);
+        // only rebuilt for a read: dump is big
+        static int shown = -1;
+        if (sd && prof_on) {
+            sb_t pb = { "running\n", 8, 9 };
+            put(sd, "prof", &pb);
+            shown = -1;
+        } else if (sd && shown != prof_gen) {
+            shown = prof_gen;
+            sb_t pb = { kmalloc(300000), 0, 300000 };
+            if (pb.buf) {
+                pb.len = prof_dump(pb.buf, pb.cap);
+                put(sd, "prof", &pb);
+                kfree(pb.buf);
+            }
+        }
+        if (sd) sd->mode = 0555;
+        fs_node_t* pn = sd ? fs_child(sd, "prof") : NULL;
+        if (pn) pn->mode = 0666;
+    }
     irq_restore(f);
 }

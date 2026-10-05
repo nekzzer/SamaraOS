@@ -5,6 +5,8 @@
 #define MAX_TASKS  64
 #define TASK_STACK_SZ 8192
 
+#define NB_SLOW (-0x7fffffff00000000ll)   /* nobkl handler: take the lock and do it the long way */
+
 typedef enum { T_FREE = 0, T_READY, T_BLOCKED, T_DEAD } task_state_t;
 
 struct proc;
@@ -30,6 +32,8 @@ typedef struct task {
     volatile int  on_cpu;      /* some cpu runs on this stack (or is still leaving it) */
     int           cpu;         /* the one that ran it last */
     int           ysw;         /* last yield went to somebody else */
+    int           nobkl;       /* in a syscall that runs without the big lock */
+    volatile int  io_wait;     /* blocked in task_wait_io, io_wake lets it go early */
 } task_t;
 
 /* Frame built by every entry path (isr stubs, syscall_entry, see boot/entry.S),
@@ -51,7 +55,10 @@ int   task_spawn_frame(const char* name, uint8_t* stack, uint32_t stack_size,
                        uint64_t rsp, uint64_t cr3, struct proc* p);
 void  task_exit(void);
 void  task_yield(void);
+void  task_yield_fast(void);        /* yield, never hlt when nobody else is ready */
 void  task_sleep_ms(uint32_t ms);   /* kernel tasks: give up the CPU for a while */
+void  task_wait_io(uint32_t ms);    /* sleep until io_wake() or ms passed */
+void  io_wake(void);                /* something readable/writable/closed happened, poll again */
 task_t* task_current(void);
 void  task_ready(task_t* t);        /* blocked -> ready, wakes a parked cpu */
 regs_t* task_reap(regs_t* f);        /* dead task in ring 3: send the cpu elsewhere */

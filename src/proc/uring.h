@@ -14,6 +14,7 @@ int  uring_mmap(struct uring* r, uint64_t pd, uint64_t addr, uint64_t len, uint6
 void uring_release(struct uring* r);        /* last close of the ring file */
 void uring_exit(struct proc* p);            /* a process or thread goes away: drop its requests */
 bool uring_readable(struct uring* r);
+struct wq* uring_wq(struct uring* r);
 
 /* syscall.c helpers, all run in the context of the current process */
 struct file* sys_getf(int fd);

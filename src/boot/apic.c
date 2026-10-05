@@ -63,6 +63,11 @@ void ioapic_irq(int irq, bool mask) {
     }
 }
 
+uint64_t tsc_us(void) {
+    if (!tsc_khz) return 0;
+    return (rdtsc() - tsc0) * 1000 / tsc_khz;
+}
+
 uint64_t tsc_ms(void) {
     if (!tsc_khz) return 0;
     return (rdtsc() - tsc0) / tsc_khz;

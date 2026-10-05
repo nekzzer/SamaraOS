@@ -6,6 +6,7 @@
 #include "core/string.h"
 #include "core/io.h"
 #include "core/heap.h"
+#include "core/smp.h"
 #include "drivers/drm.h"
 
 static uint8_t* fb;            /* current draw target */
@@ -277,16 +278,22 @@ bool gfx_on_front(void) { return fb == real_fb; }
 void gfx_present(void) {
     if (!back_buf || !real_fb) return;
     if (fbdev_active()) return;           /* X or doom own the screen, the console wrote over xorg */
-    uint32_t n = (uint32_t)(fb_pitch_bytes * fb_h) / 4;
+    uint32_t tot = (uint32_t)(fb_pitch_bytes * fb_h) / 4;
+    uint32_t step = fb_pitch_bytes * 64 / 4;
     void* d = real_fb;
     void* s = back_buf;
-    __asm__ volatile (
-        "cld\n\t"
-        "rep movsl"
-        : "+D"(d), "+S"(s), "+c"(n)
-        :
-        : "memory"
-    );
+    while (tot) {
+        uint32_t n = tot < step ? tot : step;
+        tot -= n;
+        __asm__ volatile (
+            "cld\n\t"
+            "rep movsl"
+            : "+D"(d), "+S"(s), "+c"(n)
+            :
+            : "memory"
+        );
+        if (tot) bkl_yield(this_cpu());   // other cpus starved during a full present
+    }
 }
 
 void gfx_present_rect(int x, int y, int w, int h) {

@@ -42,13 +42,25 @@ make run SELF=0 NICS=3                      # + virtio-net cards eth1, eth2
   (syscall 332 is still ENOSYS)
 * void userland: `build/root-x64.img` (userland/build-x64root.sh, 97 void x86_64-musl packages, ext2 root), xbps-install/remove
   work (gcc, xterm, nano installs checked, e2fsck clean), gcc compiles and runs. sysroot.tar is x86_64 now (samara apps + sources).
-  fork is COW, kernel faults on user addresses return EFAULT. no hard links in the fs (the image build copies them),
-  fallocate/flock are stubs, mremap grow often ENOMEM (musl copes)
+  fork is COW, kernel faults on user addresses return EFAULT. mremap grow often ENOMEM (musl copes)
+* ag/fs: hard links. an extra name is a small dentry node (fs_node_t.hl -> the real node, chain in hn, count in xl), resolve
+  follows it, unlink of the real node's name moves the node into another name's place (fs_drop_name). link/linkat
+  (AT_SYMLINK_FOLLOW, AT_EMPTY_PATH), st_nlink/st_ino, unlink of an open file lives till close, rename over a name atomic,
+  rename of two names of one file is a no-op. ext2 reads several dirents -> one inode and writes them back with
+  the right i_links_count (ent.lc counted per sync), e2fsck clean. build-x64root.sh keeps the links (cross volume
+  or fat link = EXDEV/EPERM, a link whose real node sits in a dir that isn't written back (/tmp) is not saved)
+* ag/fs: locks in src/proc/flock.c: flock (per open file description), fcntl F_SETLK/W/GETLK (per fd table, dropped on any
+  close of the file / exec cloexec / exit), F_OFD_*, ranges split/cut, blocking = sleep loop (2 ms), EINTR, simple EDEADLK
+  for posix locks, /proc/locks. fallocate: mode 0, KEEP_SIZE, PUNCH_HOLE|KEEP_SIZE, ZERO_RANGE (holes are zeros in the
+  ram copy, no real holes on disk). fsync/fdatasync/sync_file_range check the fd, then sync every dirty volume
+* tested ag/fs: own tests (link/unlink/open deleted/rename, flock fork, ranges, SETLKW wake, OFD, EINTR, EDEADLK, fallocate),
+  `ln a b; echo x >> b; cat a`, util-linux flock, sqlite3 3 writers x 40 inserts (120/120, integrity ok), xbps-install
+  git perl + remove + reboot, e2fsck -fn clean after each
 * merged ag/smp + ag/xbps: live pte changes in vmm.c (pte_put/tlb_inval) shoot down the other cpus (IPI 0xF1), range
   loops and fork's cow marking batch it (sd_defer). EFAULT longjmp keeps the BKL (kernel fault, lock stays held).
   tested -smp 4 kvm + -smp 2 tcg: nproc, xbps-install/remove nano, cow, fork+threads cow (pthreads write the heap while
   the parent forks), kill/spin, fork/exec stress in 4 shells, uring tests, drmtest virtio-gpu, ping6, desktop+fm
-* left: ping6 prints ttl=-1 (no IPV6_HOPLIMIT cmsg); bochs drm has no hw cursor
+* left: bochs drm has no hw cursor
   (ENXIO, expected); fm right click / menus only checked by eye on the first screen, not clicked through
 
 ## Done recently (all committed and pushed)
@@ -92,12 +104,43 @@ make run SELF=0 NICS=3                      # + virtio-net cards eth1, eth2
 8. Debug output to remove when stable: `samara: gw arp ...` (net.c),
    `kdbg()` helper in pty.c.
 
+## Lock work (ag/lock)
+
+* Done: spinlocks + lockdep-lite (-DLOCKDEP), pmm/heap/mm/futex locks, nobkl syscalls,
+  pipes, eventfd, bkl_yield in ext2 sync/put_blocks/fnv and gfx_present.
+* Not done: before/after scaling numbers, fork/exec stress, tcg -smp 2 run, xbps/DE+foot
+  retest after the lock changes (only one smoke boot: ls -R | wc ok on kvm smp 4).
+* Not done: yield points in net/uw workers/drm flush are only the task_yield ones.
+  tty/pty, vfs and sockets are still under the BKL.
+
 ## Style
 
 Code like a person wrote it (see CLAUDE.md, local only): snake_case, short
 names, few comments with some life in them, no docstrings, no banners, no
 over-engineering. Talk to the user in Russian, informally.
 
+* net/wakeups (ag/net): `core/wq.c` wait queues (static entry pool, waiter = task, or a callback).
+  sockets, pipes/spair (so unix), tty, pty, eventfd, unix listeners and the uring fd have one;
+  poll/select/epoll and the uring workers sleep on them instead of the 1ms loop. no queue (timerfd, input, ...)
+  still ticks at 1ms. sockets: `pump()` (netd every 2ms and after every op) diffs `smask()` and wakes.
+  tcp loopback ping-pong 739 us -> 10 us per round, idle cpu ~0.5% sys. waiters cap their sleep at 500ms
+  (uring workers 100ms) as a net against a lost wake
+* icmpv4 raw + ping (dgram) sockets, ping_group_range, IP_TTL/IP_RECVTTL, SO_TIMESTAMP(NS), SO_RCVTIMEO,
+  ipv6 hoplimit cmsg, icmp port unreachable both ways (ECONNREFUSED for udp/tcp v4), clock has us resolution
+* io_uring: SQPOLL (one kernel thread per ring, no shared threads for ATTACH_WQ, SQ_AFF ignored), R_DISABLED +
+  ENABLE_RINGS, SINGLE_ISSUER check, PROVIDE/REMOVE_BUFFERS, PBUF_RING (user memory only, no MMAP/INC flags),
+  BUFFER_SELECT for read/recv, multishot recv (not recvmsg), CQE_SKIP_SUCCESS. reqs and overflow cqes come from
+  pools (kmalloc is first fit, 65k poll_adds crawled). not done: registered wait regions, recvmsg multishot,
+  send zerocopy, send vectorized. liburing tests that pass: nop poll (flaky: multishot cqe is posted by a worker, not inline in send, test peeks too early) poll-cancel poll-link poll-mshot-update
+  poll-many accept accept-link io-cancel timeout eventfd link link-timeout sq-poll-* sqpoll-* buf-ring buf-ring-mshot
+  buf-ring-stress multicqes_drain cq-overflow cq-full sq-full socket-rw-eagain poll-race submit-reuse statx unlink
+  open-close single-issuer; examples io_uring-cp link-cp echo-server (pbuf ring + multishot recv, nc). failing:
+  send_recv (vectorized send), recv-multishot (needs dgram socketpair + recvmsg multishot), buf-ring-upgrade,
+  fixed-reuse, io_uring_register, ring-leak, defer-taskrun, read-write (buf select with readv)
 * io_uring: no SQPOLL, no provided buffer rings (PBUF_RING), no registered wait
   regions, multishot poll is sampled by workers (no real wakeups), UDP sends
   over MSS fail (send_recv test)
+
+- perf: page cache для .so (общие страницы файлов между процессами) не сделан, ext2 читает файл целиком в память, так что readahead не нужен
+- perf: fc-cache/xkb-каталог добавлены в build-x64root.sh, образ не пересобирали, эффект не замерен (TCG до/после xterm не мерили)
+- perf: прогреть xkb-кэш Xwayland при сборке образа (сейчас кэш появится после первого старта)

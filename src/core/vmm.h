@@ -57,6 +57,7 @@ uint64_t vmm_clone_space(uint64_t pd);                 /* fork: copy RW, share R
 int      vmm_alloc_range(uint64_t pd, uint64_t va, uint64_t len, bool writable);
 void     vmm_free_range(uint64_t pd, uint64_t va, uint64_t len);
 bool     vmm_range_unmapped(uint64_t pd, uint64_t va, uint64_t len);
+uint64_t vmm_map_anon(uint64_t pd, uint64_t addr, bool fixed, uint64_t lo, uint64_t hi, uint64_t len, bool rw, bool user);
 uint64_t vmm_find_free(uint64_t pd, uint64_t from, uint64_t limit, uint64_t len);
 uint64_t vmm_pte(uint64_t pd, uint64_t va);            /* 0 = not mapped */
 void     vmm_set_writable(uint64_t pd, uint64_t va, uint64_t len, bool writable);

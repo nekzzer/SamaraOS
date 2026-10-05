@@ -378,7 +378,7 @@ static void icmp_input(int ifi, const uint8_t* smac, const uint8_t* src, const u
         ra_input(ifi, smac, src, m, n);
         return;
     }
-    if (m[0] < 130) sock_input_icmp6(src, dst, m, n);
+    if (m[0] < 130) sock_input_icmp6(src, dst, m, n, hl);
 }
 
 void ip6_input(int ifi, const uint8_t* p, int len, const uint8_t* smac) {
