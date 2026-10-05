@@ -278,12 +278,12 @@ static void fill_stat_file(kstat64_t* st, file_t* f) {
 
 /* readlink: the ramfs has no symlinks, but /proc/self/fd/N names what an
    fd refers to (musl's ttyname() relies on it; ssh servers use ttyname). */
-static int do_readlink(const char* path, char* buf, uint64_t n) {
+static int do_readlink(int dfd, const char* path, char* buf, uint64_t n) {
     UCHK(path, 1);
     UCHK(buf, n);
     {
         int err;
-        fs_node_t* ln = lookup_peek(AT_FDCWD, path, &err, false);
+        fs_node_t* ln = lookup_peek(dfd, path, &err, false);
         if (ln && ln->type == FS_LINK) {
             uint64_t k = ln->size < n ? (uint64_t)ln->size : n;
             memcpy(buf, ln->data, k);
@@ -402,7 +402,7 @@ static int64_t do_lseek(int fd, int64_t off, int whence) {
         int64_t base = whence == 0 ? 0 : whence == 1 ? (int64_t)f->off : -1;
         if (base < 0) return -EINVAL;
         if (base + off < 0) return -EINVAL;
-        f->off = (uint32_t)(base + off);
+        f->off = (uint64_t)(base + off);
         return base + off;
     }
     if (f->type != F_NODE && f->type != F_DISK) return f->type == F_NULL || f->type == F_ZERO ? 0 : -ESPIPE;
@@ -411,8 +411,8 @@ static int64_t do_lseek(int fd, int64_t off, int whence) {
                    whence == 2 ? (int64_t)end : -1;
     if (base < 0) return -EINVAL;
     int64_t pos = base + off;
-    if (pos < 0 || pos > 0x7FFFFFFF) return -EINVAL;
-    f->off = (uint32_t)pos;
+    if (pos < 0) return -EINVAL;
+    f->off = (uint64_t)pos;
     return pos;
 }
 
@@ -2111,8 +2111,8 @@ static int64_t dispatch(regs_t* r) {
             file_t* fl = getf((int)a);
             if (!fl) return -EBADF;
             if (fl->type != F_NODE) return -ESPIPE;
-            uint32_t save = fl->off;
-            fl->off = (uint32_t)d;
+            uint64_t save = fl->off;
+            fl->off = d;
             int res = r->rax == 17 ? do_read((int)a, (char*)b, c) : do_write((int)a, (const char*)b, c);
             fl->off = save;
             return res;
@@ -2321,8 +2321,8 @@ static int64_t dispatch(regs_t* r) {
             if (b) { UCHK((void*)b, 8); memset((void*)b, 0, 8); }
             return 0;
         }
-        case 89:  return do_readlink((const char*)a, (char*)b, c);
-        case 267: return do_readlink((const char*)b, (char*)c, d);   /* readlinkat (absolute) */
+        case 89:  return do_readlink(AT_FDCWD, (const char*)a, (char*)b, c);
+        case 267: return do_readlink((int)a, (const char*)b, (char*)c, d);
         case 9:   return do_mmap(a, b, (int)c, (int)d, (int)e, f6);
         case 11:  return do_munmap(a, b);
         case 10:  return do_mprotect(a, b, (int)c);
@@ -2429,9 +2429,10 @@ static int64_t dispatch(regs_t* r) {
         }
         case 126: return 0;                                          /* capset: sure */
         case 285: return -95;                                        /* fallocate, apk asks. EOPNOTSUPP and it just writes */
-        // signalfd(4), membarrier, rseq, statx: not here yet. glib/qemu fall back
+        // signalfd(4), membarrier, rseq: not here yet. glib/qemu fall back
         // to pipes and poll on ENOSYS, so just say no without spamming the log
-        case 289: case 282: case 324: case 334: case 332: case 435:
+        case 332: return sys_statx((int)a, (const char*)b, (int)c, (uint32_t)d, (void*)e);
+        case 289: case 282: case 324: case 334: case 435:
             return -ENOSYS;
         case 284: case 290: {                                        /* eventfd(2) */
             int fl = r->rax == 290 ? (int)b : 0;
