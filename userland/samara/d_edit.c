@@ -939,7 +939,7 @@ static void draw(void) {
         tab_geo(i, &x, &w);
         be_fill(x, 3, w, TH - 3, i == cur ? c_bg : c_bar);
         if (i == cur) be_fill(x, 3, w, 2, c_acc);
-        snprintf(b, sizeof b, "%s%s", docs[i]->dirty ? "\xE2\x97\x8F " : "", docs[i]->path[0] ? (p ? p + 1 : docs[i]->path) : "untitled");
+        snprintf(b, sizeof b, "%s%s", docs[i]->dirty ? "* " : "", docs[i]->path[0] ? (p ? p + 1 : docs[i]->path) : "untitled");
         fit(b, w - 30, F_REG, t, sizeof t);
         txt(x + 8, 3, TH - 3, t, i == cur ? c_ink : c_dim, F_REG);
         txt(x + w - 18, 3, TH - 3, "x", c_faint, F_REG);
