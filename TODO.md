@@ -62,14 +62,17 @@ make run SELF=0 NICS=3                      # + virtio-net cards eth1, eth2
 
 ## TODO for the next session
 
-1. **SMP** (the big one): ACPI MADT parse, LAPIC + IOAPIC, AP trampoline
-   (real mode -> protected), per-CPU GDT/TSS/stacks and current task,
-   spinlocks instead of `irq_save` in the scheduler, heap, fs, net, tty/pty,
-   then a scheduler that runs tasks on all cores. QEMU `-smp 4`. llvmpipe and
-   java want it badly.
-2. **Boot runs with interrupts off** for a long time: KVM replays the lost
-   PIT ticks afterwards and the uptime jumps (worked around with
-   `kvm-pit.lost_tick_policy=discard` in the Makefile).
+1. **SMP** works (`-smp N`, up to 8, kvm and tcg): ACPI MADT, LAPIC timer
+   1 kHz, IOAPIC (irqs to the BSP), AP trampoline (`boot/smp_tramp.S`),
+   per-CPU GDT/TSS/gs block, per-CPU scheduler with an idle task per cpu.
+   One big kernel lock (`core/smp.c`, ticket lock): taken on every entry
+   from ring 3 and held in ring 0 except in `cpu_wait()` (hlt) and at
+   `task_yield()` when another cpu waits. So only user code runs in
+   parallel. Next steps: finer locks (heap, pmm, fs), no BKL for pure
+   user faults, x2apic, no-ACPI machines stay on the PIC with one cpu.
+2. **Boot with interrupts off:** uptime is TSC based now (calibrated against
+   the PIT in `apic_init`), the lost-tick drift is gone with APIC. The
+   `lost_tick_policy` flag stays for the PIC fallback.
 3. **virtio-gpu** (skipped): needs the modern virtio PCI transport.
 4. **Browser leftovers:** progressive JPEG, SVG (at least icons), `z-index`,
    `box-shadow`, `transform`, `:hover`.
