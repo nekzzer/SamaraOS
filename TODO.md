@@ -44,6 +44,10 @@ make run SELF=0 NICS=3                      # + virtio-net cards eth1, eth2
   work (gcc, xterm, nano installs checked, e2fsck clean), gcc compiles and runs. sysroot.tar is x86_64 now (samara apps + sources).
   fork is COW, kernel faults on user addresses return EFAULT. no hard links in the fs (the image build copies them),
   fallocate/flock are stubs, mremap grow often ENOMEM (musl copes)
+* merged ag/smp + ag/xbps: live pte changes in vmm.c (pte_put/tlb_inval) shoot down the other cpus (IPI 0xF1), range
+  loops and fork's cow marking batch it (sd_defer). EFAULT longjmp keeps the BKL (kernel fault, lock stays held).
+  tested -smp 4 kvm + -smp 2 tcg: nproc, xbps-install/remove nano, cow, fork+threads cow (pthreads write the heap while
+  the parent forks), kill/spin, fork/exec stress in 4 shells, uring tests, drmtest virtio-gpu, ping6, desktop+fm
 * left: ping6 prints ttl=-1 (no IPV6_HOPLIMIT cmsg); bochs drm has no hw cursor
   (ENXIO, expected); fm right click / menus only checked by eye on the first screen, not clicked through
 
