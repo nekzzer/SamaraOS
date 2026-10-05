@@ -57,6 +57,7 @@ int  ip6_addr_del(int ifi, const uint8_t* a);
 int  ip6_addrs(int ifi, uint8_t addrs[][16], uint8_t* plen, uint8_t* scope, int max);   /* ifi -1 = lo */
 int  ip6_routes(ip6_route_t* r, int max);
 /* net.c */
+int  net_raw_send(int ifi, const void* fr, int len);
 int  net_eth_send(int ifi, const uint8_t* dmac, uint16_t type, const void* pl, int len);
 
 #endif

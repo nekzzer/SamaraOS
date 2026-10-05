@@ -185,6 +185,17 @@ static void send_eth(nif_t* f, uint16_t type, const uint8_t* dst_mac, const void
     eh->type = htons(type);
     memcpy(frame + ETH_HDR, payload, len);
     nic_send(f, frame, ETH_HDR + len);
+    sock_input_pkt((int)(f - nifs), frame, ETH_HDR + len, 4);
+    if (npkt_socks) sock_pkt_flush();
+}
+
+/* AF_PACKET sockets sending whole frames */
+int net_raw_send(int ifi, const void* fr, int len) {
+    if (ifi < 0 || ifi >= n_nifs || len < 14 || len > PKT_BUF || !g_ready) return -1;
+    nic_send(&nifs[ifi], fr, len);
+    sock_input_pkt(ifi, (const uint8_t*)fr, len, 4);
+    if (npkt_socks) sock_pkt_flush();
+    return 0;
 }
 
 int net_eth_send(int ifi, const uint8_t* dmac, uint16_t type, const void* pl, int len) {
@@ -590,12 +601,19 @@ void net_poll(void) {
             got = true;
             if (n < ETH_HDR) continue;
             const eth_hdr_t* eh = (const eth_hdr_t*)buf;
+            if (npkt_socks) {
+                int pt = 3;
+                if (eh->dst[0] & 1) pt = (eh->dst[0] & eh->dst[1] & eh->dst[2] & eh->dst[3] & eh->dst[4] & eh->dst[5]) == 0xFF ? 1 : 2;
+                else if (!memcmp(eh->dst, nifs[k].mac, 6)) pt = 0;
+                sock_input_pkt(k, buf, n, pt);
+            }
             uint16_t type = ntohs(eh->type);
             if (type == ET_ARP) on_arp(&nifs[k], buf + ETH_HDR, n - ETH_HDR);
             else if (type == ET_IPV4) on_ipv4(buf + ETH_HDR, n - ETH_HDR);
             else if (type == 0x86DD) ip6_input(k, buf + ETH_HDR, n - ETH_HDR, eh->src);
         }
     ip6_poll();
+    if (npkt_socks) sock_pkt_flush();
     if (got) io_wake();
     irq_restore(irq);
 }

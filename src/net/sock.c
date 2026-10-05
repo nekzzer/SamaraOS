@@ -1,3 +1,4 @@
+#include "core/vmm.h"
 #include "net/sock.h"
 #include "net/net.h"
 #include "core/io.h"
@@ -52,6 +53,7 @@ typedef struct dgram {
     uint16_t len;
     uint8_t  ttl;
     uint32_t ts_s, ts_us;
+    uint16_t pproto;               /* AF_PACKET: ethertype of this frame */
     uint8_t  data[];
 } dgram_t;
 
@@ -62,6 +64,12 @@ struct sock {
     int      state;
     int      af, proto;            /* 2 or 10 as the user sees it */
     bool     v6only;
+    uint16_t pproto;               /* AF_PACKET: ethertype wanted, 3 = all */
+    int      pifi;                 /* ifindex, 0 = any */
+    uint64_t ring_pa;              /* rx ring (tpacket v2) */
+    uint32_t ring_np, fsz, fnr, rcur;
+    uint32_t pver, boff, bnum;     /* tpacket version, v3: write offset and pkt count in the open block */
+    uint64_t bseq;
     uint8_t  lip[16], rip[16];     /* ipv4 is ::ffff:a.b.c.d, zero = any */
     uint16_t lport, rport;
     bool     bound, connected;
@@ -113,6 +121,7 @@ struct sock {
 };
 
 static sock_t socks[MAX_SOCKS];
+int npkt_socks;
 static const uint8_t zero_ip[16];
 static uint16_t next_eph = 49152;
 
@@ -225,6 +234,7 @@ static sock_t* alloc_sock(int type, int af) {
         s->refs = 1;
         s->rto = 1000;
         s->mss = 536;
+        if (af == 17) npkt_socks++;
         s->ka_idle = 7200; s->ka_intvl = 75; s->ka_cnt = 9;
         if (type == 1 && !tcp_bufs(s, BUF_DEF, BUF_DEF)) {
             s->used = false;
@@ -236,6 +246,11 @@ static sock_t* alloc_sock(int type, int af) {
 }
 
 static void free_sock(sock_t* s) {
+    if (s->af == 17) {
+        npkt_socks--;
+        if (s->ring_pa) for (uint32_t i = 0; i < s->ring_np; i++) pmm_unref(s->ring_pa + i * 4096);
+        s->ring_pa = 0;
+    }
     wq_drain(&s->wq);
     if (s->rx) kfree(s->rx);
     if (s->tx) kfree(s->tx);
@@ -1000,7 +1015,7 @@ static void udp_in(const uint8_t* src, const uint8_t* dst, const uint8_t* d, int
     if (ulen < 8 || ulen > len) return;
     for (int i = 0; i < MAX_SOCKS; i++) {
         sock_t* s = &socks[i];
-        if (!s->used || s->type != 2 || s->proto == 58 || s->proto == 1 || s->lport != dport) continue;
+        if (!s->used || s->type != 2 || s->af == 17 || s->proto == 58 || s->proto == 1 || s->lport != dport) continue;
         if (!dst_ok(s, dst) && !(is4(dst) && dst[12] == 127 && is4(s->lip))) continue;
         if (s->connected && (memcmp(s->rip, src, 16) || s->rport != sport)) continue;
         if (s->q_n >= UDP_QMAX) return;
@@ -1168,12 +1183,155 @@ sock_t* sock_create(int af, int type, int proto, int* err) {
     if (type < 1 || type > 3) { *err = -EINVAL; return NULL; }
     sock_t* s = alloc_sock(type, af);
     if (!s) { *err = -ENOMEM; return NULL; }
+    if (af == 17) { s->pproto = (uint16_t)proto; return s; }
     s->proto = proto;
     if (type == 2 && (proto == 58 || proto == 1) && !s->lport) s->lport = ephemeral(2);       /* ping socket: the port is the echo id */
     return s;
 }
 
 int sock_af(sock_t* s) { return s->af; }
+
+/* frame from/to the wire for packet sockets. pt: 0 host 1 bcast 2 mcast 3 other 4 outgoing */
+void sock_input_pkt(int ifi, const uint8_t* fr, int len, int pt) {
+    if (!npkt_socks || len < 14) return;
+    uint16_t et = (uint16_t)(fr[12] << 8 | fr[13]);
+    for (int i = 0; i < MAX_SOCKS; i++) {
+        sock_t* s = &socks[i];
+        if (!s->used || s->af != 17) continue;
+        if (s->pifi && s->pifi != ifi + 2) continue;
+        if (s->pproto != 3 && s->pproto != et) continue;
+        if (s->ring_pa && s->pver == 2) {
+            uint8_t* b = (uint8_t*)P2V(s->ring_pa) + (uint64_t)s->rcur * s->fsz;
+            int po = s->type == 3 ? 0 : 14;                    /* cooked: payload only */
+            uint32_t cl = len - po < 65535 ? len - po : 65535;
+            uint32_t sz = (130 + cl + 15) & ~15u;
+            if (*(uint32_t*)(b + 8) & 1) continue;             /* user still owns it */
+            if (!s->boff) s->boff = 48;
+            if (s->boff + sz > s->fsz) continue;               /* TODO: oversized frame in a small block, drop */
+            uint8_t* h = b + s->boff;
+            uint32_t sec, us;
+            clock_now_us(&sec, &us);
+            *(uint32_t*)h = sz;
+            ((uint32_t*)h)[1] = sec; ((uint32_t*)h)[2] = us * 1000;
+            ((uint32_t*)h)[3] = cl; ((uint32_t*)h)[4] = len - po; ((uint32_t*)h)[5] = 1;
+            *(uint16_t*)(h + 24) = po ? 128 : 80; *(uint16_t*)(h + 26) = po ? 128 : 94;
+            memset(h + 28, 0, 20);
+            uint8_t* ll = h + 48;
+            memset(ll, 0, 20);
+            *(uint16_t*)ll = 17;
+            *(uint16_t*)(ll + 2) = (uint16_t)(et >> 8 | et << 8);
+            *(int*)(ll + 4) = ifi + 2;
+            *(uint16_t*)(ll + 8) = 1;
+            ll[10] = pt; ll[11] = 6;
+            memcpy(ll + 12, fr + 6, 6);
+            memcpy(h + (po ? 128 : 80), fr + po, cl);
+            if (!s->bnum) { ((uint32_t*)b)[8] = sec; ((uint32_t*)b)[9] = us * 1000; }
+            ((uint32_t*)b)[10] = sec; ((uint32_t*)b)[11] = us * 1000;
+            s->bnum++;
+            s->boff += sz;
+            continue;
+        }
+        if (s->ring_pa) {
+            uint8_t* f = (uint8_t*)P2V(s->ring_pa) + (uint64_t)s->rcur * s->fsz;
+            uint32_t* st = (uint32_t*)f;
+            if (*st || s->fsz < 128) continue;
+            uint32_t cl = len < (int)(s->fsz - 64) ? (uint32_t)len : s->fsz - 64;
+            uint32_t sec, us;
+            clock_now_us(&sec, &us);
+            st[1] = len; st[2] = cl;
+            *(uint16_t*)(f + 12) = 64; *(uint16_t*)(f + 14) = 78;
+            st[4] = sec; st[5] = us * 1000;
+            st[6] = 0; st[7] = 0;
+            uint8_t* ll = f + 32;
+            memset(ll, 0, 20);
+            *(uint16_t*)ll = 17;
+            *(uint16_t*)(ll + 2) = (uint16_t)(et >> 8 | et << 8);
+            *(int*)(ll + 4) = ifi + 2;
+            *(uint16_t*)(ll + 8) = 1;
+            ll[10] = pt; ll[11] = 6;
+            memcpy(ll + 12, fr + 6, 6);
+            memcpy(f + 64, fr, cl);
+            __sync_synchronize();
+            *st = 1;
+            if (++s->rcur >= s->fnr) s->rcur = 0;
+            continue;
+        }
+        if (s->q_n >= 512) continue;
+        int off = s->type == 3 ? 0 : 14;
+        dgram_t* g = (dgram_t*)kmalloc(sizeof(dgram_t) + (uint32_t)(len - off));
+        if (!g) continue;
+        g->next = NULL;
+        memset(g->ip, 0, 16);
+        memcpy(g->ip, fr + 6, 6);
+        g->ip[6] = pt; g->ip[7] = ifi + 2;
+        g->port = et; g->pproto = et;
+        g->len = (uint16_t)(len - off);
+        g->ttl = 0;
+        clock_now_us(&g->ts_s, &g->ts_us);
+        memcpy(g->data, fr + off, (uint32_t)(len - off));
+        if (s->q_tail) s->q_tail->next = g; else s->q_head = g;
+        s->q_tail = g;
+        s->q_n++;
+    }
+}
+
+/* v3: hand the open block to userland, called after every rx batch (no retire timer) */
+void sock_pkt_flush(void) {
+    for (int i = 0; npkt_socks && i < MAX_SOCKS; i++) {
+        sock_t* s = &socks[i];
+        if (!s->used || s->af != 17 || s->pver != 2 || !s->bnum) continue;
+        uint8_t* b = (uint8_t*)P2V(s->ring_pa) + (uint64_t)s->rcur * s->fsz;
+        uint32_t* w = (uint32_t*)b;
+        w[0] = 3; w[1] = 0;
+        w[3] = s->bnum; w[4] = 48; w[5] = s->boff;
+        *(uint64_t*)(b + 24) = ++s->bseq;
+        __sync_synchronize();
+        w[2] = 1;
+        s->bnum = s->boff = 0;
+        if (++s->rcur >= s->fnr) s->rcur = 0;
+    }
+}
+
+int sock_pkt_ver(sock_t* s, int v) {
+    if (v < 1 || v > 2 || s->ring_pa) return -22;
+    s->pver = v;
+    return 0;
+}
+
+int sock_pkt_ring(sock_t* s, uint32_t* rq) {
+    uint32_t bs = rq[0], bn = rq[1], fs = rq[2], fn = rq[3];
+    if (!bn) return 0;                     /* libpcap probes with zeros, teardown in linux */
+    if (s->ring_pa) return -16;
+    if (!bs || bs & 4095 || !fs || fs & 15 || bs * (uint64_t)bn > (32u << 20) || fn != bs / fs * bn) return -EINVAL;
+    s->ring_np = bs * bn / 4096;
+    s->ring_pa = pmm_alloc_run(s->ring_np);
+    if (!s->ring_pa) return -ENOMEM;
+    s->fsz = s->pver == 2 ? bs : fs; s->fnr = s->pver == 2 ? bn : fn; s->rcur = 0;
+    return 0;
+}
+
+int sock_pkt_mmap(sock_t* s, uint64_t pd, uint64_t addr, uint64_t len) {
+    if (!s->ring_pa || len > (uint64_t)s->ring_np * 4096) return -EINVAL;
+    for (uint64_t i = 0; i < len / 4096; i++)
+        if (vmm_map_frame(pd, addr + i * 4096, s->ring_pa + i * 4096, true) < 0) return -ENOMEM;
+    return 0;
+}
+
+int sock_pkt_bind(sock_t* s, int ifidx, int proto) {
+    if (ifidx && ifidx - 2 >= net_ifcount()) return -19;
+    s->pifi = ifidx;
+    if (proto) s->pproto = (uint16_t)proto;
+    s->bound = true;
+    return 0;
+}
+
+int sock_pkt_send(sock_t* s, const uint8_t* buf, uint32_t len, int ifidx, int proto, const uint8_t* mac) {
+    int ifi = (ifidx ? ifidx : s->pifi) - 2;
+    if (ifi < 0) return -19;
+    if (s->type == 3) return net_raw_send(ifi, buf, (int)len) < 0 ? -5 : (int)len;
+    if (!mac) return -EDESTADDRREQ;
+    return net_eth_send(ifi, mac, (uint16_t)(proto ? proto : s->pproto), buf, (int)len) < 0 ? -5 : (int)len;
+}
 
 int sock_v6only(sock_t* s, int set, int val) {
     if (set >= 0) s->v6only = val != 0;
@@ -1451,6 +1609,7 @@ void sock_name(sock_t* s, bool peer, uint8_t* ip, uint16_t* port) {
 int sock_take_error(sock_t* s) { int e = s->err; s->err = 0; return e; }
 
 bool sock_readable(sock_t* s) {
+    if (s->ring_pa) return *(volatile uint32_t*)((uint8_t*)P2V(s->ring_pa) + (uint64_t)(s->rcur ? s->rcur - 1 : s->fnr - 1) * s->fsz) & 1;
     if (s->type != 1) return s->q_head != NULL || s->err;
     if (s->state == S_LISTEN) return s->aq_n > 0;
     return s->rx_count || s->fin_rcvd || s->err || s->state == S_CLOSED;

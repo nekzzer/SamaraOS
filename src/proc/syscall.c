@@ -958,7 +958,7 @@ static int64_t do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd,
     if (!(flags & MAP_ANON)) {
         f = getf(fd);
         if (!f) return -EBADF;
-        if (f->type != F_NODE && f->type != F_ZERO && f->type != F_FB && f->type != F_DRM && f->type != F_URING) return -EACCES;
+        if (f->type != F_NODE && f->type != F_ZERO && f->type != F_FB && f->type != F_DRM && f->type != F_URING && f->type != F_SOCKET) return -EACCES;
     }
     uint64_t lo = USER_MMAP_BASE, hi = USER_STACK_TOP - USER_STACK_MAX;
     if (flags & MAP_FIXED) {
@@ -971,6 +971,12 @@ static int64_t do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd,
     } else {
         addr = vmm_find_free(p->pd, lo, hi, len);
         if (!addr) return -ENOMEM;
+    }
+    if (f && f->type == F_SOCKET) {
+        int sr = sock_pkt_mmap(f->sock, p->pd, addr, len);
+        if (sr < 0) return sr;
+        vmm_flush();
+        return (int64_t)addr;
     }
     if (f && f->type == F_URING) {
         int ur = uring_mmap(f->ur, p->pd, addr, len, off);
@@ -1523,7 +1529,16 @@ static int write_addr(uint64_t uaddr, uint64_t ulen, int af, const uint8_t* ip, 
     sockaddr_in6_t sa;
     memset(&sa, 0, sizeof(sa));
     uint32_t sz;
-    if (af == AF_INET6) {
+    if (af == 17) {                                                   /* sockaddr_ll, mac/type/ifindex hidden in ip[] */
+        uint8_t* l = (uint8_t*)&sa;
+        *(uint16_t*)l = 17;
+        *(uint16_t*)(l + 2) = nbo16(port);
+        *(int*)(l + 4) = ip[7];
+        *(uint16_t*)(l + 8) = 1;
+        l[10] = ip[6]; l[11] = 6;
+        memcpy(l + 12, ip, 6);
+        sz = 20;
+    } else if (af == AF_INET6) {
         sa.family = AF_INET6;
         sa.port = nbo16(port);
         memcpy(sa.addr, ip, 16);
@@ -1594,6 +1609,7 @@ static int sock_ioctl(uint32_t req, uint64_t arg) {
             return 0;
         case 0x8921: *(int*)(ifr + 16) = i < 0 ? 65536 : 1500; return 0;   /* MTU */
         case 0x8942: *(int*)(ifr + 16) = i < 0 ? 0 : 1000; return 0;       /* TXQLEN */
+        case 0x8946: return -95;                                           /* SIOCETHTOOL, libpcap only wants a sane errno */
     }
     return -ENOTTY;
 }
@@ -2152,6 +2168,15 @@ static int64_t sys_socket_call(int call, uint64_t a, uint64_t b, uint64_t c,
                 memset(fl->pipe, 0, sizeof(pipe_t));
                 return install_fd(fl, 0, (b & 02000000) != 0);
             }
+            if (a == 17) {                                            /* AF_PACKET */
+                if ((b & 0xF) != 2 && (b & 0xF) != 3) return -94;
+                s = sock_create(17, (int)(b & 0xF), nbo16((uint16_t)c), &err);
+                if (!s) return err;
+                fl = file_new(F_SOCKET, 2 | ((b & 04000) ? O_NONBLOCK : 0));
+                if (!fl) { sock_close(s); return -ENOMEM; }
+                fl->sock = s;
+                return install_fd(fl, 0, (b & 02000000) != 0);
+            }
             if (a != AF_INET && a != AF_INET6) return -97;
             int type = (int)(b & 0xF);
             if (type == 3) { if (c != (a == AF_INET ? 1 : 58)) return -93; }
@@ -2165,6 +2190,11 @@ static int64_t sys_socket_call(int call, uint64_t a, uint64_t b, uint64_t c,
         }
         case 2:                                                       /* bind */
             if (!(s = getsock((int)a, &err))) return err;
+            if (sock_af(s) == 17) {
+                if (c < 12) return -EINVAL;
+                UCHK((void*)b, 12);
+                return sock_pkt_bind(s, *(int*)(b + 4), nbo16(*(uint16_t*)(b + 2)));
+            }
             if ((err = read_addr(b, c, ip, &port)) < 0) return err;
             return sock_bind(s, ip, port);
         case 3:                                                       /* connect */
@@ -2194,6 +2224,11 @@ static int64_t sys_socket_call(int call, uint64_t a, uint64_t b, uint64_t c,
             if (!(s = getsock((int)a, &err))) return err;
             UCHK((void*)b, c);
             bool nb = (getf((int)a)->flags & O_NONBLOCK) || (d & 0x40);
+            if (sock_af(s) == 17) {
+                const uint8_t* mac = 0; int ifx = 0, pr = 0;
+                if (call == 11 && e && f6 >= 20) { UCHK((void*)e, 20); ifx = *(int*)(e + 4); pr = nbo16(*(uint16_t*)(e + 2)); mac = (const uint8_t*)(e + 12); }
+                return sock_pkt_send(s, (const uint8_t*)b, c, ifx, pr, mac);
+            }
             if (call == 11 && e) {
                 if ((err = read_addr(e, f6, ip, &port)) < 0) return err;
                 return sock_send(s, (const uint8_t*)b, c, nb, ip, &port);
@@ -2220,6 +2255,12 @@ static int64_t sys_socket_call(int call, uint64_t a, uint64_t b, uint64_t c,
                 UCHK((void*)d, 16);
                 int64_t* tv = (int64_t*)d;
                 sock_rcvtmo(s, (uint32_t)(tv[0] * 1000 + tv[1] / 1000));
+            } else if (sock_af(s) == 17) {
+                if (b == 263 && c == 5) { UCHK((void*)d, e < 28 ? 16 : 28); return sock_pkt_ring(s, (uint32_t*)d); }
+                if (b == 263 && c == 10) return d ? sock_pkt_ver(s, *(int*)d) : -22;
+                if (b == 263) return 0;                                   /* membership (promisc: nothing to do), reserve, ts.. */
+                if (b == 1 && c == 26) return -92;                        /* no bpf, libpcap filters in userland */
+                if (d && e >= 1) { UCHK((void*)d, 1); sock_opt(s, (int)b, (int)c, e >= 4 ? *(int*)d : *(uint8_t*)d); }
             } else if (b == 6 && c == 13 && d && e >= 4) {            /* TCP_CONGESTION */
                 UCHK((void*)d, e);
                 return sock_setcc(s, (const char*)d, (int)e);
@@ -2234,6 +2275,15 @@ static int64_t sys_socket_call(int call, uint64_t a, uint64_t b, uint64_t c,
             UCHK((void*)e, 4);
             UCHK((void*)d, 4);
             int v = 0;
+            if (sock_af(s) == 17 && b == 263) {
+                if (c == 11) { int v = *(int*)d; if (v < 1 || v > 2) return -92; *(int*)d = v == 2 ? 68 : 52; *(uint32_t*)e = 4; return 0; }   /* HDRLEN, v2 */
+                if (c != 6) return -EINVAL;                               /* PACKET_STATISTICS */
+                uint32_t l = *(uint32_t*)e;
+                UCHK((void*)d, l < 8 ? l : 8);
+                memset((void*)d, 0, l < 8 ? l : 8);
+                *(uint32_t*)e = l < 8 ? l : 8;
+                return 0;
+            }
             { uint32_t l = *(uint32_t*)e; UCHK((void*)d, l); if (sock_getopt(s, (int)b, (int)c, (uint8_t*)d, &l)) { *(uint32_t*)e = l; return 0; } }
             if (b == 1 && c == 4) v = sock_take_error(s);             /* SO_ERROR */
             else if (b == 1 && c == 3) v = sock_type(s);              /* SO_TYPE */
