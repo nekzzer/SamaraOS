@@ -4,6 +4,7 @@
 
 void mouse_init(void);
 void mouse_feed(int dx, int dy, int dz, uint8_t btn);
+void mouse_feed_abs(int x, int y, int xmax, int ymax, int dz, uint8_t btn);
 void mouse_get(int* x, int* y, uint8_t* btn);
 void mouse_draw_cursor(void);
 void mouse_hide_cursor(void);

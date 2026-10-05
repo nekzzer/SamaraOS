@@ -241,8 +241,8 @@ static void* input_thread(void* arg) {
 
 static void input_start(void) {
     if (mpipe[0] >= 0) return;
-    int fd = open("/dev/input", O_RDONLY);
-    if (fd < 0) { perror("/dev/input"); return; }
+    int fd = open("/dev/input-all", O_RDONLY);
+    if (fd < 0) { perror("/dev/input-all"); return; }
     pipe(mpipe);
     pipe(kpipe);
     pthread_t t;

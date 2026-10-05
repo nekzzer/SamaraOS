@@ -35,6 +35,8 @@ enum { FS_DEV_NONE = 0, FS_DEV_NULL, FS_DEV_ZERO, FS_DEV_TTY, FS_DEV_RANDOM, FS_
        FS_DEV_DRM, FS_DEV_DRMR, FS_DEV_SNDC, FS_DEV_SNDP };   /* /dev/dri/card0, renderD128 */   /* /dev/input-kbd, /dev/input-mouse: evdev for xorg */
 #define FS_DEV_DISK 16                 /* FS_DEV_DISK + ata index: /dev/hda.. /dev/sda.. */
 #define FS_DEV_PTS  64                 /* FS_DEV_PTS + n: /dev/pts/n (pty slaves) */
+#define FS_DEV_EVENT 80                /* FS_DEV_EVENT + n: /dev/input/eventN */
+#define FS_DEV_IS_EVENT(d) ((d) >= FS_DEV_EVENT && (d) < FS_DEV_EVENT + 12)
 #define FS_DEV_IS_DISK(d) ((d) >= FS_DEV_DISK && (d) < FS_DEV_PTS)
 #define FS_DEV_IS_PTS(d)  ((d) >= FS_DEV_PTS && (d) < FS_DEV_PTS + 16)
 
