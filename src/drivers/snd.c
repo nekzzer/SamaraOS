@@ -98,11 +98,56 @@ static void hw_update(void) {
     if ((int32_t)(pit_uptime_ms() - drain_at) >= 0) { hda_run(false); state = S_SETUP; }
 }
 
+// mediaplayer tones: square wave pushed into the ring by the snd task, alsa owns the stream when it is open
+static void do_prepare(void);
+static void do_start(void);
+static uint32_t tone_f, tone_ph, tone_quiet;
+static bool tone_run;
+
+static void tone_put(uint32_t n) {
+    int16_t* r = (int16_t*)hda_ring();
+    uint32_t step = tone_f ? (uint32_t)(((uint64_t)tone_f << 32) / rate) : 0;
+    while (n--) {
+        int16_t v = !tone_f ? 0 : (tone_ph & 0x80000000u) ? -5000 : 5000;
+        tone_ph += step;
+        uint64_t p = appl % bfr;
+        r[p * 2] = r[p * 2 + 1] = v;
+        appl++;
+    }
+}
+
+static void tone_tick(void) {
+    if (!tone_run) return;
+    if (state == S_XRUN) { do_prepare(); tone_put(bfr / 2); do_start(); }
+    while (appl - hw < bfr * 3 / 4) tone_put(128);
+    if (tone_f) tone_quiet = 0;
+    else if (!tone_quiet) tone_quiet = pit_uptime_ms() | 1;
+    else if ((int32_t)(pit_uptime_ms() - tone_quiet) > 400) { hda_run(false); state = S_OPEN; tone_run = false; }
+}
+
+bool snd_tone(uint32_t f) {
+    if (!have) return false;
+    uint64_t fl = spin_lock(&lk);
+    if (open_pcm || (state != S_OPEN && !tone_run)) { spin_unlock(&lk, fl); return false; }
+    tone_f = f;
+    if (f && !tone_run) {
+        tone_run = true;
+        rate = 48000;
+        pfr = 512; bfr = 2048; perb = 2048; bufb = 8192;
+        do_prepare();
+        tone_put(bfr / 2);
+        do_start();
+    }
+    spin_unlock(&lk, fl);
+    return true;
+}
+
 static void snd_task(void) {
     for (;;) {
         task_sleep_ms(state == S_RUN || state == S_DRAIN ? 4 : 40);
         uint64_t f = spin_lock(&lk);
         hw_update();
+        tone_tick();
         spin_unlock(&lk, f);
         wq_wake(&wq);
     }
@@ -115,6 +160,9 @@ struct snd_fd* snd_open(int pcm) {
     if (!have) return NULL;
     if (pcm) {
         if (open_pcm) return NULL;
+        uint64_t f = spin_lock(&lk);
+        if (tone_run) { hda_run(false); tone_run = false; }
+        spin_unlock(&lk, f);
         open_pcm = 1;
         state = S_OPEN;
         rate = 0;

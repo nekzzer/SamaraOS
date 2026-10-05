@@ -10,17 +10,20 @@
 #include "core/io.h"
 #include "core/string.h"
 #include "drivers/keyboard.h"
+#include "drivers/snd.h"
 
 /* ------------------------------------------------------------------ */
 /*  PC speaker driver (PIT channel 2)                                  */
 /* ------------------------------------------------------------------ */
 
 static void spk_off(void) {
+    if (snd_tone(0)) return;
     uint8_t t = inb(0x61);
     if (t & 3) outb(0x61, t & 0xFC);
 }
 static void spk_on(uint16_t freq) {
     if (freq == 0) { spk_off(); return; }
+    if (snd_tone(freq)) return;
     if (freq < 30)    freq = 30;
     if (freq > 12000) freq = 12000;
     uint32_t div = 1193180U / (uint32_t)freq;
