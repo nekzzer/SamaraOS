@@ -1288,6 +1288,14 @@ static int do_statfs(uint64_t* b, fs_node_t* at) {
         b[8] = 255; b[9] = cs;
         return 0;
     }
+    uint64_t tb, fb;
+    if (at && ext2_statfs(at, &cs, &tb, &fb)) {
+        b[0] = 0xEF53;
+        b[1] = cs;
+        b[2] = tb; b[3] = fb; b[4] = fb;
+        b[8] = 255; b[9] = cs;
+        return 0;
+    }
     b[0] = 0x858458f6;                                  /* RAMFS_MAGIC */
     b[1] = 4096;
     b[2] = pmm_total_frames();

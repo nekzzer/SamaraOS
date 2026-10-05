@@ -73,6 +73,16 @@ static int wblk(ev_t* v, uint32_t b, const void* buf) {
     return ata_write(v->disk, b * v->spb, (int)v->spb, buf);
 }
 
+/* statfs of the volume n sits on, false if it isn't ext2. free count is from the last sync */
+bool ext2_statfs(fs_node_t* n, uint32_t* bs, uint64_t* tot, uint64_t* fr) {
+    fs_node_t* o = n ? fs_owner(n) : NULL;
+    if (!o || o->mount_id < E2_ID0 || o->mount_id >= E2_ID0 + E2_MAX) return false;
+    ev_t* v = &vols[o->mount_id - E2_ID0];
+    if (!v->used) return false;
+    *bs = v->bs; *tot = v->nblocks; *fr = rd32(v->sb + 12);
+    return true;
+}
+
 /* volume label; we use "/some/path" labels as the mount point */
 void ext2_label(int disk, char* out) {
     uint8_t s[1024];
