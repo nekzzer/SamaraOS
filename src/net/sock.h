@@ -16,10 +16,20 @@ void    sock_input_tcp(uint32_t src, uint32_t dst, const uint8_t* seg, int len);
 void    sock_input_udp(uint32_t src, uint32_t dst, const uint8_t* dgram, int len);
 void    sock_input_tcp6(const uint8_t* src, const uint8_t* dst, const uint8_t* seg, int len);
 void    sock_input_udp6(const uint8_t* src, const uint8_t* dst, const uint8_t* dgram, int len);
+void    sock_input_pkt(int ifi, const uint8_t* fr, int len, int pt);
+extern int npkt_socks;
+int     sock_pkt_ring(sock_t* s, uint32_t* rq);
+void    sock_pkt_flush(void);
+int     sock_pkt_ver(sock_t* s, int v);
+int     sock_pkt_mmap(sock_t* s, uint64_t pd, uint64_t addr, uint64_t len);
+int     sock_pkt_bind(sock_t* s, int ifidx, int proto);
+int     sock_pkt_send(sock_t* s, const uint8_t* buf, uint32_t len, int ifidx, int proto, const uint8_t* mac);
 void    sock_input_icmp6(const uint8_t* src, const uint8_t* dst, const uint8_t* msg, int len, int hl);
 void    sock_input_icmp(uint32_t src, uint32_t dst, const uint8_t* pkt, int ihl, int total);
 void    sock_rcvtmo(sock_t* s, uint32_t ms);
 void    sock_opt(sock_t* s, int level, int name, int val);
+int     sock_setcc(sock_t* s, const char* name, int len);
+int     sock_getopt(sock_t* s, int level, int name, uint8_t* out, uint32_t* len);
 int     sock_cmsg(sock_t* s, uint8_t* out, int cap);
 
 /* All return >= 0 or -errno. `nonblock` comes from the file's O_NONBLOCK. */

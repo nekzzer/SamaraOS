@@ -9,7 +9,7 @@ SIZE=${SIZE:-4G}
 REPO=${REPO:-https://repo-fastly.voidlinux.org/current/musl}
 PKGS="base-files musl busybox coreutils findutils grep sed gawk tar gzip xz bash dash xbps \
       ca-certificates openssl curl wget nano htop dropbear openssh iproute2 file less \
-      ncurses-base ncurses procps-ng util-linux shadow iputils \
+      ncurses-base ncurses procps-ng util-linux shadow iputils iperf3 tcpdump \
       wayland libxkbcommon xkeyboard-config foot xterm xorg-server-xwayland \
       font-misc-misc dejavu-fonts-ttf fontconfig \
       mesa-dri mesa-demos xclock xeyes xcalc xev xclip xsel xdotool wl-clipboard wayland-utils \

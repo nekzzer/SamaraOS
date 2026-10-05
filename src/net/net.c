@@ -9,6 +9,7 @@
 #include "boot/pit.h"
 #include "core/task.h"
 #include "net/sock.h"
+#include "core/smp.h"
 
 /* === Small IP/ARP/ICMP/TCP-client stack over RTL8139. ===
    No fragmentation, no retransmits, single TCP connection at a time.
@@ -184,6 +185,17 @@ static void send_eth(nif_t* f, uint16_t type, const uint8_t* dst_mac, const void
     eh->type = htons(type);
     memcpy(frame + ETH_HDR, payload, len);
     nic_send(f, frame, ETH_HDR + len);
+    sock_input_pkt((int)(f - nifs), frame, ETH_HDR + len, 4);
+    if (npkt_socks) sock_pkt_flush();
+}
+
+/* AF_PACKET sockets sending whole frames */
+int net_raw_send(int ifi, const void* fr, int len) {
+    if (ifi < 0 || ifi >= n_nifs || len < 14 || len > PKT_BUF || !g_ready) return -1;
+    nic_send(&nifs[ifi], fr, len);
+    sock_input_pkt(ifi, (const uint8_t*)fr, len, 4);
+    if (npkt_socks) sock_pkt_flush();
+    return 0;
 }
 
 int net_eth_send(int ifi, const uint8_t* dmac, uint16_t type, const void* pl, int len) {
@@ -269,10 +281,12 @@ static struct {
 
 /* === loopback: packets to 127/8 or to ourselves are queued and fed back
    into on_ipv4 by net_poll (never recursively from the send path). === */
-#define LOOP_SLOTS 64
+#define LOOP_SLOTS 1024
 static uint8_t* g_loop[LOOP_SLOTS];
 static int      g_loop_len[LOOP_SLOTS];
 static int      g_loop_head, g_loop_tail;
+static uint32_t g_loop_bytes;
+static uint8_t  g_loop_big[LOOP_SLOTS];
 
 static bool is_local(uint32_t ip) { return (ip >> 24) == 127 || nif_by_ip(ip) != NULL; }
 
@@ -280,9 +294,61 @@ static void on_ipv4(const uint8_t* pkt, int len);
 
 uint8_t net_ttl;
 
+/* kmalloc of 16k a packet was slow with all the other stuff in the heap: keep some around */
+#define BIGB 16448
+static uint8_t* bpool[2][64];
+static int bpn[2];
+static spin_t bpl;
+
+uint8_t* net_buf_get(int big) {
+    uint64_t f = spin_lock(&bpl);
+    uint8_t* p = bpn[big] ? bpool[big][--bpn[big]] : NULL;
+    spin_unlock(&bpl, f);
+    return p ? p : (uint8_t*)kmalloc(big ? BIGB : PKT_BUF);
+}
+
+void net_buf_put(uint8_t* p, int big) {
+    uint64_t f = spin_lock(&bpl);
+    if (bpn[big] < 64) { bpool[big][bpn[big]++] = p; p = NULL; }
+    spin_unlock(&bpl, f);
+    if (p) kfree(p);
+}
+
+/* loopback has no mtu to speak of: one malloc per packet, handed to on_ipv4 as is */
+static void loop_pkt(uint32_t dst, uint8_t proto, const void* payload, int len) {
+    int total = 20 + len;
+    uint32_t irq = irq_save();
+    int next = (g_loop_head + 1) % LOOP_SLOTS;
+    if (total > BIGB || next == g_loop_tail || g_loop_bytes > (8u << 20)) { irq_restore(irq); return; }
+    int big = total > PKT_BUF;
+    uint8_t* p = net_buf_get(big);
+    if (!p) { irq_restore(irq); return; }
+    ip4_hdr_t* ih = (ip4_hdr_t*)p;
+    static uint16_t lid = 1;
+    ih->vihl = 0x45;
+    ih->tos = 0;
+    ih->total = htons((uint16_t)total);
+    ih->id = htons(lid++);
+    ih->flags_frag = 0;
+    ih->ttl = net_ttl ? net_ttl : 64;
+    ih->proto = proto;
+    ih->check = 0;
+    ih->src = htonl(dst);
+    ih->dst = htonl(dst);
+    ih->check = htons(cksum(ih, sizeof(*ih)));
+    memcpy(p + 20, payload, len);
+    g_loop[g_loop_head] = p;
+    g_loop_big[g_loop_head] = big;
+    g_loop_len[g_loop_head] = total;
+    g_loop_bytes += total;
+    g_loop_head = next;
+    irq_restore(irq);
+}
+
 static void send_ip(uint32_t dst, uint8_t proto, const void* payload, int len) {
     uint8_t frame[PKT_BUF];
     int total = sizeof(ip4_hdr_t) + len;
+    if (is_local(dst)) { loop_pkt(dst, proto, payload, len); return; }
     if (total > MTU) return;
     uint32_t irq = irq_save();
     nif_t* out = route(dst);
@@ -304,19 +370,6 @@ static void send_ip(uint32_t dst, uint8_t proto, const void* payload, int len) {
 
     memcpy(frame + sizeof(ip4_hdr_t), payload, len);
 
-    if (is_local(dst)) {
-        int next = (g_loop_head + 1) % LOOP_SLOTS;
-        if (next != g_loop_tail) {
-            if (!g_loop[g_loop_head]) g_loop[g_loop_head] = (uint8_t*)kmalloc(PKT_BUF);
-            if (g_loop[g_loop_head]) {
-                memcpy(g_loop[g_loop_head], frame, total);
-                g_loop_len[g_loop_head] = total;
-                g_loop_head = next;
-            }
-        }
-        irq_restore(irq);
-        return;
-    }
     uint8_t mac[6];
     if (resolve_mac(dst, mac, 1000)) send_eth(out, ET_IPV4, mac, frame, total);
     irq_restore(irq);
@@ -324,6 +377,12 @@ static void send_ip(uint32_t dst, uint8_t proto, const void* payload, int len) {
 
 void net_send_ip(uint32_t dst, uint8_t proto, const void* payload, int len) {
     send_ip(dst, proto, payload, len);
+}
+
+uint32_t net_rxwnd(uint32_t dst) {
+    if ((dst >> 24) == 127) return 1 << 20;
+    nif_t* f = dst ? route(dst) : &nifs[0];
+    return f && f->kind == NIC_E1000 ? 192 * 1024 : 48 * 1024;
 }
 
 uint32_t net_src_for(uint32_t dst) {
@@ -524,12 +583,16 @@ void net_poll(void) {
     uint32_t irq = irq_save();
     uint8_t buf[PKT_BUF];                  /* on the stack: net_poll can nest via ARP */
     bool got = false;
-    for (int i = 0; i < 64 && g_loop_tail != g_loop_head; i++) {
+    for (int i = 0; i < 256 && g_loop_tail != g_loop_head; i++) {
         int slot = g_loop_tail;
         got = true;
         g_loop_tail = (g_loop_tail + 1) % LOOP_SLOTS;
-        memcpy(buf, g_loop[slot], g_loop_len[slot]);
-        on_ipv4(buf, g_loop_len[slot]);
+        uint8_t* p = g_loop[slot];
+        int pl = g_loop_len[slot];
+        g_loop[slot] = NULL;
+        g_loop_bytes -= pl;
+        on_ipv4(p, pl);
+        net_buf_put(p, g_loop_big[slot]);
     }
     for (int k = 0; g_ready && k < n_nifs; k++)
         for (int i = 0; i < 32; i++) {
@@ -538,12 +601,19 @@ void net_poll(void) {
             got = true;
             if (n < ETH_HDR) continue;
             const eth_hdr_t* eh = (const eth_hdr_t*)buf;
+            if (npkt_socks) {
+                int pt = 3;
+                if (eh->dst[0] & 1) pt = (eh->dst[0] & eh->dst[1] & eh->dst[2] & eh->dst[3] & eh->dst[4] & eh->dst[5]) == 0xFF ? 1 : 2;
+                else if (!memcmp(eh->dst, nifs[k].mac, 6)) pt = 0;
+                sock_input_pkt(k, buf, n, pt);
+            }
             uint16_t type = ntohs(eh->type);
             if (type == ET_ARP) on_arp(&nifs[k], buf + ETH_HDR, n - ETH_HDR);
             else if (type == ET_IPV4) on_ipv4(buf + ETH_HDR, n - ETH_HDR);
             else if (type == 0x86DD) ip6_input(k, buf + ETH_HDR, n - ETH_HDR, eh->src);
         }
     ip6_poll();
+    if (npkt_socks) sock_pkt_flush();
     if (got) io_wake();
     irq_restore(irq);
 }

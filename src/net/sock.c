@@ -1,3 +1,4 @@
+#include "core/vmm.h"
 #include "net/sock.h"
 #include "net/net.h"
 #include "core/io.h"
@@ -34,9 +35,11 @@
 #define TCP_ACK 0x10
 
 #define MAX_SOCKS  1024
-#define RX_CAP     (64u * 1024u)
-#define TX_CAP     (64u * 1024u)
-#define MSS        1400
+#define BUF_DEF    (128u * 1024u)
+#define BUF_MAX    (4u * 1024u * 1024u)
+#define BUF_MIN    (16u * 1024u)
+#define MSS_MAX    1460
+#define LO_MSS     16000                /* loopback: no real mtu, see net.c loop_pkt */
 #define ACCEPT_MAX 64
 #define UDP_QMAX   32
 
@@ -50,6 +53,7 @@ typedef struct dgram {
     uint16_t len;
     uint8_t  ttl;
     uint32_t ts_s, ts_us;
+    uint16_t pproto;               /* AF_PACKET: ethertype of this frame */
     uint8_t  data[];
 } dgram_t;
 
@@ -60,6 +64,12 @@ struct sock {
     int      state;
     int      af, proto;            /* 2 or 10 as the user sees it */
     bool     v6only;
+    uint16_t pproto;               /* AF_PACKET: ethertype wanted, 3 = all */
+    int      pifi;                 /* ifindex, 0 = any */
+    uint64_t ring_pa;              /* rx ring (tpacket v2) */
+    uint32_t ring_np, fsz, fnr, rcur;
+    uint32_t pver, boff, bnum;     /* tpacket version, v3: write offset and pkt count in the open block */
+    uint64_t bseq;
     uint8_t  lip[16], rip[16];     /* ipv4 is ::ffff:a.b.c.d, zero = any */
     uint16_t lport, rport;
     bool     bound, connected;
@@ -72,14 +82,34 @@ struct sock {
     uint32_t l_s, l_us;
 
     /* TCP */
-    uint32_t iss, snd_una, snd_nxt, rcv_nxt, tx_seq;
-    uint16_t snd_wnd;
-    uint16_t adv_wnd;          /* receive window we last advertised */
-    uint8_t* rx; uint32_t rx_head, rx_count;
-    uint8_t* tx; uint32_t tx_len;
+    uint32_t iss, snd_una, snd_nxt, snd_max, rcv_nxt, tx_seq;
+    uint32_t snd_wnd;
+    uint32_t adv_wnd;          /* receive window we last advertised */
+    uint8_t  snd_ws, rcv_ws;
+    bool     ws_ok, ts_ok, sack_ok;
+    uint16_t mss;              /* payload per segment, without options */
+    uint32_t ts_recent;
+    uint8_t* rx; uint32_t rx_cap, rx_head, rx_count;
+    uint8_t* tx; uint32_t tx_cap, tx_head, tx_len;
+    uint32_t ooo[6][2]; int ooo_n;              /* received above rcv_nxt, newest first */
+    uint32_t sb[8][2]; int sb_n;                /* what the peer sacked, sorted */
+    uint32_t cwnd, ssthresh, recover, rexmit_hi, dupacks, acked_acc;
+    uint8_t  rec;                               /* 0 no, 1 fast recovery, 2 after rto */
+    uint8_t  cc;                                /* 0 reno, 1 cubic */
+    uint32_t cb_wmax, cb_k, cb_t0, cb_cnt;
+    uint32_t srtt, rttvar, rto, rtt_seq, rtt_t0;
+    bool     rtt_on, timer_on;
     bool     fin_rcvd, shut_wr, fin_sent;
-    uint32_t rto, last_tx_ms, deadline_ms;
+    uint32_t last_tx_ms, deadline_ms, rto_at;
     int      retries;
+    bool     nodelay, cork, ka_on;
+    uint32_t ka_idle, ka_intvl, ka_cnt, last_rx_ms, ka_at;
+    int      ka_n;
+    bool     ack_now;
+    uint32_t ack_at;
+    uint8_t  ack_segs, quick;
+    uint32_t n_retrans, last_data_ms, last_ack_ms;
+    uint32_t want_rx, want_tx;                  /* SO_RCVBUF/SO_SNDBUF, 0 = default */
     sock_t*  parent;
     sock_t*  acceptq[ACCEPT_MAX];
     int      aq_n, backlog;
@@ -91,6 +121,7 @@ struct sock {
 };
 
 static sock_t socks[MAX_SOCKS];
+int npkt_socks;
 static const uint8_t zero_ip[16];
 static uint16_t next_eph = 49152;
 
@@ -154,6 +185,44 @@ static int ip_out(const uint8_t* src, const uint8_t* dst, uint8_t proto, const v
 
 /* ---------------- allocation ---------------- */
 
+static bool tcp_bufs(sock_t* s, uint32_t rc, uint32_t tc) {
+    s->rx = (uint8_t*)kmalloc_big(rc);
+    s->tx = (uint8_t*)kmalloc_big(tc);
+    if (!s->rx || !s->tx) {
+        if (s->rx) kfree(s->rx);
+        if (s->tx) kfree(s->tx);
+        s->rx = s->tx = NULL;
+        return false;
+    }
+    s->rx_cap = rc; s->tx_cap = tc;
+    return true;
+}
+
+static uint32_t buf_clamp(uint32_t v) { return v < BUF_MIN ? BUF_MIN : v > BUF_MAX ? BUF_MAX : v; }
+
+/* resize the rings, keeps what is queued; stays as it was if there is no memory */
+static void tcp_setbuf(sock_t* s, uint32_t rc, uint32_t tc) {
+    rc = buf_clamp(rc); tc = buf_clamp(tc);
+    if (!s->rx) return;
+    if (rc != s->rx_cap && rc >= s->rx_count) {
+        uint8_t* r = (uint8_t*)kmalloc_big(rc);
+        if (r) {
+            for (uint32_t i = 0; i < s->rx_count; i++) r[i] = s->rx[(s->rx_head + i) % s->rx_cap];
+            kfree(s->rx);
+            s->rx = r; s->rx_cap = rc; s->rx_head = 0;
+            s->ooo_n = 0;
+        }
+    }
+    if (tc != s->tx_cap && tc >= s->tx_len) {
+        uint8_t* r = (uint8_t*)kmalloc_big(tc);
+        if (r) {
+            for (uint32_t i = 0; i < s->tx_len; i++) r[i] = s->tx[(s->tx_head + i) % s->tx_cap];
+            kfree(s->tx);
+            s->tx = r; s->tx_cap = tc; s->tx_head = 0;
+        }
+    }
+}
+
 static sock_t* alloc_sock(int type, int af) {
     for (int i = 0; i < MAX_SOCKS; i++) {
         sock_t* s = &socks[i];
@@ -163,16 +232,13 @@ static sock_t* alloc_sock(int type, int af) {
         s->type = type;
         s->af = af;
         s->refs = 1;
-        s->rto = 300;
-        if (type == 1) {
-            s->rx = (uint8_t*)kmalloc(RX_CAP);
-            s->tx = (uint8_t*)kmalloc(TX_CAP);
-            if (!s->rx || !s->tx) {
-                if (s->rx) kfree(s->rx);
-                if (s->tx) kfree(s->tx);
-                s->used = false;
-                return NULL;
-            }
+        s->rto = 1000;
+        s->mss = 536;
+        if (af == 17) npkt_socks++;
+        s->ka_idle = 7200; s->ka_intvl = 75; s->ka_cnt = 9;
+        if (type == 1 && !tcp_bufs(s, BUF_DEF, BUF_DEF)) {
+            s->used = false;
+            return NULL;
         }
         return s;
     }
@@ -180,6 +246,11 @@ static sock_t* alloc_sock(int type, int af) {
 }
 
 static void free_sock(sock_t* s) {
+    if (s->af == 17) {
+        npkt_socks--;
+        if (s->ring_pa) for (uint32_t i = 0; i < s->ring_np; i++) pmm_unref(s->ring_pa + i * 4096);
+        s->ring_pa = 0;
+    }
     wq_drain(&s->wq);
     if (s->rx) kfree(s->rx);
     if (s->tx) kfree(s->tx);
@@ -206,26 +277,91 @@ static uint16_t ephemeral(int type) {
 
 /* ---------------- TCP output ---------------- */
 
-/* The NIC is polled and its receive ring holds 64 KiB (~42 full frames with
-   headers): never let the peer have more in flight than fits, or bursts
-   overflow the ring and every drop costs a retransmit timeout. */
-#define RX_WND_MAX (48u * 1024u)
-#define RX_MSS     1460                     /* advertised in SYNs (default would be 536) */
+/* The NIC is polled and its receive ring is small (rtl8139: 64 KiB, ~42 full
+   frames): never let the peer have more in flight than fits, or bursts
+   overflow the ring and every drop costs a retransmit. net_rxwnd knows. */
 
-static uint16_t rx_window(sock_t* s) {
-    uint32_t free = RX_CAP - s->rx_count;
-    return (uint16_t)(free > RX_WND_MAX ? RX_WND_MAX : free);
+typedef struct {
+    int mss, ws;
+    bool sackok, ts;
+    uint32_t tsval, tsecr;
+    int nsack;
+    uint32_t sack[4][2];
+} topt_t;
+
+static inline int32_t sd(uint32_t a, uint32_t b) { return (int32_t)(a - b); }
+
+static void parse_opts(const uint8_t* p, int len, topt_t* o) {
+    memset(o, 0, sizeof(*o));
+    o->ws = -1;
+    while (len > 0) {
+        uint8_t k = p[0];
+        if (k == 0) break;
+        if (k == 1) { p++; len--; continue; }
+        if (len < 2 || p[1] < 2 || p[1] > len) break;
+        int l = p[1];
+        if (k == 2 && l == 4) o->mss = (p[2] << 8) | p[3];
+        else if (k == 3 && l == 3) o->ws = p[2] > 14 ? 14 : p[2];
+        else if (k == 4 && l == 2) o->sackok = true;
+        else if (k == 8 && l == 10) {
+            o->ts = true;
+            o->tsval = (uint32_t)p[2] << 24 | p[3] << 16 | p[4] << 8 | p[5];
+            o->tsecr = (uint32_t)p[6] << 24 | p[7] << 16 | p[8] << 8 | p[9];
+        } else if (k == 5 && (l - 2) % 8 == 0) {
+            for (int i = 2; i + 8 <= l && o->nsack < 4; i += 8, o->nsack++) {
+                o->sack[o->nsack][0] = (uint32_t)p[i] << 24 | p[i + 1] << 16 | p[i + 2] << 8 | p[i + 3];
+                o->sack[o->nsack][1] = (uint32_t)p[i + 4] << 24 | p[i + 5] << 16 | p[i + 6] << 8 | p[i + 7];
+            }
+        }
+        p += l; len -= l;
+    }
 }
 
-static void tcp_segment(sock_t* s, uint32_t seq, uint8_t flags, const uint8_t* data, uint32_t len) {
-    uint8_t buf[24 + MSS];
+static uint32_t wnd_cap(sock_t* s) {
+    if (is4(s->rip)) return net_rxwnd(un4(s->rip));
+    for (int i = 0; i < 15; i++) if (s->rip[i]) return net_rxwnd(0);
+    return s->rip[15] == 1 ? net_rxwnd(0x7F000001) : net_rxwnd(0);
+}
+
+static uint32_t rx_window(sock_t* s) {
+    uint32_t fr = s->rx_cap - s->rx_count;
+    uint32_t cap = wnd_cap(s);
+    uint32_t w = fr > cap ? cap : fr;
+    return (w >> s->rcv_ws) << s->rcv_ws;
+}
+
+static bool is_lo(const uint8_t* a) { return is4(a) && a[12] == 127; }
+static int link_mss(const uint8_t* rip) { return is_lo(rip) ? LO_MSS : is4(rip) ? MSS_MAX : MSS_MAX - 20; }
+
+static void put32(uint8_t* p, uint32_t v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
+
+static void tcp_segment(sock_t* s, uint32_t seq, uint8_t flags, uint32_t len) {
+    uint8_t sbuf[60 + MSS_MAX + 16];
+    uint8_t* buf = sbuf;
+    if (len > MSS_MAX) { buf = net_buf_get(1); if (!buf) return; }
     tcph_t* h = (tcph_t*)buf;
-    uint32_t hl = 20;
-    if (flags & TCP_SYN) {                           /* MSS option */
-        int mss = is4(s->rip) ? RX_MSS : RX_MSS - 20;
-        buf[20] = 2; buf[21] = 4; buf[22] = mss >> 8; buf[23] = mss & 0xFF;
-        hl = 24;
+    uint8_t* o = buf + 20;
+    uint32_t now = pit_uptime_ms();
+    if (flags & TCP_SYN) {
+        int mss = link_mss(s->rip);
+        *o++ = 2; *o++ = 4; *o++ = mss >> 8; *o++ = mss & 0xFF;
+        if (s->ts_ok) {
+            if (s->sack_ok) { *o++ = 4; *o++ = 2; } else { *o++ = 1; *o++ = 1; }
+            *o++ = 8; *o++ = 10; put32(o, now + 1); put32(o + 4, s->ts_recent); o += 8;
+        } else if (s->sack_ok) { *o++ = 4; *o++ = 2; *o++ = 1; *o++ = 1; }
+        if (s->ws_ok) { *o++ = 1; *o++ = 3; *o++ = 3; *o++ = s->rcv_ws; }
+    } else {
+        if (s->ts_ok) {
+            *o++ = 1; *o++ = 1; *o++ = 8; *o++ = 10;
+            put32(o, now + 1); put32(o + 4, s->ts_recent); o += 8;
+        }
+        if (s->sack_ok && s->ooo_n && !len) {
+            int n = s->ooo_n > (s->ts_ok ? 3 : 4) ? (s->ts_ok ? 3 : 4) : s->ooo_n;
+            *o++ = 1; *o++ = 1; *o++ = 5; *o++ = 2 + 8 * n;
+            for (int i = 0; i < n; i++) { put32(o, s->ooo[i][0]); put32(o + 4, s->ooo[i][1]); o += 8; }
+        }
     }
+    uint32_t hl = (uint32_t)(o - buf);
     h->sport = be16(s->lport);
     h->dport = be16(s->rport);
     h->seq = be32(seq);
@@ -233,12 +369,21 @@ static void tcp_segment(sock_t* s, uint32_t seq, uint8_t flags, const uint8_t* d
     h->off = (uint8_t)((hl / 4) << 4);
     h->flags = flags;
     s->adv_wnd = rx_window(s);
-    h->win = be16(s->adv_wnd);
+    if (flags & TCP_SYN) { uint32_t w = s->adv_wnd > 65535 ? 65535 : s->adv_wnd; h->win = be16((uint16_t)w); }
+    else h->win = be16((uint16_t)(s->adv_wnd >> s->rcv_ws));
     h->sum = 0;
     h->urg = 0;
-    if (len) memcpy(buf + hl, data, len);
-    h->sum = be16(l4_sum(s->lip, s->rip, 6, buf, (int)(hl + len)));
+    if (flags & TCP_ACK) { s->ack_now = false; s->ack_at = 0; s->ack_segs = 0; s->last_ack_ms = now; }
+    if (len) {
+        uint32_t off = (s->tx_head + (seq - s->tx_seq)) % s->tx_cap;
+        uint32_t n1 = s->tx_cap - off < len ? s->tx_cap - off : len;
+        memcpy(buf + hl, s->tx + off, n1);
+        if (len > n1) memcpy(buf + hl + n1, s->tx, len - n1);
+        s->last_data_ms = now;
+    }
+    if (!is_lo(s->rip)) h->sum = be16(l4_sum(s->lip, s->rip, 6, buf, (int)(hl + len)));
     ip_out(s->lip, s->rip, 6, buf, (int)(hl + len));
+    if (buf != sbuf) net_buf_put(buf, 1);
 }
 
 static void send_rst(const uint8_t* src, const uint8_t* dst, const tcph_t* in, int datalen) {
@@ -247,37 +392,160 @@ static void send_rst(const uint8_t* src, const uint8_t* dst, const tcph_t* in, i
     memcpy(tmp.lip, dst, 16); memcpy(tmp.rip, src, 16);
     tmp.lport = be16(in->dport); tmp.rport = be16(in->sport);
     if (in->flags & TCP_ACK) {
-        tcp_segment(&tmp, be32(in->ack), TCP_RST, NULL, 0);
+        tcp_segment(&tmp, be32(in->ack), TCP_RST, 0);
     } else {
         tmp.rcv_nxt = be32(in->seq) + (uint32_t)datalen + ((in->flags & TCP_SYN) ? 1 : 0) +
                       ((in->flags & TCP_FIN) ? 1 : 0);
-        tcp_segment(&tmp, 0, TCP_RST | TCP_ACK, NULL, 0);
+        tcp_segment(&tmp, 0, TCP_RST | TCP_ACK, 0);
     }
 }
 
-/* Push unsent data (and FIN when shut down) within the peer's window. */
+/* scoreboard: what the peer sacked, sorted, merged */
+static void sb_add(sock_t* s, uint32_t a, uint32_t b) {
+    uint32_t t[9][2];
+    int n = 0;
+    bool done = false;
+    if (sd(a, s->snd_una) < 0 || sd(b, a) <= 0 || sd(b, s->snd_max) > 0) return;
+    for (int i = 0; i < s->sb_n; i++) {
+        uint32_t x = s->sb[i][0], y = s->sb[i][1];
+        if (sd(y, a) < 0) { t[n][0] = x; t[n][1] = y; n++; }
+        else if (sd(x, b) > 0) {
+            if (!done) { t[n][0] = a; t[n][1] = b; n++; done = true; }
+            t[n][0] = x; t[n][1] = y; n++;
+        } else {
+            if (sd(x, a) < 0) a = x;
+            if (sd(y, b) > 0) b = y;
+        }
+    }
+    if (!done) { t[n][0] = a; t[n][1] = b; n++; }
+    if (n > 8) n = 8;
+    memcpy(s->sb, t, (uint32_t)n * 8);
+    s->sb_n = n;
+}
+
+static void sb_trim(sock_t* s) {
+    int n = 0;
+    for (int i = 0; i < s->sb_n; i++) {
+        if (sd(s->sb[i][1], s->snd_una) <= 0) continue;
+        s->sb[n][0] = sd(s->sb[i][0], s->snd_una) < 0 ? s->snd_una : s->sb[i][0];
+        s->sb[n][1] = s->sb[i][1];
+        n++;
+    }
+    s->sb_n = n;
+}
+
+static uint32_t sack_in(sock_t* s, uint32_t a, uint32_t b) {
+    uint32_t t = 0;
+    for (int i = 0; i < s->sb_n; i++) {
+        uint32_t x = s->sb[i][0], y = s->sb[i][1];
+        if (sd(x, a) < 0) x = a;
+        if (sd(y, b) > 0) y = b;
+        if (sd(y, x) > 0) t += y - x;
+    }
+    return t;
+}
+
+/* bytes we think are still in the network */
+static uint32_t flight(sock_t* s) {
+    if (s->rec == 1 && s->sack_ok && s->sb_n) {
+        uint32_t high = s->sb[s->sb_n - 1][1];
+        uint32_t lim = sd(s->rexmit_hi, high) < 0 ? s->rexmit_hi : high;
+        uint32_t r = 0;
+        if (sd(lim, s->snd_una) > 0) r = (lim - s->snd_una) - sack_in(s, s->snd_una, lim);
+        return (s->snd_max - high) + r;
+    }
+    uint32_t f = s->snd_nxt - s->snd_una;
+    if (s->sack_ok) { uint32_t k = sack_in(s, s->snd_una, s->snd_nxt); f = f > k ? f - k : 0; }
+    return f;
+}
+
+/* resend one segment from seq, not past end */
+static uint32_t retx_one(sock_t* s, uint32_t seq, uint32_t end) {
+    uint32_t ring_end = s->tx_seq + s->tx_len;
+    uint32_t n = end - seq;
+    if (sd(end, ring_end) > 0) n = ring_end - seq;
+    if (sd(ring_end, seq) <= 0) return 0;
+    if (n > s->mss) n = s->mss;
+    tcp_segment(s, seq, TCP_ACK, n);
+    s->n_retrans++;
+    s->rtt_on = false;
+    return n;
+}
+
+static void arm_rto(sock_t* s) {
+    if (s->timer_on) return;
+    s->timer_on = true;
+    s->rto_at = pit_uptime_ms() + s->rto;
+}
+
+/* Push unsent data (and FIN when shut down) within the windows. */
 static void tcp_output(sock_t* s) {
     if (s->state != S_ESTABLISHED && s->state != S_CLOSE_WAIT &&
         s->state != S_FIN_WAIT1 && s->state != S_LAST_ACK && s->state != S_CLOSING) return;
-    uint32_t sent = s->snd_nxt - s->tx_seq;             /* bytes of tx already in flight */
-    if (s->fin_sent && sent) sent--;
-    uint32_t wnd = s->snd_wnd ? s->snd_wnd : 1;
-    while (sent < s->tx_len) {
-        uint32_t inflight = s->snd_nxt - s->snd_una;
-        if (inflight >= wnd) break;
-        uint32_t n = s->tx_len - sent;
-        if (n > MSS) n = MSS;
-        if (n > wnd - inflight) n = wnd - inflight;
-        tcp_segment(s, s->snd_nxt, TCP_ACK | TCP_PSH, s->tx + sent, n);
+    uint32_t sent;
+    for (int guard = 0; guard < 1024; guard++) {
+        uint32_t fl = flight(s);
+        uint32_t room = s->cwnd > fl ? s->cwnd - fl : 0;
+        if (!room) break;
+        if (s->rec == 1 && s->sack_ok && s->sb_n) {
+            uint32_t a = sd(s->rexmit_hi, s->snd_una) > 0 ? s->rexmit_hi : s->snd_una;
+            uint32_t high = s->sb[s->sb_n - 1][1];
+            int i;
+            for (i = 0; i < s->sb_n; i++) {
+                if (sd(a, s->sb[i][0]) < 0) break;
+                if (sd(a, s->sb[i][1]) < 0) a = s->sb[i][1];
+            }
+            if (i < s->sb_n && sd(a, high) < 0) {
+                uint32_t n = retx_one(s, a, s->sb[i][0]);
+                if (n) {
+                    s->rexmit_hi = a + n;
+                    arm_rto(s);
+                    continue;
+                }
+            }
+        }
+        if (s->rec == 2)
+            for (int i = 0; i < s->sb_n; i++)
+                if (sd(s->snd_nxt, s->sb[i][0]) >= 0 && sd(s->snd_nxt, s->sb[i][1]) < 0) s->snd_nxt = s->sb[i][1];
+        sent = s->snd_nxt - s->tx_seq;
+        if (s->fin_sent && sent) sent--;
+        if (sent >= s->tx_len) break;
+        uint32_t avail = s->tx_len - sent;
+        uint32_t used = s->snd_nxt - s->snd_una;
+        uint32_t inwnd = s->snd_wnd > used ? s->snd_wnd - used : 0;
+        if (!s->snd_wnd && !used) inwnd = 1;                 /* zero window probe */
+        uint32_t n = avail < s->mss ? avail : s->mss;
+        if (n > inwnd) n = inwnd;
+        if (!n || n > room) break;
+        if (n < s->mss) {
+            if (n == avail && !s->shut_wr) {
+                if (s->cork) break;
+                if (!s->nodelay && s->snd_una != s->snd_nxt) break;      /* nagle */
+            } else if (n < avail && s->snd_una != s->snd_nxt) break;
+        }
+        uint32_t seq = s->snd_nxt;
+        bool fresh = sd(seq, s->snd_max) >= 0;
+        tcp_segment(s, seq, TCP_ACK | (n == avail ? TCP_PSH : 0), n);
         s->snd_nxt += n;
-        sent += n;
+        if (fresh) {
+            if (!s->rtt_on) { s->rtt_on = true; s->rtt_seq = s->snd_nxt; s->rtt_t0 = pit_uptime_ms(); }
+            s->snd_max = s->snd_nxt;
+        } else {
+            s->n_retrans++;
+            s->rtt_on = false;
+        }
+        arm_rto(s);
         s->last_tx_ms = pit_uptime_ms();
     }
+    sent = s->snd_nxt - s->tx_seq;
+    if (s->fin_sent && sent) sent--;
     if (s->shut_wr && !s->fin_sent && sent == s->tx_len) {
-        tcp_segment(s, s->snd_nxt, TCP_FIN | TCP_ACK, NULL, 0);
+        tcp_segment(s, s->snd_nxt, TCP_FIN | TCP_ACK, 0);
         s->snd_nxt++;
+        if (sd(s->snd_nxt, s->snd_max) > 0) s->snd_max = s->snd_nxt;
         s->fin_sent = true;
         s->last_tx_ms = pit_uptime_ms();
+        arm_rto(s);
         if (s->state == S_ESTABLISHED) s->state = S_FIN_WAIT1;
         else if (s->state == S_CLOSE_WAIT) s->state = S_LAST_ACK;
     }
@@ -306,19 +574,163 @@ static sock_t* find_tcp(const uint8_t* src, uint16_t sport, const uint8_t* dst, 
     return listener;
 }
 
-static void tcp_ack_in(sock_t* s, uint32_t ack) {
-    if ((int32_t)(ack - s->snd_una) <= 0 || (int32_t)(ack - s->snd_nxt) > 0) return;
-    uint32_t n = ack - s->tx_seq;
-    if (n > s->tx_len) n = s->tx_len;              /* the rest acknowledges SYN/FIN */
-    if (n) {
-        memmove(s->tx, s->tx + n, s->tx_len - n);
-        s->tx_len -= n;
-        s->tx_seq += n;
+static uint32_t icbrt(uint64_t x) {
+    uint64_t lo = 0, hi = 1 << 20;
+    while (lo < hi) {
+        uint64_t m = (lo + hi + 1) / 2;
+        if (m * m * m <= x) lo = m; else hi = m - 1;
     }
+    return (uint32_t)lo;
+}
+
+static uint32_t rto_calc(sock_t* s) {
+    if (!s->srtt) return 1000;
+    uint32_t v = s->srtt + (s->rttvar * 4 > 4 ? s->rttvar * 4 : 4);
+    return v < 200 ? 200 : v > 30000 ? 30000 : v;
+}
+
+static void rtt_sample(sock_t* s, uint32_t r) {
+    if (!r) r = 1;
+    if (!s->srtt) { s->srtt = r; s->rttvar = r / 2 ? r / 2 : 1; }
+    else {
+        uint32_t d = r > s->srtt ? r - s->srtt : s->srtt - r;
+        s->rttvar = (3 * s->rttvar + d) / 4;
+        s->srtt = (7 * s->srtt + r) / 8;
+        if (!s->srtt) s->srtt = 1;
+    }
+}
+
+static void cc_loss(sock_t* s, uint32_t fl) {
+    if (s->cc) {
+        s->cb_wmax = s->cwnd / s->mss;
+        s->cb_t0 = 0;
+        s->ssthresh = fl / 10 * 7;
+    } else s->ssthresh = fl / 2;
+    if (s->ssthresh < 2 * s->mss) s->ssthresh = 2 * s->mss;
+}
+
+static void cc_grow(sock_t* s, uint32_t acked) {
+    if (s->cwnd < s->ssthresh) {
+        s->cwnd += acked < s->mss ? acked : s->mss;
+        return;
+    }
+    if (!s->cc) {
+        s->acked_acc += acked;
+        if (s->acked_acc >= s->cwnd) { s->acked_acc -= s->cwnd; s->cwnd += s->mss; }
+    } else {
+        uint32_t now = pit_uptime_ms();
+        uint32_t cur = s->cwnd / s->mss;
+        if (!s->cb_t0) {
+            s->cb_t0 = now ? now : 1;
+            if (s->cb_wmax <= cur) { s->cb_k = 0; s->cb_wmax = cur; }
+            else s->cb_k = icbrt((uint64_t)(s->cb_wmax - cur) * 2500000000ull);
+            s->cb_cnt = 0;
+        }
+        int64_t dt = (int64_t)(now - s->cb_t0 + s->srtt) - (int64_t)s->cb_k;
+        int64_t tgt = (int64_t)s->cb_wmax + (4 * dt * dt * dt) / 10000000000ll;
+        uint32_t cnt = tgt > (int64_t)cur ? cur / (uint32_t)(tgt - cur + 0) : 100 * cur;
+        if (cnt < 2) cnt = 2;
+        s->cb_cnt += acked / s->mss ? acked / s->mss : 1;
+        if (s->cb_cnt >= cnt) { s->cb_cnt = 0; s->cwnd += s->mss; }
+    }
+    if (s->cwnd > (64u << 20)) s->cwnd = 64u << 20;
+}
+
+static void cc_init(sock_t* s) {
+    s->cwnd = 10 * s->mss;
+    s->ssthresh = 0x40000000;
+    s->rec = 0;
+    s->quick = 16;
+}
+
+static void enter_rec(sock_t* s) {
+    cc_loss(s, flight(s));
+    s->recover = s->snd_max;
+    s->rec = 1;
+    s->cwnd = s->sack_ok ? s->ssthresh : s->ssthresh + 3 * s->mss;
+    uint32_t end = s->sb_n && sd(s->sb[0][0], s->snd_una) > 0 ? s->sb[0][0] : s->snd_max;
+    s->rexmit_hi = s->snd_una + retx_one(s, s->snd_una, end);
+    s->timer_on = true;
+    s->rto_at = pit_uptime_ms() + s->rto;
+}
+
+static void tcp_ack_in(sock_t* s, uint32_t ack, uint32_t wnd, uint32_t dlen, topt_t* o) {
+    uint32_t now = pit_uptime_ms();
+    if (sd(ack, s->snd_una) < 0) return;
+    if (sd(ack, s->snd_max) > 0) { s->ack_now = true; return; }
+    if (s->sack_ok)
+        for (int i = 0; i < o->nsack; i++) sb_add(s, o->sack[i][0], o->sack[i][1]);
+    if (ack == s->snd_una) {
+        if (s->state == S_SYN_RCVD) return;
+        bool dup = !dlen && s->snd_max != s->snd_una && (wnd == s->snd_wnd || o->nsack);
+        s->snd_wnd = wnd;
+        if (!dup) return;
+        s->dupacks++;
+        if (s->rec == 0) {
+            if (s->dupacks >= 3 || (s->sack_ok && sack_in(s, s->snd_una, s->snd_max) >= 3u * s->mss)) enter_rec(s);
+        } else if (s->rec == 1 && !s->sack_ok) s->cwnd += s->mss;
+        return;
+    }
+    uint32_t acked = ack - s->snd_una;
+    uint32_t d = sd(ack, s->tx_seq) > 0 ? ack - s->tx_seq : 0;
+    if (d > s->tx_len) d = s->tx_len;
+    s->tx_head = (s->tx_head + d) % s->tx_cap;
+    s->tx_len -= d;
+    s->tx_seq += d;
     s->snd_una = ack;
+    if (sd(s->snd_nxt, ack) < 0) s->snd_nxt = ack;
+    sb_trim(s);
+    s->snd_wnd = wnd;
+    s->dupacks = 0;
     s->retries = 0;
-    s->rto = 300;
-    s->last_tx_ms = pit_uptime_ms();
+    if (o->ts && s->ts_ok && o->tsecr) {
+        uint32_t r = now + 1 - o->tsecr;
+        if (r < 60000) rtt_sample(s, r);
+    } else if (s->rtt_on && sd(ack, s->rtt_seq) >= 0) rtt_sample(s, now - s->rtt_t0);
+    if (s->rtt_on && sd(ack, s->rtt_seq) >= 0) s->rtt_on = false;
+    s->rto = rto_calc(s);
+    if (ack == s->snd_max) s->timer_on = false;
+    else { s->timer_on = true; s->rto_at = now + s->rto; }
+
+    if (s->rec == 1) {
+        if (sd(ack, s->recover) >= 0) {
+            s->rec = 0;
+            s->cwnd = s->ssthresh;
+            s->acked_acc = 0;
+            s->cb_t0 = 0;
+        } else {
+            if (!s->sack_ok || !s->sb_n) {
+                uint32_t n = retx_one(s, ack, s->snd_max);
+                if (sd(ack + n, s->rexmit_hi) > 0) s->rexmit_hi = ack + n;
+            }
+            if (!s->sack_ok) s->cwnd = s->cwnd > acked ? s->cwnd - acked + s->mss : s->mss;
+        }
+    } else {
+        if (s->rec == 2 && sd(ack, s->recover) >= 0) s->rec = 0;
+        cc_grow(s, acked);
+    }
+}
+
+static void ooo_add(sock_t* s, uint32_t a, uint32_t b) {
+    uint32_t t[7][2];
+    int n = 0;
+    for (int i = 0; i < s->ooo_n; i++) {
+        uint32_t x = s->ooo[i][0], y = s->ooo[i][1];
+        if (sd(y, a) < 0 || sd(x, b) > 0) { t[n + 1][0] = x; t[n + 1][1] = y; n++; }
+        else { if (sd(x, a) < 0) a = x; if (sd(y, b) > 0) b = y; }
+    }
+    t[0][0] = a; t[0][1] = b;
+    n++;
+    if (n > 6) n = 6;
+    memcpy(s->ooo, t, (uint32_t)n * 8);
+    s->ooo_n = n;
+}
+
+static void tcp_kill(sock_t* s, int err) {
+    s->err = err;
+    s->state = S_CLOSED;
+    s->timer_on = false;
+    if (s->parent) { s->parent = NULL; free_sock(s); } else reap_if_done(s);
 }
 
 static void tcp_in(const uint8_t* src, const uint8_t* dst, const uint8_t* seg, int len) {
@@ -331,9 +743,12 @@ static void tcp_in(const uint8_t* src, const uint8_t* dst, const uint8_t* seg, i
     uint8_t fl = h->flags;
     const uint8_t* data = seg + hl;
     uint32_t dlen = (uint32_t)(len - hl);
+    uint32_t now = pit_uptime_ms();
+    topt_t o;
 
     sock_t* s = find_tcp(src, sport, dst, dport);
     if (!s) { if (!(fl & TCP_RST)) send_rst(src, dst, h, (int)dlen); return; }
+    parse_opts(seg + 20, hl - 20, &o);
 
     if (s->state == S_LISTEN) {
         if (fl & (TCP_RST | TCP_ACK)) { if (!(fl & TCP_RST)) send_rst(src, dst, h, (int)dlen); return; }
@@ -348,48 +763,84 @@ static void tcp_in(const uint8_t* src, const uint8_t* dst, const uint8_t* seg, i
         c->parent = s;
         memcpy(c->lip, dst, 16); c->lport = dport;
         memcpy(c->rip, src, 16); c->rport = sport;
-        c->iss = 0x20000000u + pit_uptime_ms() * 64 + (uint32_t)(c - socks) * 4096;
+        c->iss = 0x20000000u + now * 64 + (uint32_t)(c - socks) * 4096;
         c->snd_una = c->iss;
-        c->snd_nxt = c->iss + 1;
+        c->snd_nxt = c->snd_max = c->iss + 1;
         c->tx_seq = c->iss + 1;
         c->rcv_nxt = seq + 1;
         c->snd_wnd = be16(h->win);
+        c->nodelay = s->nodelay; c->ka_on = s->ka_on; c->cc = s->cc;
+        c->ka_idle = s->ka_idle; c->ka_intvl = s->ka_intvl; c->ka_cnt = s->ka_cnt;
+        if (is_lo(src) && !s->want_rx && !s->want_tx) tcp_setbuf(c, 1 << 20, 1 << 20);
+        else if (s->want_rx || s->want_tx) {
+            c->want_rx = s->want_rx; c->want_tx = s->want_tx;
+            tcp_setbuf(c, s->want_rx ? s->want_rx : BUF_DEF, s->want_tx ? s->want_tx : BUF_DEF);
+        }
+        int link = link_mss(src);
+        int pm = o.mss ? o.mss : 536;
+        if (pm > link) pm = link;
+        c->ts_ok = o.ts; c->ts_recent = o.tsval;
+        c->sack_ok = o.sackok;
+        if (o.ws >= 0) { c->ws_ok = true; c->snd_ws = (uint8_t)o.ws; c->rcv_ws = 7; }
+        c->mss = (uint16_t)(pm - (o.ts ? 12 : 0));
+        cc_init(c);
         c->state = S_SYN_RCVD;
-        tcp_segment(c, c->iss, TCP_SYN | TCP_ACK, NULL, 0);
-        c->last_tx_ms = pit_uptime_ms();
+        c->last_rx_ms = now;
+        tcp_segment(c, c->iss, TCP_SYN | TCP_ACK, 0);
+        c->rto = 1000;
+        c->timer_on = true; c->rto_at = now + c->rto;
         return;
     }
 
     if (fl & TCP_RST) {
-        if (s->state == S_SYN_SENT) s->err = ECONNREFUSED;
+        if (s->state == S_SYN_SENT) { if (!(fl & TCP_ACK)) return; s->err = ECONNREFUSED; }
         else if (s->state != S_TIME_WAIT && s->state != S_CLOSED) s->err = ECONNRESET;
-        s->state = S_CLOSED;
-        if (s->parent) {                                 /* never accepted: forget it */
-            s->parent = NULL;
-            free_sock(s);
-        } else {
-            reap_if_done(s);
-        }
+        tcp_kill(s, s->err);
         return;
     }
 
     if (s->state == S_SYN_SENT) {
         if ((fl & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK) && ack == s->snd_nxt) {
+            int link = link_mss(s->rip);
+            int pm = o.mss ? o.mss : 536;
+            if (pm > link) pm = link;
+            s->ts_ok = s->ts_ok && o.ts;
+            if (s->ts_ok) s->ts_recent = o.tsval;
+            s->sack_ok = s->sack_ok && o.sackok;
+            if (o.ws < 0) { s->ws_ok = false; s->rcv_ws = 0; s->snd_ws = 0; }
+            else s->snd_ws = (uint8_t)o.ws;
+            s->mss = (uint16_t)(pm - (s->ts_ok ? 12 : 0));
             s->rcv_nxt = seq + 1;
             s->snd_una = ack;
             s->snd_wnd = be16(h->win);
+            if (!s->retries) rtt_sample(s, now - s->rtt_t0);
+            s->rto = rto_calc(s);
+            s->timer_on = false;
             s->state = S_ESTABLISHED;
             s->retries = 0;
-            tcp_segment(s, s->snd_nxt, TCP_ACK, NULL, 0);
+            s->last_rx_ms = now;
+            cc_init(s);
+            tcp_segment(s, s->snd_nxt, TCP_ACK, 0);
             tcp_output(s);
         }
         return;
     }
 
-    /* Anything past the handshake. */
+    s->last_rx_ms = now;
+    s->ka_n = 0;
+    if (s->ts_ok && o.ts) {
+        if (s->ts_recent && sd(o.tsval, s->ts_recent) < 0) {       /* paws */
+            s->ack_now = true;
+            goto out;
+        }
+        if (sd(seq, s->rcv_nxt) <= 0) s->ts_recent = o.tsval;
+    }
+    if ((fl & TCP_SYN) && s->state != S_SYN_RCVD) { s->ack_now = true; goto out; }    /* our ack got lost */
+
     if (fl & TCP_ACK) {
-        tcp_ack_in(s, ack);
-        s->snd_wnd = be16(h->win);
+        uint32_t wnd = be16(h->win);
+        if (!(fl & TCP_SYN)) wnd <<= s->snd_ws;
+        tcp_ack_in(s, ack, wnd, dlen, &o);
         if (s->state == S_SYN_RCVD && ack == s->snd_nxt) {
             s->state = S_ESTABLISHED;
             sock_t* p = s->parent;
@@ -397,7 +848,7 @@ static void tcp_in(const uint8_t* src, const uint8_t* dst, const uint8_t* seg, i
                 p->acceptq[p->aq_n++] = s;
             } else {
                 s->parent = NULL;
-                tcp_segment(s, s->snd_nxt, TCP_RST, NULL, 0);
+                tcp_segment(s, s->snd_nxt, TCP_RST, 0);
                 free_sock(s);
                 return;
             }
@@ -405,37 +856,69 @@ static void tcp_in(const uint8_t* src, const uint8_t* dst, const uint8_t* seg, i
         bool fin_acked = s->fin_sent && s->snd_una == s->snd_nxt;
         if (fin_acked) {
             if (s->state == S_FIN_WAIT1) s->state = S_FIN_WAIT2;
-            else if (s->state == S_CLOSING) { s->state = S_TIME_WAIT; s->deadline_ms = pit_uptime_ms() + 1000; }
-            else if (s->state == S_LAST_ACK) { s->state = S_CLOSED; reap_if_done(s); return; }
+            else if (s->state == S_CLOSING) { s->state = S_TIME_WAIT; s->deadline_ms = now + 1000; }
+            else if (s->state == S_LAST_ACK) { s->state = S_CLOSED; s->timer_on = false; reap_if_done(s); return; }
         }
     }
 
-    bool need_ack = false;
     if (dlen && (s->state == S_ESTABLISHED || s->state == S_FIN_WAIT1 || s->state == S_FIN_WAIT2)) {
-        if (seq == s->rcv_nxt) {
-            uint32_t room = RX_CAP - s->rx_count;
-            uint32_t take = dlen < room ? dlen : room;
-            for (uint32_t i = 0; i < take; i++)
-                s->rx[(s->rx_head + s->rx_count + i) % RX_CAP] = data[i];
-            s->rx_count += take;
-            s->rcv_nxt += take;
+        uint32_t fr = s->rx_cap - s->rx_count;
+        int32_t off = sd(seq, s->rcv_nxt);
+        if (off < 0) {
+            uint32_t cut = (uint32_t)-off;
+            if (cut >= dlen) { s->ack_now = true; dlen = 0; goto nodata; }    /* old stuff */
+            data += cut; dlen -= cut; seq += cut; off = 0;
         }
-        need_ack = true;                                 /* in order or not: (dup)ACK */
+        if ((uint32_t)off >= fr) { s->ack_now = true; dlen = 0; fl &= ~TCP_FIN; goto nodata; }
+        if ((uint32_t)off + dlen > fr) { dlen = fr - (uint32_t)off; fl &= ~TCP_FIN; }
+        uint32_t pos = (s->rx_head + s->rx_count + (uint32_t)off) % s->rx_cap;
+        uint32_t n1 = s->rx_cap - pos < dlen ? s->rx_cap - pos : dlen;
+        memcpy(s->rx + pos, data, n1);
+        if (dlen > n1) memcpy(s->rx, data + n1, dlen - n1);
+        if (off == 0) {
+            bool hole = s->ooo_n > 0;
+            s->rx_count += dlen;
+            s->rcv_nxt += dlen;
+            for (bool again = true; again; ) {
+                again = false;
+                for (int i = 0; i < s->ooo_n; i++) {
+                    if (sd(s->ooo[i][0], s->rcv_nxt) > 0) continue;
+                    if (sd(s->ooo[i][1], s->rcv_nxt) > 0) {
+                        uint32_t adv = s->ooo[i][1] - s->rcv_nxt;
+                        s->rx_count += adv;
+                        s->rcv_nxt += adv;
+                    }
+                    memmove(&s->ooo[i], &s->ooo[i + 1], (uint32_t)(s->ooo_n - i - 1) * 8);
+                    s->ooo_n--;
+                    again = true;
+                    break;
+                }
+            }
+            s->ack_segs++;
+            if (hole || s->ooo_n || s->ack_segs >= 2) s->ack_now = true;
+            else if (s->quick) { s->quick--; s->ack_now = true; }
+            else if (!s->ack_at) s->ack_at = now + 40;
+        } else {
+            ooo_add(s, seq, seq + dlen);
+            s->ack_now = true;                           /* dupack + sack */
+        }
     }
-    if ((fl & TCP_FIN) && seq + dlen == s->rcv_nxt - 0 && !s->fin_rcvd &&
+nodata:
+    if ((fl & TCP_FIN) && seq + dlen == s->rcv_nxt && !s->fin_rcvd &&
         (s->state == S_ESTABLISHED || s->state == S_FIN_WAIT1 || s->state == S_FIN_WAIT2)) {
         s->rcv_nxt++;
         s->fin_rcvd = true;
-        need_ack = true;
+        s->ack_now = true;
         if (s->state == S_ESTABLISHED) s->state = S_CLOSE_WAIT;
         else if (s->state == S_FIN_WAIT1) s->state = (s->snd_una == s->snd_nxt) ? S_TIME_WAIT : S_CLOSING;
         else if (s->state == S_FIN_WAIT2) s->state = S_TIME_WAIT;
-        if (s->state == S_TIME_WAIT) s->deadline_ms = pit_uptime_ms() + 1000;
+        if (s->state == S_TIME_WAIT) s->deadline_ms = now + 1000;
     } else if ((fl & TCP_FIN) && s->fin_rcvd) {
-        need_ack = true;                                 /* retransmitted FIN */
+        s->ack_now = true;                               /* retransmitted FIN */
     }
-    if (need_ack) tcp_segment(s, s->snd_nxt, TCP_ACK, NULL, 0);
+out:
     tcp_output(s);
+    if (s->ack_now && s->state != S_CLOSED) tcp_segment(s, s->snd_max, TCP_ACK, 0);
 }
 
 /* Retransmission + timers, from netd and blocking waits. */
@@ -445,27 +928,53 @@ static void sock_tick(void) {
         sock_t* s = &socks[i];
         if (!s->used || s->type != 1) continue;
         if (s->state == S_TIME_WAIT) { if (now >= s->deadline_ms) { s->state = S_CLOSED; reap_if_done(s); } continue; }
-        bool waiting = s->state == S_SYN_SENT || s->state == S_SYN_RCVD || s->snd_una != s->snd_nxt;
-        if (!waiting || now - s->last_tx_ms < s->rto) continue;
-        if (++s->retries > 8) {
-            s->err = s->state == S_SYN_SENT ? ETIMEDOUT : ECONNRESET;
-            if (s->state != S_SYN_SENT) tcp_segment(s, s->snd_nxt, TCP_RST, NULL, 0);
-            s->state = S_CLOSED;
-            if (s->parent) { s->parent = NULL; free_sock(s); } else reap_if_done(s);
+        if (s->state == S_CLOSED || s->state == S_LISTEN) continue;
+        if (s->ack_at && sd(now, s->ack_at) >= 0) tcp_segment(s, s->snd_max, TCP_ACK, 0);
+        if (s->timer_on && sd(now, s->rto_at) >= 0) {
+            bool syn = s->state == S_SYN_SENT || s->state == S_SYN_RCVD;
+            bool probe = !syn && !s->snd_wnd;
+            if (!probe && ++s->retries > (syn ? 6 : 12)) {
+                if (s->state != S_SYN_SENT) tcp_segment(s, s->snd_nxt, TCP_RST, 0);
+                tcp_kill(s, ETIMEDOUT);
+                continue;
+            }
+            s->rto = s->rto * 2 > 30000 ? 30000 : s->rto * 2;
+            s->rto_at = now + s->rto;
+            s->last_tx_ms = now;
+            if (s->state == S_SYN_SENT) { tcp_segment(s, s->iss, TCP_SYN, 0); continue; }
+            if (s->state == S_SYN_RCVD) { tcp_segment(s, s->iss, TCP_SYN | TCP_ACK, 0); continue; }
+            if (!probe) {
+                cc_loss(s, s->rec ? s->ssthresh * 2 : flight(s));
+                s->cwnd = s->mss;
+                s->recover = s->snd_max;
+                s->rec = 2;
+                s->acked_acc = 0;
+                if (s->retries >= 2) s->sb_n = 0;
+            }
+            s->dupacks = 0;
+            s->rtt_on = false;
+            bool fin_pending = s->fin_sent;
+            s->snd_nxt = s->snd_una;
+            s->fin_sent = false;
+            if (fin_pending && s->state == S_FIN_WAIT1) s->state = S_ESTABLISHED;
+            else if (fin_pending && s->state == S_LAST_ACK) s->state = S_CLOSE_WAIT;
+            else if (fin_pending && s->state == S_CLOSING) s->state = S_ESTABLISHED;
+            tcp_output(s);
             continue;
         }
-        s->rto = s->rto * 2 > 3000 ? 3000 : s->rto * 2;
-        s->last_tx_ms = now;
-        if (s->state == S_SYN_SENT) { tcp_segment(s, s->iss, TCP_SYN, NULL, 0); continue; }
-        if (s->state == S_SYN_RCVD) { tcp_segment(s, s->iss, TCP_SYN | TCP_ACK, NULL, 0); continue; }
-        /* Go back to the oldest unacknowledged byte. */
-        bool fin_pending = s->fin_sent;
-        s->snd_nxt = s->snd_una;
-        s->fin_sent = false;
-        if (fin_pending && s->state == S_FIN_WAIT1) s->state = S_ESTABLISHED;
-        else if (fin_pending && s->state == S_LAST_ACK) s->state = S_CLOSE_WAIT;
-        else if (fin_pending && s->state == S_CLOSING) s->state = S_ESTABLISHED;
-        tcp_output(s);
+        if (s->ka_on && s->snd_una == s->snd_max && s->state != S_SYN_SENT && s->state != S_SYN_RCVD) {
+            uint32_t idle = now - s->last_rx_ms;
+            if (!s->ka_n ? idle >= s->ka_idle * 1000 : sd(now, s->ka_at) >= 0) {
+                if (s->ka_n >= (int)s->ka_cnt) {
+                    tcp_segment(s, s->snd_nxt, TCP_RST, 0);
+                    tcp_kill(s, ETIMEDOUT);
+                    continue;
+                }
+                tcp_segment(s, s->snd_nxt - 1, TCP_ACK, 0);
+                s->ka_n++;
+                s->ka_at = now + s->ka_intvl * 1000;
+            }
+        }
     }
 }
 
@@ -506,7 +1015,7 @@ static void udp_in(const uint8_t* src, const uint8_t* dst, const uint8_t* d, int
     if (ulen < 8 || ulen > len) return;
     for (int i = 0; i < MAX_SOCKS; i++) {
         sock_t* s = &socks[i];
-        if (!s->used || s->type != 2 || s->proto == 58 || s->proto == 1 || s->lport != dport) continue;
+        if (!s->used || s->type != 2 || s->af == 17 || s->proto == 58 || s->proto == 1 || s->lport != dport) continue;
         if (!dst_ok(s, dst) && !(is4(dst) && dst[12] == 127 && is4(s->lip))) continue;
         if (s->connected && (memcmp(s->rip, src, 16) || s->rport != sport)) continue;
         if (s->q_n >= UDP_QMAX) return;
@@ -674,12 +1183,155 @@ sock_t* sock_create(int af, int type, int proto, int* err) {
     if (type < 1 || type > 3) { *err = -EINVAL; return NULL; }
     sock_t* s = alloc_sock(type, af);
     if (!s) { *err = -ENOMEM; return NULL; }
+    if (af == 17) { s->pproto = (uint16_t)proto; return s; }
     s->proto = proto;
     if (type == 2 && (proto == 58 || proto == 1) && !s->lport) s->lport = ephemeral(2);       /* ping socket: the port is the echo id */
     return s;
 }
 
 int sock_af(sock_t* s) { return s->af; }
+
+/* frame from/to the wire for packet sockets. pt: 0 host 1 bcast 2 mcast 3 other 4 outgoing */
+void sock_input_pkt(int ifi, const uint8_t* fr, int len, int pt) {
+    if (!npkt_socks || len < 14) return;
+    uint16_t et = (uint16_t)(fr[12] << 8 | fr[13]);
+    for (int i = 0; i < MAX_SOCKS; i++) {
+        sock_t* s = &socks[i];
+        if (!s->used || s->af != 17) continue;
+        if (s->pifi && s->pifi != ifi + 2) continue;
+        if (s->pproto != 3 && s->pproto != et) continue;
+        if (s->ring_pa && s->pver == 2) {
+            uint8_t* b = (uint8_t*)P2V(s->ring_pa) + (uint64_t)s->rcur * s->fsz;
+            int po = s->type == 3 ? 0 : 14;                    /* cooked: payload only */
+            uint32_t cl = len - po < 65535 ? len - po : 65535;
+            uint32_t sz = (130 + cl + 15) & ~15u;
+            if (*(uint32_t*)(b + 8) & 1) continue;             /* user still owns it */
+            if (!s->boff) s->boff = 48;
+            if (s->boff + sz > s->fsz) continue;               /* TODO: oversized frame in a small block, drop */
+            uint8_t* h = b + s->boff;
+            uint32_t sec, us;
+            clock_now_us(&sec, &us);
+            *(uint32_t*)h = sz;
+            ((uint32_t*)h)[1] = sec; ((uint32_t*)h)[2] = us * 1000;
+            ((uint32_t*)h)[3] = cl; ((uint32_t*)h)[4] = len - po; ((uint32_t*)h)[5] = 1;
+            *(uint16_t*)(h + 24) = po ? 128 : 80; *(uint16_t*)(h + 26) = po ? 128 : 94;
+            memset(h + 28, 0, 20);
+            uint8_t* ll = h + 48;
+            memset(ll, 0, 20);
+            *(uint16_t*)ll = 17;
+            *(uint16_t*)(ll + 2) = (uint16_t)(et >> 8 | et << 8);
+            *(int*)(ll + 4) = ifi + 2;
+            *(uint16_t*)(ll + 8) = 1;
+            ll[10] = pt; ll[11] = 6;
+            memcpy(ll + 12, fr + 6, 6);
+            memcpy(h + (po ? 128 : 80), fr + po, cl);
+            if (!s->bnum) { ((uint32_t*)b)[8] = sec; ((uint32_t*)b)[9] = us * 1000; }
+            ((uint32_t*)b)[10] = sec; ((uint32_t*)b)[11] = us * 1000;
+            s->bnum++;
+            s->boff += sz;
+            continue;
+        }
+        if (s->ring_pa) {
+            uint8_t* f = (uint8_t*)P2V(s->ring_pa) + (uint64_t)s->rcur * s->fsz;
+            uint32_t* st = (uint32_t*)f;
+            if (*st || s->fsz < 128) continue;
+            uint32_t cl = len < (int)(s->fsz - 64) ? (uint32_t)len : s->fsz - 64;
+            uint32_t sec, us;
+            clock_now_us(&sec, &us);
+            st[1] = len; st[2] = cl;
+            *(uint16_t*)(f + 12) = 64; *(uint16_t*)(f + 14) = 78;
+            st[4] = sec; st[5] = us * 1000;
+            st[6] = 0; st[7] = 0;
+            uint8_t* ll = f + 32;
+            memset(ll, 0, 20);
+            *(uint16_t*)ll = 17;
+            *(uint16_t*)(ll + 2) = (uint16_t)(et >> 8 | et << 8);
+            *(int*)(ll + 4) = ifi + 2;
+            *(uint16_t*)(ll + 8) = 1;
+            ll[10] = pt; ll[11] = 6;
+            memcpy(ll + 12, fr + 6, 6);
+            memcpy(f + 64, fr, cl);
+            __sync_synchronize();
+            *st = 1;
+            if (++s->rcur >= s->fnr) s->rcur = 0;
+            continue;
+        }
+        if (s->q_n >= 512) continue;
+        int off = s->type == 3 ? 0 : 14;
+        dgram_t* g = (dgram_t*)kmalloc(sizeof(dgram_t) + (uint32_t)(len - off));
+        if (!g) continue;
+        g->next = NULL;
+        memset(g->ip, 0, 16);
+        memcpy(g->ip, fr + 6, 6);
+        g->ip[6] = pt; g->ip[7] = ifi + 2;
+        g->port = et; g->pproto = et;
+        g->len = (uint16_t)(len - off);
+        g->ttl = 0;
+        clock_now_us(&g->ts_s, &g->ts_us);
+        memcpy(g->data, fr + off, (uint32_t)(len - off));
+        if (s->q_tail) s->q_tail->next = g; else s->q_head = g;
+        s->q_tail = g;
+        s->q_n++;
+    }
+}
+
+/* v3: hand the open block to userland, called after every rx batch (no retire timer) */
+void sock_pkt_flush(void) {
+    for (int i = 0; npkt_socks && i < MAX_SOCKS; i++) {
+        sock_t* s = &socks[i];
+        if (!s->used || s->af != 17 || s->pver != 2 || !s->bnum) continue;
+        uint8_t* b = (uint8_t*)P2V(s->ring_pa) + (uint64_t)s->rcur * s->fsz;
+        uint32_t* w = (uint32_t*)b;
+        w[0] = 3; w[1] = 0;
+        w[3] = s->bnum; w[4] = 48; w[5] = s->boff;
+        *(uint64_t*)(b + 24) = ++s->bseq;
+        __sync_synchronize();
+        w[2] = 1;
+        s->bnum = s->boff = 0;
+        if (++s->rcur >= s->fnr) s->rcur = 0;
+    }
+}
+
+int sock_pkt_ver(sock_t* s, int v) {
+    if (v < 1 || v > 2 || s->ring_pa) return -22;
+    s->pver = v;
+    return 0;
+}
+
+int sock_pkt_ring(sock_t* s, uint32_t* rq) {
+    uint32_t bs = rq[0], bn = rq[1], fs = rq[2], fn = rq[3];
+    if (!bn) return 0;                     /* libpcap probes with zeros, teardown in linux */
+    if (s->ring_pa) return -16;
+    if (!bs || bs & 4095 || !fs || fs & 15 || bs * (uint64_t)bn > (32u << 20) || fn != bs / fs * bn) return -EINVAL;
+    s->ring_np = bs * bn / 4096;
+    s->ring_pa = pmm_alloc_run(s->ring_np);
+    if (!s->ring_pa) return -ENOMEM;
+    s->fsz = s->pver == 2 ? bs : fs; s->fnr = s->pver == 2 ? bn : fn; s->rcur = 0;
+    return 0;
+}
+
+int sock_pkt_mmap(sock_t* s, uint64_t pd, uint64_t addr, uint64_t len) {
+    if (!s->ring_pa || len > (uint64_t)s->ring_np * 4096) return -EINVAL;
+    for (uint64_t i = 0; i < len / 4096; i++)
+        if (vmm_map_frame(pd, addr + i * 4096, s->ring_pa + i * 4096, true) < 0) return -ENOMEM;
+    return 0;
+}
+
+int sock_pkt_bind(sock_t* s, int ifidx, int proto) {
+    if (ifidx && ifidx - 2 >= net_ifcount()) return -19;
+    s->pifi = ifidx;
+    if (proto) s->pproto = (uint16_t)proto;
+    s->bound = true;
+    return 0;
+}
+
+int sock_pkt_send(sock_t* s, const uint8_t* buf, uint32_t len, int ifidx, int proto, const uint8_t* mac) {
+    int ifi = (ifidx ? ifidx : s->pifi) - 2;
+    if (ifi < 0) return -19;
+    if (s->type == 3) return net_raw_send(ifi, buf, (int)len) < 0 ? -5 : (int)len;
+    if (!mac) return -EDESTADDRREQ;
+    return net_eth_send(ifi, mac, (uint16_t)(proto ? proto : s->pproto), buf, (int)len) < 0 ? -5 : (int)len;
+}
 
 int sock_v6only(sock_t* s, int set, int val) {
     if (set >= 0) s->v6only = val != 0;
@@ -696,7 +1348,7 @@ void sock_close(sock_t* s) {
         for (int i = 0; i < s->aq_n; i++) {
             sock_t* c = s->acceptq[i];
             c->parent = NULL;
-            tcp_segment(c, c->snd_nxt, TCP_RST, NULL, 0);
+            tcp_segment(c, c->snd_nxt, TCP_RST, 0);
             free_sock(c);
         }
         s->aq_n = 0;
@@ -730,6 +1382,7 @@ int sock_listen(sock_t* s, int backlog) {
     s->state = S_LISTEN;
     kfree(s->rx); kfree(s->tx);                       // 128k a head, listeners never carry data
     s->rx = s->tx = NULL;
+    s->rx_cap = s->tx_cap = 0;
     s->backlog = backlog <= 0 ? 1 : backlog > ACCEPT_MAX ? ACCEPT_MAX : backlog;
     return 0;
 }
@@ -773,13 +1426,19 @@ int sock_connect(sock_t* s, const uint8_t* ip, uint16_t port, bool nonblock) {
         else if (zero16(s->lip) || un4(ip) >> 24 == 127) map4(s->lip, net_src_for(un4(ip)));
         s->iss = 0x10000000u + pit_uptime_ms() * 64 + (uint32_t)(s - socks) * 4096;
         s->snd_una = s->iss;
-        s->snd_nxt = s->iss + 1;
+        s->snd_nxt = s->snd_max = s->iss + 1;
         s->tx_seq = s->iss + 1;
+        s->ws_ok = s->ts_ok = s->sack_ok = true;
+        s->rcv_ws = 7;
+        if (is_lo(ip) && !s->want_rx && !s->want_tx) tcp_setbuf(s, 1 << 20, 1 << 20);
         s->state = S_SYN_SENT;
         s->err = 0;
         s->retries = 0;
-        s->last_tx_ms = pit_uptime_ms();
-        tcp_segment(s, s->iss, TCP_SYN, NULL, 0);
+        s->rtt_t0 = pit_uptime_ms();
+        s->rto = 1000;
+        s->timer_on = true;
+        s->rto_at = s->rtt_t0 + 1000;
+        tcp_segment(s, s->iss, TCP_SYN, 0);
         if (nonblock) return -EINPROGRESS;
     }
     wq_w_t* w_ __attribute__((cleanup(wfree))) = NULL;
@@ -861,7 +1520,7 @@ int sock_send(sock_t* s, const uint8_t* buf, uint32_t len, bool nonblock,
             if (me) proc_send_signal(me, 13);          /* SIGPIPE */
             return -EPIPE;
         }
-        uint32_t room = TX_CAP - s->tx_len;
+        uint32_t room = s->tx_cap - s->tx_len;
         if (!room) {
             if (nonblock) return done ? (int)done : -EAGAIN;
             int r_ = wstep(s, &sw_, &st_, 0);
@@ -869,7 +1528,10 @@ int sock_send(sock_t* s, const uint8_t* buf, uint32_t len, bool nonblock,
             continue;
         }
         uint32_t n = len - done < room ? len - done : room;
-        memcpy(s->tx + s->tx_len, buf + done, n);
+        uint32_t pos = (s->tx_head + s->tx_len) % s->tx_cap;
+        uint32_t n1 = s->tx_cap - pos < n ? s->tx_cap - pos : n;
+        memcpy(s->tx + pos, buf + done, n1);
+        if (n > n1) memcpy(s->tx, buf + done + n1, n - n1);
         s->tx_len += n;
         done += n;
         uint32_t f = irq_save();
@@ -906,15 +1568,19 @@ int sock_recv(sock_t* s, uint8_t* buf, uint32_t len, bool nonblock, bool peek,
         return 0;                                          /* orderly EOF */
     }
     uint32_t n = s->rx_count < len ? s->rx_count : len;
-    for (uint32_t i = 0; i < n; i++) buf[i] = s->rx[(s->rx_head + i) % RX_CAP];
+    uint32_t n1 = s->rx_cap - s->rx_head < n ? s->rx_cap - s->rx_head : n;
+    memcpy(buf, s->rx + s->rx_head, n1);
+    if (n > n1) memcpy(buf + n1, s->rx, n - n1);
     if (!peek) {
-        s->rx_head = (s->rx_head + n) % RX_CAP;
+        s->rx_head = (s->rx_head + n) % s->rx_cap;
         s->rx_count -= n;
         /* Window update once it opened by 2 segments: a sender will not
            fill a window smaller than its MSS and would sit in its persist
            timer (seconds) instead. */
-        if (s->state != S_CLOSED && rx_window(s) >= (uint32_t)s->adv_wnd + 2 * RX_MSS)
-            tcp_segment(s, s->snd_nxt, TCP_ACK, NULL, 0);
+        uint32_t f = irq_save();
+        if (s->state != S_CLOSED && rx_window(s) >= s->adv_wnd + 2 * (uint32_t)s->mss)
+            tcp_segment(s, s->snd_max, TCP_ACK, 0);
+        irq_restore(f);
     }
     if (from_ip) memcpy(from_ip, s->rip, 16);
     if (from_port) *from_port = s->rport;
@@ -943,6 +1609,7 @@ void sock_name(sock_t* s, bool peer, uint8_t* ip, uint16_t* port) {
 int sock_take_error(sock_t* s) { int e = s->err; s->err = 0; return e; }
 
 bool sock_readable(sock_t* s) {
+    if (s->ring_pa) return *(volatile uint32_t*)((uint8_t*)P2V(s->ring_pa) + (uint64_t)(s->rcur ? s->rcur - 1 : s->fnr - 1) * s->fsz) & 1;
     if (s->type != 1) return s->q_head != NULL || s->err;
     if (s->state == S_LISTEN) return s->aq_n > 0;
     return s->rx_count || s->fin_rcvd || s->err || s->state == S_CLOSED;
@@ -951,7 +1618,7 @@ bool sock_readable(sock_t* s) {
 bool sock_writable(sock_t* s) {
     if (s->type != 1) return true;
     if (s->state == S_SYN_SENT || s->state == S_LISTEN || s->state == S_SYN_RCVD) return false;
-    return s->tx_len < TX_CAP || s->err || s->state == S_CLOSED;
+    return s->tx_cap - s->tx_len > s->tx_cap / 4 || s->err || s->state == S_CLOSED;
 }
 
 bool sock_hup(sock_t* s) {
@@ -962,12 +1629,100 @@ void sock_rcvtmo(sock_t* s, uint32_t ms) { s->rcvtmo = ms; }
 
 /* setsockopt bits that only matter for the icmp cmsgs */
 void sock_opt(sock_t* s, int level, int name, int val) {
+    if (s->type == 1 && (level == 6 || (level == 1 && (name == 9 || name == 7 || name == 8 || name == 32 || name == 33)))) {
+        uint32_t f = irq_save();
+        if (level == 1 && name == 9) s->ka_on = val != 0;
+        else if (level == 1 && (name == 7 || name == 32)) {
+            s->want_tx = buf_clamp((uint32_t)val * 2);
+            tcp_setbuf(s, s->rx_cap, s->want_tx);
+        } else if (level == 1) {
+            s->want_rx = buf_clamp((uint32_t)val * 2);
+            tcp_setbuf(s, s->want_rx, s->tx_cap);
+        } else if (name == 1) { s->nodelay = val != 0; if (val) tcp_output(s); }
+        else if (name == 3) { s->cork = val != 0; if (!val) tcp_output(s); }
+        else if (name == 4 && val > 0) s->ka_idle = val;
+        else if (name == 5 && val > 0) s->ka_intvl = val;
+        else if (name == 6 && val > 0) s->ka_cnt = val;
+        else if (name == 2 && val >= 64 && val < s->mss) s->mss = val;
+        irq_restore(f);
+        return;
+    }
     if (level == 0 && name == 12) s->opts = val ? s->opts | 1 : s->opts & ~1;                 /* IP_RECVTTL */
     else if (level == 0 && name == 2) s->ttl = val;                                          /* IP_TTL */
     else if (level == 1 && name == 29) s->opts = val ? s->opts | 2 : s->opts & ~2;           /* SO_TIMESTAMP */
     else if (level == 1 && name == 35) s->opts = val ? s->opts | 4 : s->opts & ~4;           /* SO_TIMESTAMPNS */
     else if (level == 41 && name == 51) s->opts = val ? s->opts | 8 : s->opts & ~8;          /* IPV6_RECVHOPLIMIT */
     else if (level == 41 && (name == 16 || name == 52)) s->ttl = val;
+}
+
+int sock_setcc(sock_t* s, const char* name, int len) {
+    if (s->type != 1) return -EOPNOTSUPP;
+    if (len >= 5 && !memcmp(name, "cubic", 5)) s->cc = 1;
+    else if (len >= 4 && !memcmp(name, "reno", 4)) s->cc = 0;
+    else return -2;
+    return 0;
+}
+
+/* getsockopt things that need the tcp state, 1 = handled */
+int sock_getopt(sock_t* s, int level, int name, uint8_t* out, uint32_t* len) {
+    if (s->type != 1 || (level != 6 && level != 1)) return 0;
+    if (level == 1) {
+        if (name != 7 && name != 8 && name != 9) return 0;
+        uint32_t v = name == 9 ? s->ka_on : name == 7 ? (s->tx_cap ? s->tx_cap : s->want_tx ? s->want_tx : BUF_DEF)
+                                                   : (s->rx_cap ? s->rx_cap : s->want_rx ? s->want_rx : BUF_DEF);
+        if (*len >= 4) { *(uint32_t*)out = v; *len = 4; }
+        return 1;
+    }
+    if (name == 13) {                                  /* TCP_CONGESTION */
+        const char* n = s->cc ? "cubic" : "reno";
+        uint32_t l = s->cc ? 6 : 5;
+        if (*len < l) l = *len;
+        memcpy(out, n, l);
+        *len = l;
+        return 1;
+    }
+    if (name == 11) {                                  /* TCP_INFO */
+        uint32_t i[26];
+        uint32_t now = pit_uptime_ms();
+        uint8_t* b = (uint8_t*)i;
+        memset(i, 0, sizeof(i));
+        static const uint8_t st[] = { 7, 10, 2, 3, 1, 4, 5, 11, 6, 8, 9 };    /* S_* to TCP_* */
+        b[0] = s->state < 11 ? st[s->state] : 0;
+        b[1] = s->rec == 1 ? 3 : s->rec == 2 ? 4 : 0;
+        b[2] = s->retries;
+        b[5] = (s->ts_ok ? 1 : 0) | (s->sack_ok ? 2 : 0) | (s->ws_ok ? 4 : 0);
+        b[6] = (s->snd_ws & 15) | (s->rcv_ws & 15) << 4;
+        i[2] = s->rto * 1000;
+        i[3] = 40000;
+        i[4] = s->mss;
+        i[5] = s->mss;
+        i[6] = (s->snd_max - s->snd_una) / (s->mss ? s->mss : 1);
+        i[7] = s->sb_n ? sack_in(s, s->snd_una, s->snd_max) / (s->mss ? s->mss : 1) : 0;
+        i[9] = s->n_retrans ? 1 : 0;
+        i[11] = s->last_data_ms ? now - s->last_data_ms : 0;
+        i[12] = s->last_ack_ms ? now - s->last_ack_ms : 0;
+        i[14] = s->last_rx_ms ? now - s->last_rx_ms : 0;
+        i[15] = 1500;
+        i[16] = s->rx_cap;
+        i[17] = s->srtt * 1000;
+        i[18] = s->rttvar * 1000;
+        i[19] = s->ssthresh / (s->mss ? s->mss : 1);
+        i[20] = s->cwnd / (s->mss ? s->mss : 1);
+        i[21] = s->mss;
+        i[22] = 3;
+        i[25] = s->n_retrans;
+        uint32_t l = *len < sizeof(i) ? *len : sizeof(i);
+        memcpy(out, i, l);
+        *len = l;
+        return 1;
+    }
+    if (name == 1 || name == 3 || name == 2 || name == 4 || name == 5 || name == 6) {
+        uint32_t v = name == 1 ? s->nodelay : name == 3 ? s->cork : name == 2 ? s->mss : name == 4 ? s->ka_idle
+                   : name == 5 ? s->ka_intvl : s->ka_cnt;
+        if (*len >= 4) { *(uint32_t*)out = v; *len = 4; }
+        return 1;
+    }
+    return 0;
 }
 
 /* control messages for the datagram recv'd last, returns bytes */
