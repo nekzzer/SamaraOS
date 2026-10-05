@@ -2542,11 +2542,11 @@ static int64_t dispatch(regs_t* r) {
         case 291: return do_epoll_create((int)a);                    /* epoll_create1 */
         case 233: return do_epoll_ctl((int)a, (int)b, (int)c, (uint32_t*)d);
         case 232: case 281: return do_epoll_wait((int)a, (uint32_t*)b, (int)c, (int)d);   /* pwait: mask ignored */
-        case 204:                                                    /* sched_getaffinity: one cpu, no smp yet */
+        case 204:                                                    /* sched_getaffinity */
             if (b < 8) return -EINVAL;
             UCHK((void*)c, b);
             memset((void*)c, 0, b);
-            *(uint64_t*)c = 1;
+            *(uint64_t*)c = (1ull << ncpu) - 1;
             return 8;
         case 158:                                                    /* arch_prctl */
             if (a == 0x1002) { p->tls_base = b; wrmsr_fs(b); return 0; }   /* ARCH_SET_FS */
