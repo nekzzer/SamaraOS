@@ -97,10 +97,30 @@ file_t* file_open_node(fs_node_t* n, int flags) {
     return f;
 }
 
-void file_ref(file_t* f) { if (f) f->refs++; }
+/* the pipe is shared with whatever runs on other cpus without the big lock */
+static void pipe_wake(pipe_t* p) { wq_wake(&p->wq); }
+
+/* lock held on entry, gone on return. first call only queues us on wq, caller rechecks */
+static void pipe_sleep(pipe_t* p, uint64_t fl, wq_w_t** wp) {
+    spin_unlock(&p->lk, fl);
+    wq_wait(&p->wq, wp, 10);
+}
+
+/* true when nobody has either end anymore */
+static bool pipe_end(pipe_t* p, int dr, int dw) {
+    uint64_t fl = spin_lock(&p->lk);
+    p->readers += dr;
+    p->writers += dw;
+    pipe_wake(p);
+    bool dead = p->readers <= 0 && p->writers <= 0;
+    spin_unlock(&p->lk, fl);
+    return dead;
+}
+
+void file_ref(file_t* f) { if (f) __atomic_add_fetch(&f->refs, 1, __ATOMIC_ACQ_REL); }
 
 void file_close(file_t* f) {
-    if (!f || --f->refs > 0) return;
+    if (!f || __atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL) > 0) return;
     if (f->type == F_NODE && f->node) { flk_release(f); fs_release(f->node); }
     if (f->type == F_SOCKET && f->sock) sock_close(f->sock);
     if (f->type == F_FB) fbdev_close();
@@ -117,10 +137,7 @@ void file_close(file_t* f) {
         if (f->pipe->readers <= 0 && f->pipe->writers <= 0) { wq_drain(&f->pipe->wq); kfree(f->pipe); }
         if (f->pipe2->readers <= 0 && f->pipe2->writers <= 0) { wq_drain(&f->pipe2->wq); kfree(f->pipe2); }
     } else if (f->pipe) {
-        if (f->type == F_PIPE_R) f->pipe->readers--;
-        else                     f->pipe->writers--;
-        wq_wake(&f->pipe->wq);                   /* hup / epipe for whoever polls */
-        if (f->pipe->readers <= 0 && f->pipe->writers <= 0) { wq_drain(&f->pipe->wq); kfree(f->pipe); }
+        if (pipe_end(f->pipe, f->type == F_PIPE_R ? -1 : 0, f->type == F_PIPE_R ? 0 : -1)) kfree(f->pipe);
     }
     kfree(f);
 }
@@ -162,9 +179,8 @@ int spair_create(file_t** a, file_t** b) {
 /* how: 0 = SHUT_RD, 1 = SHUT_WR, 2 = both. */
 int spair_shutdown(file_t* f, int how) {
     if (how < 0 || how > 2) return -22;             /* EINVAL */
-    if ((how == 0 || how == 2) && !(f->shut & 1)) { f->shut |= 1; f->pipe->readers--; }
-    if ((how == 1 || how == 2) && !(f->shut & 2)) { f->shut |= 2; f->pipe2->writers--; }
-    wq_wake(&f->pipe->wq); wq_wake(&f->pipe2->wq);
+    if ((how == 0 || how == 2) && !(f->shut & 1)) { f->shut |= 1; pipe_end(f->pipe, -1, 0); }
+    if ((how == 1 || how == 2) && !(f->shut & 2)) { f->shut |= 2; pipe_end(f->pipe2, 0, -1); }
     return 0;
 }
 
@@ -294,51 +310,65 @@ bool file_writable(file_t* f) {
 }
 
 static int pipe_read(file_t* f, pipe_t* p, char* buf, uint32_t n) {
+    char tmp[1024];
     WQ_W(w);
-    while (p->count == 0) {
-        if (p->writers <= 0) return 0;
-        if (f->flags & O_NONBLOCK) return -EAGAIN;
-        if (proc_interrupted()) return -EINTR;
-        wq_wait(&p->wq, &w, 0);
-    }
     uint32_t got = 0;
-    while (got < n && p->count > 0) {                /* at most two runs around the ring */
+    for (;;) {
+        bool intr = got ? false : proc_interrupted();
+        uint64_t fl = spin_lock(&p->lk);
+        if (p->count == 0) {
+            if (got || p->writers <= 0) { spin_unlock(&p->lk, fl); return (int)got; }
+            if (f->flags & O_NONBLOCK) { spin_unlock(&p->lk, fl); return -EAGAIN; }
+            if (intr) { spin_unlock(&p->lk, fl); return -EINTR; }
+            pipe_sleep(p, fl, &w);
+            continue;
+        }
         uint32_t k = PIPE_SZ - (uint32_t)p->tail;
         if (k > (uint32_t)p->count) k = (uint32_t)p->count;
         if (k > n - got) k = n - got;
-        memcpy(buf + got, p->buf + p->tail, k);
-        got += k;
+        if (k > sizeof(tmp)) k = sizeof(tmp);
+        memcpy(tmp, p->buf + p->tail, k);
         p->tail = (p->tail + (int)k) % PIPE_SZ;
         p->count -= (int)k;
+        pipe_wake(p);
+        spin_unlock(&p->lk, fl);
+        memcpy(buf + got, tmp, k);               // user buffer, may fault
+        got += k;
+        if (got >= n) return (int)got;
     }
-    wq_wake(&p->wq);
-    return (int)got;
 }
 
 static int pipe_write(file_t* f, pipe_t* p, const char* buf, uint32_t n) {
+    char tmp[1024];
     uint32_t put = 0;
     WQ_W(w);
     while (put < n) {
+        uint32_t k = n - put < sizeof(tmp) ? n - put : sizeof(tmp);
+        memcpy(tmp, buf + put, k);
+        bool intr = proc_interrupted();
+        uint64_t fl = spin_lock(&p->lk);
         if (p->readers <= 0) {
+            spin_unlock(&p->lk, fl);
             proc_t* me = proc_current();
-            if (me) proc_send_signal(me, 13);   /* SIGPIPE */
+            if (me) { int tk = bkl_enter(); proc_send_signal(me, 13); bkl_leave(tk); }   /* SIGPIPE */
             return put ? (int)put : -EPIPE;
         }
         if (p->count == PIPE_SZ) {
-            if (f->flags & O_NONBLOCK) return put ? (int)put : -EAGAIN;
-            if (proc_interrupted()) return put ? (int)put : -EINTR;
-            wq_wait(&p->wq, &w, 0);
+            if (f->flags & O_NONBLOCK) { spin_unlock(&p->lk, fl); return put ? (int)put : -EAGAIN; }
+            if (intr) { spin_unlock(&p->lk, fl); return put ? (int)put : -EINTR; }
+            pipe_sleep(p, fl, &w);
             continue;
         }
-        uint32_t k = PIPE_SZ - (uint32_t)p->head, room = PIPE_SZ - (uint32_t)p->count;
-        if (k > room) k = room;
-        if (k > n - put) k = n - put;
-        memcpy(p->buf + p->head, buf + put, k);
-        put += k;
-        p->head = (p->head + (int)k) % PIPE_SZ;
-        p->count += (int)k;
+        uint32_t c = PIPE_SZ - (uint32_t)p->head, room = PIPE_SZ - (uint32_t)p->count;
+        if (c > room) c = room;
+        if (c > k) c = k;
+        memcpy(p->buf + p->head, tmp, c);
+        put += c;
+        p->head = (p->head + (int)c) % PIPE_SZ;
+        p->count += (int)c;
         p->wgen++;
-        wq_wake(&p->wq);
+        pipe_wake(p);
+        spin_unlock(&p->lk, fl);
     }
     return (int)put;
 }
@@ -349,6 +379,18 @@ uint32_t file_gen(file_t* f) {
     return 0;
 }
 
+/* eventfd readers sleep here, every write wakes all of them */
+static spin_t efl;
+static task_t* ewq[16];
+
+void efd_wake(void) {
+    uint64_t fl = spin_lock(&efl);
+    for (int i = 0; i < 16; i++)
+        if (ewq[i]) { task_ready(ewq[i]); ewq[i] = NULL; }
+    spin_unlock(&efl, fl);
+}
+
+
 int file_read(file_t* f, char* buf, uint32_t n) {
     switch (f->type) {
         case F_URING: return -22;
@@ -358,9 +400,10 @@ int file_read(file_t* f, char* buf, uint32_t n) {
             uint64_t v;
             WQ_W(w);
             for (;;) {
-                if (f->type == F_EVENTFD && f->cnt) {
-                    v = (f->flags & 0x10000000) ? 1 : f->cnt;  /* EFD_SEMAPHORE, kept in a spare flag bit */
-                    f->cnt -= v;
+                uint64_t cur = f->type == F_EVENTFD ? __atomic_load_n(&f->cnt, __ATOMIC_ACQUIRE) : 0;
+                if (cur) {
+                    v = (f->flags & 0x10000000) ? 1 : cur;  /* EFD_SEMAPHORE, kept in a spare flag bit */
+                    if (!__atomic_compare_exchange_n(&f->cnt, &cur, cur - v, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
                     break;
                 }
                 if (f->type == F_TIMERFD && f->t_next && (int32_t)(pit_uptime_ms() - f->t_next) >= 0) {
@@ -371,7 +414,7 @@ int file_read(file_t* f, char* buf, uint32_t n) {
                 }
                 if (f->flags & O_NONBLOCK) return -11;
                 if (proc_interrupted()) return -4;
-                if (f->type == F_EVENTFD) wq_wait(&f->wq, &w, 0);
+                if (f->type == F_EVENTFD) wq_wait(&f->wq, &w, 10);
                 else task_sleep_ms(1);
             }
             if (f->type == F_EVENTFD) wq_wake(&f->wq);
@@ -440,7 +483,8 @@ int file_write(file_t* f, const char* buf, uint32_t n) {
             uint64_t v;
             memcpy(&v, buf, 8);
             if (v == ~0ull) return -22;
-            f->cnt += v;
+            __atomic_add_fetch(&f->cnt, v, __ATOMIC_ACQ_REL);
+            efd_wake();
             wq_wake(&f->wq);
             return 8;
         }

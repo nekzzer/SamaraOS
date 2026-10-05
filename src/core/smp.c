@@ -43,13 +43,69 @@ void tlb_unload(uint64_t pd) {
         while ((mask & (1 << i)) && __atomic_load_n(&cpus[i].unload, __ATOMIC_ACQUIRE)) { tlb_service(); __asm__ volatile ("pause"); }
 }
 
+static void dbg(const char* m, int v);
+static int bkl_cpu = -1;
+static void* bkl_pc;
+
 void bkl_take(struct cpu* c) {
+    void* ra = __builtin_return_address(0);
     uint32_t t = __atomic_fetch_add(&tk_next, 1, __ATOMIC_ACQUIRE);
+#ifdef LOCKDEP
+    if (c->bkl) { dbg("lockdep: bkl twice, cpu ", c->id); dbg(" from ", (int)(uint64_t)ra); }
+    uint32_t n = 0;
+    uint64_t t0 = 0;
+#endif
     while (__atomic_load_n(&tk_serve, __ATOMIC_ACQUIRE) != t) {
         tlb_service();
         __asm__ volatile ("pause");
+#ifdef LOCKDEP
+        if (!(++n & 0x3FFFFF) && (!t0 ? (t0 = tsc_ms(), 0) : tsc_ms() - t0 > 3000)) {
+            dbg("lockdep: bkl hang, cpu ", c->id); dbg(" owner cpu ", bkl_cpu);
+            dbg(" owner pc ", (int)(uint64_t)bkl_pc); dbg(" my pc ", (int)(uint64_t)ra);
+            t0 = tsc_ms();
+        }
+#endif
     }
     c->bkl = 1;
+    bkl_cpu = c->id;
+    bkl_pc = ra;
+}
+
+uint64_t spin_lock(spin_t* l) {
+    uint64_t f = irq_save();
+    struct cpu* c = this_cpu();
+    void* ra = __builtin_return_address(0);
+#ifdef LOCKDEP
+    if (l->v && l->cpu == c->id) {
+        dbg("lockdep: recursive lock ", (int)(uint64_t)l); dbg(" cpu ", c->id);
+        dbg(" held from ", (int)(uint64_t)l->pc); dbg(" again from ", (int)(uint64_t)ra);
+    }
+    uint32_t n = 0;
+    uint64_t t0 = 0;
+#endif
+    while (__atomic_exchange_n(&l->v, 1, __ATOMIC_ACQUIRE)) {
+        while (l->v) {
+            tlb_service();
+            __asm__ volatile ("pause");
+#ifdef LOCKDEP
+            if (!(++n & 0x3FFFFF) && (!t0 ? (t0 = tsc_ms(), 0) : tsc_ms() - t0 > 3000)) {
+                dbg("lockdep: spin hang ", (int)(uint64_t)l); dbg(" cpu ", c->id);
+                dbg(" owner cpu ", l->cpu); dbg(" owner pc ", (int)(uint64_t)l->pc);
+                dbg(" my pc ", (int)(uint64_t)ra);
+                t0 = tsc_ms();
+            }
+#endif
+        }
+    }
+    l->cpu = c->id;
+    l->pc = ra;
+    return f;
+}
+
+void spin_unlock(spin_t* l, uint64_t f) {
+    l->cpu = -1;
+    __atomic_store_n(&l->v, 0, __ATOMIC_RELEASE);
+    irq_restore(f);
 }
 
 void bkl_drop(struct cpu* c) {
@@ -57,26 +113,48 @@ void bkl_drop(struct cpu* c) {
     __atomic_store_n(&tk_serve, tk_serve + 1, __ATOMIC_RELEASE);
 }
 
+int bkl_enter(void) {
+    uint64_t f = irq_save();
+    struct cpu* c = this_cpu();
+    int t = !c->bkl;
+    if (t) { bkl_take(c); c->cur->nobkl = 0; }      // isr_leave would drop it again otherwise
+    irq_restore(f);
+    return t;
+}
+
+void bkl_leave(int taken) {
+    if (!taken) return;
+    uint64_t f = irq_save();
+    this_cpu()->cur->nobkl = 1;
+    bkl_drop(this_cpu());
+    irq_restore(f);
+}
+
 /* we sit at a yield point: let a waiting cpu in, if any. ticket lock so it gets it */
 void bkl_yield(struct cpu* c) {
-    if (tk_next - tk_serve < 2) return;
+    if (!c->bkl || tk_next - tk_serve < 2) return;
     bkl_drop(c);
     bkl_take(c);
 }
 
-void tlb_shootdown(void) {
+/* pd != 0: only the cpus that have that space loaded. whoever loads it later flushes by
+   loading it. the fence pairs with the cr3 write on the other side */
+void tlb_shootdown_pd(uint64_t pd) {
     struct cpu* me = this_cpu();
     uint32_t mask = 0;
+    __sync_synchronize();
     for (int i = 0; i < ncpu; i++) {
         struct cpu* c = &cpus[i];
-        if (c == me || !c->online) continue;
+        if (c == me || !c->online || (pd && c->cr3 != pd)) continue;
         __atomic_store_n(&c->tlb_req, 1, __ATOMIC_SEQ_CST);
         lapic_ipi(c->apic_id, VEC_TLB);
         mask |= 1 << i;
     }
     for (int i = 0; i < ncpu; i++)
-        while ((mask & (1 << i)) && __atomic_load_n(&cpus[i].tlb_req, __ATOMIC_ACQUIRE)) __asm__ volatile ("pause");
+        while ((mask & (1 << i)) && __atomic_load_n(&cpus[i].tlb_req, __ATOMIC_ACQUIRE)) { tlb_service(); __asm__ volatile ("pause"); }
 }
+
+void tlb_shootdown(void) { tlb_shootdown_pd(0); }
 
 void kick_idle(void) {
     struct cpu* me = this_cpu();

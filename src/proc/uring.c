@@ -317,7 +317,7 @@ static void cq_post(uring_t* r, __u64 ud, int res, uint32_t fl) {
     }
     r->ncq++;
     wq_wake(&r->wq);
-    if (r->efd && !(*(volatile uint32_t*)(r->rings + 280) & 1)) { r->efd->cnt++; wq_wake(&r->efd->wq); }      // cq_flags: EVENTFD_DISABLED
+    if (r->efd && !(*(volatile uint32_t*)(r->rings + 280) & 1)) { __atomic_add_fetch(&r->efd->cnt, 1, __ATOMIC_ACQ_REL); efd_wake(); wq_wake(&r->efd->wq); }      // cq_flags: EVENTFD_DISABLED
     if (r->waiter >= 0) {
         task_t* t = task_at(r->waiter);
         if (t && t->state == T_BLOCKED) { t->wake_ms = 0; t->state = T_READY; }

@@ -104,6 +104,15 @@ make run SELF=0 NICS=3                      # + virtio-net cards eth1, eth2
 8. Debug output to remove when stable: `samara: gw arp ...` (net.c),
    `kdbg()` helper in pty.c.
 
+## Lock work (ag/lock)
+
+* Done: spinlocks + lockdep-lite (-DLOCKDEP), pmm/heap/mm/futex locks, nobkl syscalls,
+  pipes, eventfd, bkl_yield in ext2 sync/put_blocks/fnv and gfx_present.
+* Not done: before/after scaling numbers, fork/exec stress, tcg -smp 2 run, xbps/DE+foot
+  retest after the lock changes (only one smoke boot: ls -R | wc ok on kvm smp 4).
+* Not done: yield points in net/uw workers/drm flush are only the task_yield ones.
+  tty/pty, vfs and sockets are still under the BKL.
+
 ## Style
 
 Code like a person wrote it (see CLAUDE.md, local only): snake_case, short

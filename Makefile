@@ -31,7 +31,7 @@ KCFLAGS  := -m64 -mcmodel=kernel -ffreestanding -fno-stack-protector -fno-pic -f
             -nostdlib -mno-red-zone -fno-asynchronous-unwind-tables \
             -mgeneral-regs-only \
             -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -MMD -MP \
-            -std=gnu11 -Isrc
+            -std=gnu11 -Isrc $(if $(LOCKDEP),-DLOCKDEP)
 
 # DOOM compile flags. Permissive so id Software's 1993 K&R C compiles.
 # x87 FP allowed (a few % format strings use it); SSE/MMX off.

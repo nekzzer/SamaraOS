@@ -302,6 +302,12 @@ void task_yield(void) {
     irq_restore(f);
 }
 
+void task_yield_fast(void) {
+    uint64_t f = irq_save();
+    __asm__ volatile ("int $0x81" : : : "memory");
+    irq_restore(f);
+}
+
 void task_sleep_ms(uint32_t ms) {
     uint32_t f = irq_save();
     task_t* t = task_current();
@@ -382,9 +388,28 @@ void task_ap_start(int id) {
 }
 
 void syscall_dispatch(regs_t* r);
+int64_t syscall_nobkl(regs_t* r);
+extern uint8_t nobkl_tab[512];
 void syscall_enter(regs_t* r) {
     struct cpu* c = this_cpu();
-    bkl_take(c);
+    uint64_t nr = r->rax;
+    if (nr < 512 && nobkl_tab[nr] && c->cur->state != T_DEAD) {
+        task_t* t = c->cur;
+        t->nobkl = 1;
+        int64_t ret = syscall_nobkl(r);
+        t->nobkl = 0;
+        if (ret != NB_SLOW) {
+            r->rax = (uint64_t)ret;
+            if (t->proc && proc_signal_deliverable(t->proc)) {
+                if (!this_cpu()->bkl) bkl_take(this_cpu());
+                proc_deliver_signal(r, (int)nr, (int32_t)ret);
+            }
+            return;
+        }
+        r->rax = nr;
+    }
+    c = this_cpu();
+    if (!c->bkl) bkl_take(c);
     /* killed from another cpu while it was in ring 3: it never does anything again */
     while (c->cur->state == T_DEAD) { task_yield(); c = this_cpu(); }
     syscall_dispatch(r);

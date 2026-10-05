@@ -98,6 +98,7 @@ static bool uok(const void* p, uint64_t len) {
     return true;
 }
 bool user_ok(const void* p, uint32_t len) { return uok(p, len); }
+#define UCHK2(p, n) do { if (!uok((p), (n))) { proc_current()->ujb_on = false; return -EFAULT; } } while (0)
 #define UCHK(p, n) do { if (!uok((p), (n))) return -EFAULT; } while (0)
 
 /* user string: walk it page by page till the NUL */
@@ -113,6 +114,27 @@ static bool ustr_ok(const char* s) {
 /* ---------------- fds + paths ---------------- */
 
 static proc_t* me(void) { return proc_current(); }
+
+/* slot changes (close, dup2) and the nobkl lookups, so a file can't die between
+   the lookup and the ref */
+static spin_t fdl;
+
+static file_t* getf_ref(int fd) {
+    if (fd < 0 || fd >= MAX_FDS) return NULL;
+    uint64_t fl = spin_lock(&fdl);
+    file_t* f = proc_current()->sh->fds[fd];
+    file_ref(f);
+    spin_unlock(&fdl, fl);
+    return f;
+}
+
+static file_t* fd_swap(int fd, file_t* nf) {
+    uint64_t fl = spin_lock(&fdl);
+    file_t* old = me()->sh->fds[fd];
+    me()->sh->fds[fd] = nf;
+    spin_unlock(&fdl, fl);
+    return old;
+}
 
 static file_t* getf(int fd) {
     if (fd < 0 || fd >= MAX_FDS) return NULL;
@@ -612,9 +634,9 @@ static int do_dup2(int fd, int nfd, bool cloexec) {
     if (!f) return -EBADF;
     if (nfd < 0 || nfd >= MAX_FDS) return -EBADF;
     if (fd == nfd) return nfd;
-    if (me()->sh->fds[nfd]) { flk_close(me()->sh, me()->sh->fds[nfd]); file_close(me()->sh->fds[nfd]); }
     file_ref(f);
-    me()->sh->fds[nfd] = f;
+    file_t* old = fd_swap(nfd, f);
+    if (old) { flk_close(me()->sh, old); file_close(old); }
     me()->sh->cloexec[nfd] = cloexec;
     return nfd;
 }
@@ -2318,7 +2340,7 @@ static int64_t dispatch(regs_t* r) {
         case 3: {
             file_t* fl = getf((int)a);
             if (!fl) return -EBADF;
-            p->sh->fds[a] = NULL;
+            fd_swap((int)a, NULL);
             flk_close(p->sh, fl);
             file_close(fl);
             return 0;
@@ -2834,7 +2856,7 @@ int16_t sys_revents(file_t* f, int16_t want) { return fd_revents(f, want); }
 int sys_close(int fd) {
     file_t* fl = getf(fd);
     if (!fl) return -EBADF;
-    me()->sh->fds[fd] = NULL;
+    fd_swap(fd, NULL);
     file_close(fl);
     return 0;
 }
@@ -3019,6 +3041,98 @@ void syscall_dispatch(regs_t* r) {
     proc_deliver_signal(r, keep ? -1 : (int)nr, keep ? 0 : (int32_t)ret);
 }
 
+/* syscalls that run without the big lock (see syscall_enter). everything in here
+   must be fine with other cpus running in the kernel at the same time */
+uint8_t nobkl_tab[512];
+
+int64_t syscall_nobkl(regs_t* r) {
+    uint64_t nr = r->rax, a = r->rdi, b = r->rsi, c = r->rdx;
+    proc_t* p = proc_current();
+    if (!p || g_strace || g_ftrace || p->alarm_at) return NB_SLOW;
+    int64_t ret;
+    if (setjmp((void*)p->ujb)) {
+        proc_current()->ujb_on = false;
+        return -EFAULT;
+    }
+    p->ujb_on = true;
+    switch (nr) {
+        case 39: ret = p->tgid; break;
+        case 186: ret = p->pid; break;
+        case 102: case 104: case 107: case 108: ret = 0; break;
+        case 96:
+            ret = 0;
+            if (a) {
+                UCHK2((void*)a, 16);
+                uint32_t s, ns; clock_now(&s, &ns);
+                ((int64_t*)a)[0] = s; ((int64_t*)a)[1] = ns / 1000;
+            }
+            if (b) { UCHK2((void*)b, 8); memset((void*)b, 0, 8); }
+            break;
+        case 228: ret = do_clock_gettime((int)a, (int64_t*)b); break;
+        case 229:
+            if (b) { UCHK2((void*)b, 16); memset((void*)b, 0, 16); ((int64_t*)b)[1] = 1000000; }
+            ret = 0;
+            break;
+        case 24: task_yield_fast(); ret = 0; break;
+        case 35: case 230: {
+            const int64_t* ts = (const int64_t*)(nr == 35 ? a : c);
+            UCHK2(ts, 16);
+            uint32_t ms;
+            if (nr == 230 && (b & 1)) {
+                uint32_t s, ns; clock_now(&s, &ns);
+                ms = ts[0] > s ? (ts[0] - s) * 1000 : 0;
+            } else ms = ts[0] * 1000 + ts[1] / 1000000;
+            uint32_t end = pit_uptime_ms() + ms;
+            ret = 0;
+            while ((int32_t)(pit_uptime_ms() - end) < 0) {
+                if (proc_signal_deliverable(p)) { ret = -EINTR; break; }
+                uint32_t left = end - pit_uptime_ms();
+                task_sleep_ms(left > 20 ? 20 : left);
+            }
+            break;
+        }
+        case 202: ret = do_futex(a, (uint32_t)b, (uint32_t)c, r->r10, r->r8, (uint32_t)r->r9); break;
+        case 0: case 1: {                            /* pipes and eventfd only */
+            file_t* f = getf_ref((int)a);
+            if (!f || (f->type != F_PIPE_R && f->type != F_PIPE_W && f->type != F_EVENTFD)) { file_close(f); ret = NB_SLOW; break; }
+            if (nr == 0 ? f->type == F_PIPE_W : f->type == F_PIPE_R) ret = -EBADF;
+            else if (!uok((void*)b, c)) ret = -EFAULT;
+            else ret = nr == 0 ? file_read(f, (char*)b, c) : file_write(f, (const char*)b, c);
+            file_close(f);
+            break;
+        }
+        case 9: {                                    /* anon only, the rest keeps the lock */
+            if (!(r->r10 & MAP_ANON)) { ret = NB_SLOW; break; }
+            uint64_t len = (b + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+            if (!b) { ret = -EINVAL; break; }
+            bool fx = r->r10 & MAP_FIXED;
+            if (fx && ((a & (PAGE_SIZE - 1)) || a < USER_BASE || a + len > USER_TOP || a + len < a)) { ret = -EINVAL; break; }
+            uint64_t m = vmm_map_anon(p->pd, a, fx, USER_MMAP_BASE, USER_STACK_TOP - USER_STACK_MAX, len, (c & PROT_WRITE) != 0, c != 0);
+            ret = m ? (int64_t)m : -ENOMEM;
+            break;
+        }
+        case 11:
+            if ((a & (PAGE_SIZE - 1)) || !b) ret = -EINVAL;
+            else { if (a >= USER_BASE && a < USER_TOP) vmm_free_range(p->pd, a, b); ret = 0; }
+            break;
+        case 10:
+            if (a & (PAGE_SIZE - 1)) ret = -EINVAL;
+            else {
+                if (a >= USER_BASE && a < USER_TOP) {
+                    vmm_set_writable(p->pd, a, b, (c & PROT_WRITE) != 0);
+                    vmm_set_user(p->pd, a, b, c != 0);
+                }
+                ret = 0;
+            }
+            break;
+        default: ret = NB_SLOW;
+    }
+    proc_current()->ujb_on = false;
+    return ret;
+}
+
 void syscall_init(void) {
     fs_free_hook = shm_drop;
+    static const uint16_t nb[] = { 0, 1, 9, 10, 11, 39, 186, 102, 104, 107, 108, 96, 228, 229, 24, 35, 230, 202 };
+    for (unsigned i = 0; i < sizeof(nb) / sizeof(nb[0]); i++) nobkl_tab[nb[i]] = 1;
 }

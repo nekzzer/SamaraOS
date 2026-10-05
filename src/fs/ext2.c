@@ -3,6 +3,7 @@
 #include "core/heap.h"
 #include "core/string.h"
 #include "core/task.h"
+#include "core/smp.h"
 #include "core/io.h"
 #include "boot/pit.h"
 
@@ -62,7 +63,10 @@ static void wr32(uint8_t* p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v
 static void wr16(uint8_t* p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static uint32_t fnv(const uint8_t* p, uint32_t n) {
     uint32_t h = 2166136261u;
-    for (uint32_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    for (uint32_t i = 0; i < n; i++) {
+        h ^= p[i]; h *= 16777619u;
+        if (n > 0x100000 && !(i & 0x3FFFF)) bkl_yield(this_cpu());   // hashing a huge file used to freeze the other cpus
+    }
     return h | 1;
 }
 
@@ -527,6 +531,7 @@ static int put_blocks(ev_t* v, int ei, const char* data, uint32_t len) {
         memcpy(blk, data + i * v->bs, take);
         if (take < v->bs) memset(blk + take, 0, v->bs - take);
         if (wdata(v, e->bl[i], blk) < 0) return -1;
+        if (!(i & 255)) bkl_yield(this_cpu());
     }
     memset(e->ib, 0, 60);
     for (uint32_t i = 0; i < nb && i < 12; i++) e->ib[i] = e->bl[i];
@@ -646,6 +651,7 @@ static int sync_vol(ev_t* v) {
     bool ft = v->incompat & 2;
     int err = 0;
     for (uint32_t i = 0; i < v->ne; i++) {      /* one bad file used to stop the whole sync, forever */
+        if (!(i & 63)) bkl_yield(this_cpu());
         ent_t* e = &v->E[i];
         fs_node_t* n = e->n;
         uint32_t links = 1, size = (uint32_t)n->size;

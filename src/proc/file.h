@@ -3,6 +3,7 @@
 #include "core/types.h"
 #include "fs/fs.h"
 #include "core/wq.h"
+#include "core/smp.h"
 
 /* Open file descriptions, shared between fds after dup()/fork(). */
 
@@ -25,6 +26,7 @@ typedef struct pipe {
     int  nfds;
     wq_t wq;
     uint32_t wgen;          /* bumped on every write, io_uring multishot poll looks at it */
+    spin_t lk;              /* buf, head/tail/count, readers/writers */
 } pipe_t;
 
 typedef struct file {
@@ -53,6 +55,7 @@ uint32_t file_gen(file_t* f);
 file_t* file_open_node(fs_node_t* n, int flags);   /* handles device nodes */
 void    file_ref(file_t* f);
 void    file_close(file_t* f);
+void    efd_wake(void);                            /* an eventfd counter went up */
 
 int     file_read(file_t* f, char* buf, uint32_t n);
 int     file_write(file_t* f, const char* buf, uint32_t n);

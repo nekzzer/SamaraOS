@@ -6,6 +6,7 @@
 #include "core/heap.h"
 #include "core/string.h"
 #include "core/vmm.h"
+#include "core/smp.h"
 #include "core/io.h"
 #include "boot/gdt.h"
 #include "boot/pit.h"
@@ -508,28 +509,45 @@ static proc_t* leader_of(proc_t* p) {
     return l ? l : p;
 }
 
-/* Futex waiters: at most one per proc (a proc sleeps in one syscall). */
-static struct { bool active, woken; uint64_t pd, addr; } fwq[MAX_PROCS];
+/* Futex waiters: at most one per proc (a proc sleeps in one syscall). A bucket
+   (hash of pd + addr) has its own lock, the table is scanned by bucket number */
+#define FB 64
+static struct { bool active, woken; uint64_t pd, addr; int bk; } fwq[MAX_PROCS];
+static spin_t fbl[FB];
+#define FBK(pd, a) ((int)((((pd) >> 12) * 31 + ((a) >> 2)) & (FB - 1)))
 
 void futex_forget(proc_t* p) {
-    fwq[p - procs].active = false;
+    int w = p - procs;
+    uint64_t f = spin_lock(&fbl[fwq[w].bk]);
+    fwq[w].active = false;
+    spin_unlock(&fbl[fwq[w].bk], f);
     p->in_futex = false;
 }
 
 static void ready_task_of(proc_t* p) {
+    __sync_synchronize();
     task_t* t = task_at(p->task);
     if (t && t->proc == p && t->state == T_BLOCKED) { t->wake_ms = 0; t->state = T_READY; }
 }
 
+/* the word through the direct map: no faults while a bucket lock is held */
+static bool fut_read(uint64_t pd, uint64_t a, uint32_t* v) {
+    uint64_t pte = vmm_pte(pd, a);
+    if (!(pte & PTE_P)) return false;
+    *v = *(volatile uint32_t*)((uint8_t*)P2V(pte & PTE_ADDR) + (a & 0xFFF));
+    return true;
+}
+
 void futex_wake_addr(uint64_t pd, uint64_t addr, int n) {
-    uint32_t f = irq_save();
+    int b = FBK(pd, addr);
+    uint64_t f = spin_lock(&fbl[b]);
     for (int i = 0; i < MAX_PROCS && n > 0; i++) {
-        if (!fwq[i].active || fwq[i].woken || fwq[i].pd != pd || fwq[i].addr != addr) continue;
+        if (!__atomic_load_n(&fwq[i].active, __ATOMIC_ACQUIRE) || fwq[i].woken || fwq[i].bk != b || fwq[i].pd != pd || fwq[i].addr != addr) continue;
         fwq[i].woken = true;
         ready_task_of(&procs[i]);
         n--;
     }
-    irq_restore(f);
+    spin_unlock(&fbl[b], f);
 }
 
 /* One thread (not the leader) goes away. It is either not running or it is
@@ -887,51 +905,70 @@ int futex_op(uint64_t uaddr, int op, uint32_t val, uint64_t tmo, uint64_t uaddr2
     if (!uword_ok(uaddr)) return -EFAULT;
     switch (cmd) {
     case 0: case 9: {                                   /* WAIT, WAIT_BITSET */
-        uint32_t f = irq_save();
-        if (*(volatile uint32_t*)uaddr != val) { irq_restore(f); return -EAGAIN; }
+        uint32_t cur = *(volatile uint32_t*)uaddr;      /* faults it in, no lock yet */
         uint32_t end = tmo == 0xFFFFFFFFu ? 0 : pit_uptime_ms() + (tmo ? tmo : 1);
-        int w = p - procs;
-        fwq[w].active = true; fwq[w].woken = false; fwq[w].pd = p->pd; fwq[w].addr = uaddr;
-        p->in_futex = true;
+        int w = p - procs, b = FBK(p->pd, uaddr), ret;
         task_t* t = task_current();
-        int ret;
+        uint64_t f = spin_lock(&fbl[b]);
+        if (!fut_read(p->pd, uaddr, &cur)) { spin_unlock(&fbl[b], f); return -EFAULT; }
+        if (cur != val) { spin_unlock(&fbl[b], f); return -EAGAIN; }
+        fwq[w].woken = false; fwq[w].pd = p->pd; fwq[w].addr = uaddr; fwq[w].bk = b;
+        __atomic_store_n(&fwq[w].active, true, __ATOMIC_RELEASE);
+        p->in_futex = true;
         for (;;) {
             t->wake_ms = end;
             t->state = T_BLOCKED;
+            __sync_synchronize();
+            if (proc_signal_deliverable(p)) { t->state = T_READY; spin_unlock(&fbl[b], f); ret = -EINTR; break; }
+            spin_unlock(&fbl[b], f);
             while (t->state == T_BLOCKED) task_yield();
             if (fwq[w].woken) { ret = 0; break; }
             if (proc_signal_deliverable(p)) { ret = -EINTR; break; }
             if (end && (int32_t)(pit_uptime_ms() - end) >= 0) { ret = -ETIMEDOUT; break; }
+            f = spin_lock(&fbl[b]);
+            if (fwq[w].woken) { spin_unlock(&fbl[b], f); ret = 0; break; }
         }
         futex_forget(p);
-        irq_restore(f);
         return ret;
     }
     case 1: case 10: {                                  /* WAKE, WAKE_BITSET */
         int n = (int)val < 0 ? 0x7FFFFFFF : (int)val, k = 0;
-        uint32_t f = irq_save();
+        int b = FBK(p->pd, uaddr);
+        uint64_t f = spin_lock(&fbl[b]);
         for (int i = 0; i < MAX_PROCS && k < n; i++) {
-            if (!fwq[i].active || fwq[i].woken || fwq[i].pd != p->pd || fwq[i].addr != uaddr) continue;
+            if (!__atomic_load_n(&fwq[i].active, __ATOMIC_ACQUIRE) || fwq[i].woken || fwq[i].bk != b || fwq[i].pd != p->pd || fwq[i].addr != uaddr) continue;
             fwq[i].woken = true;
             ready_task_of(&procs[i]);
             k++;
         }
-        irq_restore(f);
+        spin_unlock(&fbl[b], f);
         return k;
     }
     case 3: case 4: {                                   /* REQUEUE, CMP_REQUEUE: tmo = val2 */
         if (!uword_ok(uaddr2)) return -EFAULT;
-        uint32_t f = irq_save();
-        if (cmd == 4 && *(volatile uint32_t*)uaddr != val3) { irq_restore(f); return -EAGAIN; }
-        int n = (int)val < 0 ? 0x7FFFFFFF : (int)val, k = 0, moved = 0;
-        int m = (int)tmo < 0 ? 0x7FFFFFFF : (int)tmo;
-        for (int i = 0; i < MAX_PROCS; i++) {
-            if (!fwq[i].active || fwq[i].woken || fwq[i].pd != p->pd || fwq[i].addr != uaddr) continue;
-            if (k < n) { fwq[i].woken = true; ready_task_of(&procs[i]); k++; }
-            else if (moved < m) { fwq[i].addr = uaddr2; moved++; }
+        volatile uint32_t probe = *(volatile uint32_t*)uaddr;
+        (void)probe;
+        int b1 = FBK(p->pd, uaddr), b2 = FBK(p->pd, uaddr2);
+        int lo = b1 < b2 ? b1 : b2, hi = b1 < b2 ? b2 : b1;
+        uint64_t f = spin_lock(&fbl[lo]);
+        uint64_t f2 = 0;
+        if (hi != lo) f2 = spin_lock(&fbl[hi]);
+        uint32_t cur;
+        int ret;
+        if (cmd == 4 && (!fut_read(p->pd, uaddr, &cur) || cur != val3)) ret = -EAGAIN;
+        else {
+            int n = (int)val < 0 ? 0x7FFFFFFF : (int)val, k = 0, moved = 0;
+            int m = (int)tmo < 0 ? 0x7FFFFFFF : (int)tmo;
+            for (int i = 0; i < MAX_PROCS; i++) {
+                if (!__atomic_load_n(&fwq[i].active, __ATOMIC_ACQUIRE) || fwq[i].woken || fwq[i].bk != b1 || fwq[i].pd != p->pd || fwq[i].addr != uaddr) continue;
+                if (k < n) { fwq[i].woken = true; ready_task_of(&procs[i]); k++; }
+                else if (moved < m) { fwq[i].addr = uaddr2; fwq[i].bk = b2; moved++; }
+            }
+            ret = k + moved;
         }
-        irq_restore(f);
-        return k + moved;
+        if (hi != lo) spin_unlock(&fbl[hi], f2);
+        spin_unlock(&fbl[lo], f);
+        return ret;
     }
     }
     return -38;                                         /* ENOSYS: PI futexes, WAKE_OP */
