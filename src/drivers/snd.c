@@ -540,7 +540,7 @@ int snd_ioctl(struct snd_fd* s, uint32_t req, void* arg, bool nb) {
     return -ENOTTY;
 }
 
-int snd_kplay(const int16_t* pcm, uint32_t frames, uint32_t hz) {
+int snd_kopen(uint32_t hz) {
     if (!have || open_pcm) return -EBUSY;
     open_pcm = 1;
     kern = true;
@@ -550,19 +550,22 @@ int snd_kplay(const int16_t* pcm, uint32_t frames, uint32_t hz) {
     uint64_t f = spin_lock(&lk);
     do_prepare();
     spin_unlock(&lk, f);
+    return 0;
+}
+
+int snd_kwrite(const int16_t* pcm, uint32_t frames) {
     int64_t r = pcm_write((const uint8_t*)pcm, frames, false);
-    if (r >= 0) pcm_drain(false);
-    f = spin_lock(&lk);
+    return r < 0 ? (int)r : 0;
+}
+
+void snd_kclose(bool drain) {
+    if (drain) pcm_drain(false);
+    uint64_t f = spin_lock(&lk);
     hda_run(false);
     state = S_OPEN;
     spin_unlock(&lk, f);
     kern = false;
     open_pcm = 0;
-    return r < 0 ? (int)r : 0;
-}
-
-void snd_kstop(void) {
-    // FIXME: abort from the shell is not wired, wav_play just stops writing
 }
 
 static void com_s(const char* s) { while (*s) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, *s++); } }

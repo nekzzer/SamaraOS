@@ -3,6 +3,7 @@
 #include "core/heap.h"
 #include "core/string.h"
 #include "drivers/sb16.h"
+#include "drivers/snd.h"
 #include "drivers/vga.h"
 #include "fs/fat.h"
 #include "fs/fs.h"
@@ -104,7 +105,7 @@ void cmd_playfat(int argc, char **argv) {
     vga_puts("playfat: usage: playfat <FAT-name>\n");
     return;
   }
-  if (!sb16_present()) {
+  if (!sb16_present() && !snd_present()) {
     vga_puts("playfat: SB16 not available\n");
     return;
   }
@@ -133,7 +134,7 @@ void cmd_playwav(int argc, char **argv) {
     vga_puts("playwav: usage: playwav <file>\n");
     return;
   }
-  if (!sb16_present()) {
+  if (!sb16_present() && !snd_present()) {
     vga_puts("playwav: SB16 not available (");
     vga_puts(sb16_status());
     vga_puts(")\n");

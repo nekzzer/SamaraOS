@@ -27,7 +27,7 @@ QDISPLAY ?= -display gtk,zoom-to-fit=off
 # pa = PulseAudio (Linux). Override with AUDIO= for another backend/host.
 # USB: UHCI controller with a mouse on it (drivers/usb.c). USB= to drop it.
 USB      ?= -usb -device usb-mouse
-AUDIO    ?= -audiodev pa,id=snd0 -machine pcspk-audiodev=snd0 -device sb16,audiodev=snd0
+AUDIO    ?= -audiodev pa,id=snd0 -machine pcspk-audiodev=snd0 -device sb16,audiodev=snd0 -device intel-hda -device hda-duplex,audiodev=snd0
 
 KCFLAGS  := -m64 -mcmodel=kernel -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
             -nostdlib -mno-red-zone -fno-asynchronous-unwind-tables \

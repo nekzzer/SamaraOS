@@ -1,6 +1,7 @@
 #include "core/task.h"
 #include "apps/wav.h"
 #include "drivers/sb16.h"
+#include "drivers/snd.h"
 #include "core/string.h"
 #include "core/io.h"
 #include "boot/pit.h"
@@ -105,10 +106,44 @@ static uint32_t resample_chunk(const wav_info_t* w,
     return n;
 }
 
+// hda path: anything -> s16 stereo, 44100 or 48000, rate is nearest-sample
+static int wav_play_hda(const wav_info_t* w) {
+    static int16_t out[2048 * 2];
+    uint32_t ch = w->channels, bps = w->bits_per_sample / 8;
+    if (!ch || !bps || bps > 2) return -11;
+    uint32_t fsize = ch * bps, total = w->pcm_size / fsize;
+    uint32_t hz = w->sample_rate == 44100 ? 44100 : 48000;
+    uint64_t nout = (uint64_t)total * hz / w->sample_rate;
+    if (snd_kopen(hz) != 0) return -10;
+    uint64_t o = 0;
+    int r = 0;
+    while (o < nout) {
+        uint32_t n = nout - o > 2048 ? 2048 : (uint32_t)(nout - o);
+        for (uint32_t i = 0; i < n; i++) {
+            uint64_t si = (o + i) * w->sample_rate / hz;
+            const uint8_t* p = w->pcm + si * fsize;
+            int v[2];
+            for (int c = 0; c < 2; c++) {
+                const uint8_t* q = p + (c < (int)ch ? c : 0) * bps;
+                v[c] = bps == 1 ? ((int)*q - 128) << 8 : (int16_t)(q[0] | q[1] << 8);
+            }
+            out[i * 2] = (int16_t)v[0];
+            out[i * 2 + 1] = (int16_t)v[1];
+        }
+        if (snd_kwrite(out, n) != 0) { r = -12; break; }
+        o += n;
+        char c = kbd_trygetc();
+        if (c == 3 || c == 0x1B) { snd_kclose(false); return 0; }
+    }
+    snd_kclose(r == 0);
+    return r;
+}
+
 int wav_play(const uint8_t* buf, uint32_t len) {
     wav_info_t w;
     int r = wav_parse(buf, len, &w);
     if (r != 0) return r;
+    if (snd_present()) return wav_play_hda(&w);
     if (!sb16_present()) return -10;
 
     /* SB16 driver chunk limit. Smaller actual chunks reduce hiccups. */
