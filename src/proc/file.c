@@ -271,6 +271,7 @@ bool file_readable(file_t* f) {
         case F_EVENTFD: return f->cnt > 0;
         case F_URING:  return uring_readable(f->ur);
         case F_TIMERFD: return f->t_next && (int32_t)(pit_uptime_ms() - f->t_next) >= 0;
+        case F_SIGNALFD: { proc_t* c = proc_current(); return c && (c->sig_pending & f->cnt); }
         case F_USOCK:  return false;
         case F_INPUT:  return input_pending(f->disk);
         case F_DRM:    return drm_readable(f->drm);
@@ -367,6 +368,24 @@ int file_read(file_t* f, char* buf, uint32_t n) {
             memcpy(buf, &v, 8);
             return 8;
         }
+        case F_SIGNALFD: {
+            proc_t* c = proc_current();
+            if (n < 128) return -22;
+            for (;;) {
+                uint64_t m = c->sig_pending & f->cnt;
+                if (m) {
+                    int sig = 1;
+                    while (!(m & SIGBIT(sig))) sig++;
+                    c->sig_pending &= ~SIGBIT(sig);
+                    memset(buf, 0, 128);
+                    *(uint32_t*)buf = (uint32_t)sig;
+                    return 128;
+                }
+                if (f->flags & O_NONBLOCK) return -11;
+                if (proc_interrupted()) return -4;
+                task_sleep_ms(2);
+            }
+        }
         case F_ZERO: memset(buf, 0, n); return (int)n;
         case F_RANDOM: for (uint32_t i = 0; i < n; i++) buf[i] = (char)rnd8(); return (int)n;
         case F_TTY:  return tty_read(buf, (int)n, (f->flags & O_NONBLOCK) != 0);
@@ -414,7 +433,7 @@ int file_write(file_t* f, const char* buf, uint32_t n) {
             f->cnt += v;
             return 8;
         }
-        case F_TIMERFD: return -22;
+        case F_TIMERFD: case F_SIGNALFD: return -22;
         case F_USOCK: case F_ULISTEN: return -107;   /* ENOTCONN */
         case F_EPOLL: case F_URING: return -22;
         case F_TTY:  return tty_write(buf, (int)n);

@@ -12,6 +12,8 @@
 #include "gfx/gfx.h"
 #include "gui/desktop.h"
 #include "gui/wm.h"
+#include "shell/shell.h"
+#include "proc/proc.h"
 
 /* ===================== sample App: bouncing ball ===================== */
 /* Demonstrates the wm_open_app API used for porting future apps (e.g. DOOM):
@@ -143,7 +145,15 @@ void cmd_desktop(int argc, char **argv) {
   wm_open_info(gfx_w() - 500, 60, 440, 220, "Welcome", welcome);
   wm_open_terminal(120, 64);
 
+  /* wayland side of the DE, if it is installed */
+  int wlpid = shell_launch_detached("/usr/bin/samara-wl");
+
   wm_run();
+
+  if (wlpid > 0) {
+    proc_t *wp = proc_by_pid(wlpid);
+    if (wp) proc_kill_session(wp->sid);
+  }
 
   /* cleanup */
   mediaplayer_force_stop();

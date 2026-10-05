@@ -49,6 +49,19 @@ static int     n_ignored;
 
 static volatile uint8_t keybits[32];
 
+/* press/release events by Linux key code for the WM (wayland windows) */
+static volatile uint16_t rawq[64];
+static volatile int raw_h, raw_t;
+
+int kbd_raw_take(int* code, int* down) {
+    if (raw_h == raw_t) return 0;
+    uint16_t v = rawq[raw_t];
+    raw_t = (raw_t + 1) & 63;
+    *code = v & 0x7FFF;
+    *down = v >> 15;
+    return 1;
+}
+
 void kbd_key_bits(uint8_t out[32]) {
     for (int i = 0; i < 32; i++) out[i] = keybits[i];
 }
@@ -107,6 +120,8 @@ static void kbd_isr(regs_t* f) {
         if (lk && lk < 256) {
             if (released) keybits[lk >> 3] &= (uint8_t)~(1u << (lk & 7));
             else          keybits[lk >> 3] |= (uint8_t)(1u << (lk & 7));
+            int nh = (raw_h + 1) & 63;
+            if (nh != raw_t) { rawq[raw_h] = (uint16_t)(lk | (released ? 0 : 0x8000)); raw_h = nh; }
         }
     }
 

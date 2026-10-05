@@ -88,6 +88,7 @@ window_t* wm_open_app_ex(int x, int y, int w, int h, const char* title,
                           void* user);
 void      wm_close(window_t* w);
 window_t* wm_focused(void);
+window_t* wm_window_at(int x, int y);
 
 /* Desktop wallpaper (/home/user, /mnt or / wallpaper.bmp) changed: reload
    it on the next frame (or at the next desktop start). */

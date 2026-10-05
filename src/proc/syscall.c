@@ -2472,10 +2472,26 @@ static int64_t dispatch(regs_t* r) {
         case 197: case 198: case 199: return -95;                    /* removexattr */
         case 444: case 445: case 446: return -ENOSYS;                /* landlock, xz asks */
         case 285: return -95;                                        /* fallocate, apk asks. EOPNOTSUPP and it just writes */
-        // signalfd(4), membarrier, rseq: not here yet. glib/qemu fall back
+        // membarrier, rseq: not here yet. glib/qemu fall back
         // to pipes and poll on ENOSYS, so just say no without spamming the log
         case 332: return sys_statx((int)a, (const char*)b, (int)c, (uint32_t)d, (void*)e);
-        case 289: case 282: case 324: case 334: case 435:
+        case 289: case 282: {                                        /* signalfd4 / signalfd */
+            UCHK((void*)b, 8);
+            uint64_t m = *(uint64_t*)b;
+            if ((int)a >= 0) {
+                file_t* f = getf((int)a);
+                if (!f) return -EBADF;
+                if (f->type != F_SIGNALFD) return -EINVAL;
+                f->cnt = m;
+                return (int)a;
+            }
+            int fl = r->rax == 289 ? (int)d : 0;
+            file_t* f = file_new(F_SIGNALFD, 2 | ((fl & 04000) ? O_NONBLOCK : 0));
+            if (!f) return -ENOMEM;
+            f->cnt = m;
+            return install_fd(f, 0, (fl & 02000000) != 0);
+        }
+        case 324: case 334: case 435:
             return -ENOSYS;
         case 284: case 290: {                                        /* eventfd(2) */
             int fl = r->rax == 290 ? (int)b : 0;

@@ -33,6 +33,9 @@ static char *const user_env[] = {
     "ENV=/etc/shrc",                  /* interactive sh: gradient prompt, colours */
     "PS1=\\u@\\h:\\w\\$ ",
     "LANG=C.UTF-8",                   /* btop refuses to start without utf-8 */
+    "XDG_RUNTIME_DIR=/run/user/0",    /* samara-wl */
+    "WAYLAND_DISPLAY=wayland-0",
+    "DISPLAY=:0",
     NULL,
 };
 

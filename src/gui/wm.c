@@ -204,6 +204,13 @@ static int hit_window_edge(int mx, int my, int* edge) {
 
 static int hit_window(int mx, int my) { return hit_window_edge(mx, my, NULL); }
 
+/* window under the pointer for wayland-ish input (taskbar and open menu cover it) */
+window_t* wm_window_at(int mx, int my) {
+    if (menu_open || (my >= gfx_h() - TASKBAR_H && !tb_hidden())) return NULL;
+    int i = hit_window(mx, my);
+    return i < 0 ? NULL : &windows[i];
+}
+
 /* ========================================================================
    Focus / lifecycle
    ======================================================================== */
@@ -682,6 +689,8 @@ typedef struct { const char* label; const char* hint; int action; } menu_entry_t
 static const menu_entry_t menu_entries[] = {
     { "Terminal",     NULL,  0 },
     { "Files",        NULL, 11 },
+    { "XTerm",        NULL, 12 },
+    { "Foot",         NULL, 13 },
     { "Web Browser",  NULL,  1 },
     { "Music Player", NULL,  2 },
     { "Paint",        NULL,  3 },
@@ -782,6 +791,8 @@ static void menu_run(int action) {
         case 9:  ext2_sync_all(); fatfs_sync_all(); outw(0x604, 0x2000); outw(0xB004, 0x2000); break;
         case 10: exit_requested = true; break;
         case 11: if (shell_launch_detached("/usr/bin/fm") < 0) wm_open_info(W / 2 - 150, H / 2 - 60, 300, 120, "Files", "fm not found"); break;
+        case 12: if (shell_launch_detached("xterm") < 0) wm_open_info(W / 2 - 150, H / 2 - 60, 300, 120, "XTerm", "xterm not installed"); break;
+        case 13: if (shell_launch_detached("foot") < 0) wm_open_info(W / 2 - 150, H / 2 - 60, 300, 120, "Foot", "foot not installed"); break;
     }
 }
 

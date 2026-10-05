@@ -35,5 +35,6 @@ void kbd_unignore_all(void);
 
 /* Currently held keys, one bit per Linux key code (KEY_A = 30, ...). */
 void kbd_key_bits(uint8_t out[32]);
+int  kbd_raw_take(int* code, int* down);   /* key events by Linux code, 0 = empty */
 
 #endif

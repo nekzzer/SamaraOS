@@ -675,8 +675,8 @@ static int send_sig(proc_t* p, int sig, bool exact) {
     if (sig != 9) {
         uint64_t h = p->sh->sa[sig].handler;
         if (h == 1) return 0;                               /* SIG_IGN */
-        if (h > 1) {                                        /* caught: delivered on return to ring 3 */
-            proc_t* d = p->is_thread || exact ? p : pick_thread(p, sig);
+        proc_t* d = p->is_thread || exact ? p : pick_thread(p, sig);
+        if (h > 1 || (d->sig_mask & SIGBIT(sig))) {         /* caught or blocked (signalfd): stays pending */
             d->sig_pending |= SIGBIT(sig);
             if (d->in_futex) ready_task_of(d);
             return 0;

@@ -58,6 +58,8 @@ typedef struct {
     ovl_t     ovl[2][OVL_MAX];       /* presented frames (double-buffered) */
     int       n_ovl[2];
     volatile int ovl_cur;
+    bool inside, kfocus;             /* SM_F_WL: pointer in the client, keyboard focus */
+    int bmask, px, py;               /* buttons we reported, last pointer pos */
 } uwin_t;
 
 static uwin_t U[UWIN_MAX];
@@ -115,6 +117,10 @@ static uwin_t* by_handle(uint32_t h) {
 static void push(uwin_t* u, int type, int a, int b, int c) {
     int next = (u->qt + 1) % EVQ;
     if (next == u->qh) return;                      /* full: drop */
+    if (type == SM_EV_PMOVE && u->qh != u->qt) {    /* motion piles up: keep only the last */
+        sm_event_t* l = &u->q[(u->qt + EVQ - 1) % EVQ];
+        if (l->type == SM_EV_PMOVE) { l->a = a; l->b = b; return; }
+    }
     u->q[u->qt] = (sm_event_t){ type, a, b, c };
     u->qt = next;
 }
@@ -205,12 +211,14 @@ static uwin_t* text_target(uint64_t buf, int bw, int bh) {
 }
 
 static void u_key(window_t* w, char c) {
+    if (of(w)->flags & SM_F_WL) return;             /* raw keys go through uwin_wm_frame */
     int m = (kbd_shift_held() ? 1 : 0) | (kbd_ctrl_held() ? 2 : 0) | (kbd_alt_held() ? 4 : 0);
     push(of(w), SM_EV_KEY, (uint8_t)c, m, 0);
 }
 
 static void u_rclick(window_t* w, int rx, int ry) {
     uwin_t* u = of(w);
+    if (u->flags & SM_F_WL) return;
     int cx, cy, cw, ch, x, y;
     wm_client_rect(w, &cx, &cy, &cw, &ch);
     u_map(u, w, cx + rx, cy + ry, &x, &y);
@@ -225,12 +233,13 @@ static void u_resize(window_t* w) {
     if (cw < 16 || ch < 16 || cw * ch > u->cap) return;
     if (cw == u->w && ch == u->h) return;
     u->w = cw; u->h = ch;
-    memset(u->pix, 0x18, (size_t)cw * ch * 4);
+    memset(u->pix, (u->flags & SM_F_WL) ? 0 : 0x18, (size_t)cw * ch * 4);
     push(u, SM_EV_RESIZE, cw, ch, 0);
 }
 
 static void u_click(window_t* w, int rx, int ry) {
     uwin_t* u = of(w);
+    if (u->flags & SM_F_WL) return;
     int cx, cy, cw, ch, x, y;
     wm_client_rect(w, &cx, &cy, &cw, &ch);
     u_map(u, w, cx + rx, cy + ry, &x, &y);
@@ -241,8 +250,41 @@ static void u_click(window_t* w, int rx, int ry) {
 
 static void u_release(window_t* w) {
     uwin_t* u = of(w);
+    if (u->flags & SM_F_WL) return;
     u->pressed = false;
     push(u, SM_EV_MOUSE_UP, u->hover_x, u->hover_y, 0);
+}
+
+/* pointer + focus for SM_F_WL windows, polled once per frame */
+static void u_wl_tick(uwin_t* u, window_t* w) {
+    int cx, cy, cw, ch, mx, my;
+    uint8_t b;
+    wm_client_rect(w, &cx, &cy, &cw, &ch);
+    mouse_get(&mx, &my, &b);
+    int rx = mx - cx, ry = my - cy;
+    bool foc = wm_focused() == w;
+    if (foc != u->kfocus) { u->kfocus = foc; push(u, SM_EV_FOCUS, foc, 0, 0); }
+    bool over = rx >= 0 && ry >= 0 && rx < cw && ry < ch && wm_window_at(mx, my) == w;
+    if (over && !u->inside) {
+        u->inside = true;
+        u->px = rx; u->py = ry;
+        push(u, SM_EV_PENTER, rx, ry, 0);
+    } else if (u->inside && (rx != u->px || ry != u->py) && (over || u->bmask)) {
+        u->px = rx; u->py = ry;
+        push(u, SM_EV_PMOVE, rx, ry, 0);
+    }
+    for (int i = 0; i < 3; i++) {
+        int bit = 1 << i;
+        bool now = b & bit, was = u->bmask & bit;
+        if (now == was) continue;
+        if (now && !over) continue;                  /* press somewhere else (title, other window) */
+        u->bmask ^= bit;
+        push(u, SM_EV_PBTN, 0x110 + i, now, 0);
+    }
+    if (u->inside && !over && !u->bmask) {
+        u->inside = false;
+        push(u, SM_EV_PLEAVE, 0, 0, 0);
+    }
 }
 
 static void u_tick(window_t* w, uint32_t now) {
@@ -253,6 +295,7 @@ static void u_tick(window_t* w, uint32_t now) {
         w->title[63] = 0;
         u->title_dirty = false;
     }
+    if (u->flags & SM_F_WL) { u_wl_tick(u, w); return; }
     if (u->pressed || wm_focused() != w) return;
     int cx, cy, cw, ch, mx, my;
     uint8_t b;
@@ -291,6 +334,13 @@ static int cascade;
 
 void uwin_wm_frame(void) {
     wm_up = true;
+    int kc, kd;
+    while (kbd_raw_take(&kc, &kd)) {
+        window_t* f = wm_focused();
+        for (int i = 0; i < UWIN_MAX; i++)
+            if (U[i].state == U_OPEN && U[i].win == f && (U[i].flags & SM_F_WL))
+                push(&U[i], SM_EV_RAWKEY, kc, kd, kbd_is_ru());
+    }
     for (int i = 0; i < UWIN_MAX; i++) {
         uwin_t* u = &U[i];
         if (u->state == U_PENDING) {
@@ -311,6 +361,7 @@ void uwin_wm_frame(void) {
             w->min_w = u->w + 8;                 /* never below 1:1 */
             w->min_h = u->h + WM_TITLE_H + 6;
             if (u->flags & SM_F_RESIZE) { w->min_w = 420; w->min_h = 300; }
+            if (u->flags & SM_F_WL) { w->min_w = 120; w->min_h = 90; }
             u->win = w;
             u->state = U_OPEN;
         } else if (u->state == U_CLOSING) {
@@ -362,6 +413,13 @@ static int32_t op_open(uint64_t a) {
     if (o.scale < 1) o.scale = 1;
     if (o.scale > 8) o.scale = 8;
     if (o.w < 16 || o.h < 16 || o.w * o.h > MAX_PIXELS) return -EINVAL;
+    bool clamped = false;
+    if (o.flags & SM_F_WL) {
+        o.flags |= SM_F_RESIZE;
+        o.scale = 1;
+        if (o.w + 8 > gfx_w()) { o.w = gfx_w() - 8; clamped = true; }
+        if (o.h + WM_TITLE_H + 6 > gfx_h() - 40) { o.h = gfx_h() - 40 - WM_TITLE_H - 6; clamped = true; }
+    }
     if (o.flags & SM_F_RESIZE) o.scale = 1;
     if (o.w * o.scale + 8 > gfx_w() || o.h * o.scale + WM_TITLE_H + 6 > gfx_h() - 40) return -EINVAL;
     int slot = -1;
@@ -390,6 +448,7 @@ static int32_t op_open(uint64_t a) {
         task_sleep_ms(5);
     }
     if (u->state != U_OPEN) { release_slot(u); return -ENODEV; }
+    if (clamped) push(u, SM_EV_RESIZE, u->w, u->h, 0);
     return slot;
 }
 

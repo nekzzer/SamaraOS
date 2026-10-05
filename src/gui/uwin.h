@@ -21,9 +21,16 @@ enum {
 };
 
 enum { SM_EV_NONE, SM_EV_KEY, SM_EV_MOUSE_DOWN, SM_EV_MOUSE_UP, SM_EV_MOUSE_MOVE, SM_EV_CLOSE,
-       SM_EV_WHEEL, SM_EV_RDOWN, SM_EV_RESIZE };
+       SM_EV_WHEEL, SM_EV_RDOWN, SM_EV_RESIZE,
+       SM_EV_RAWKEY, SM_EV_PENTER, SM_EV_PLEAVE, SM_EV_PMOVE, SM_EV_PBTN, SM_EV_FOCUS };
 /* SM_EV_KEY: b = modifiers (1 shift, 2 ctrl, 4 alt). SM_EV_RDOWN: a, b = x, y of a right click.
    SM_EV_RESIZE: a, b = new client size (SM_F_RESIZE windows) */
+/* SM_F_WL windows (samara-wl): resizable, scale 1, and raw input instead of the old events:
+   SM_EV_RAWKEY a = linux key code, b = 1 down / 0 up, c = 1 if the RU layout is on (keyboard focus only),
+   SM_EV_FOCUS a = 1/0 keyboard focus, SM_EV_PENTER / PMOVE a, b = x, y in the client (PMOVE goes on while a
+   button is held, even outside), SM_EV_PLEAVE, SM_EV_PBTN a = BTN_LEFT/RIGHT/MIDDLE (0x110..), b = 1/0,
+   SM_EV_WHEEL a = dz (> 0 down). The open size is clamped to the screen: a RESIZE event follows if it was. */
+#define SM_F_WL     4
 #define SM_F_RAW    1     /* sm_text rasterizes into the buffer, no crisp overlay (lots of text) */
 #define SM_F_RESIZE 2     /* window follows its frame: scale 1, SM_EV_RESIZE; present with size in esi */
 

@@ -466,7 +466,8 @@ window_t* pterm_open(int x, int y) {
     char* argv[] = { (char*)"sh", (char*)"-c", cmd, NULL };
     char* envp[] = { (char*)"PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/games:/usr/local/bin:/opt/gcc/bin", (char*)"HOME=/root",
                      (char*)"USER=root", (char*)"LOGNAME=root", (char*)"SHELL=/bin/sh", (char*)"TERM=linux",
-                     (char*)"COLORTERM=truecolor", (char*)"ENV=/etc/shrc", (char*)"PS1=\\u@\\h:\\w\\$ ", (char*)"LANG=C.UTF-8", NULL };
+                     (char*)"COLORTERM=truecolor", (char*)"ENV=/etc/shrc", (char*)"PS1=\\u@\\h:\\w\\$ ", (char*)"LANG=C.UTF-8",
+                     (char*)"XDG_RUNTIME_DIR=/run/user/0", (char*)"WAYLAND_DISPLAY=wayland-0", (char*)"DISPLAY=:0", NULL };
     t->pid = proc_spawn_detached("/bin/sh", argv, envp);
     if (t->pid < 0) { pty_master_close(t->pty); goto fail; }
 
