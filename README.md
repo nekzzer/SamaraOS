@@ -54,11 +54,14 @@ make                 # build the kernel (build/samara.elf)
 make run SELF=0      # run in QEMU with the kernel you just built
 ```
 
-Userland (optional, the repo ships `userland/sysroot.tar`):
+Userland (optional, the repo ships `userland/sysroot.tar`). Void x86_64-musl root disk
+with xbps (needs xbps-install, mke2fs, zstd on the host):
 
 ```
-./userland/build-quickjs.sh && ./userland/build-sysroot.sh && make
+./userland/build-x64sdk.sh && ./userland/build-sysroot.sh && ./userland/build-x64root.sh && make
 ```
+
+Inside: `xbps-install -Sy gcc` and so on, `build/root-x64.img` is the default root disk.
 
 | Command | What it does |
 |---|---|
