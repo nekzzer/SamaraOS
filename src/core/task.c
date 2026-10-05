@@ -251,7 +251,10 @@ static regs_t* schedule(regs_t* saved) {
         else if (user) c->t_user++;
         else c->t_sys++;
         if (cur->proc && !c->in_idle) proc_account_tick(cur->proc, user);
-        if (prof_on) prof_sample(saved->rip, user, c->in_idle || cur == c->idle, cur->proc ? cur->proc->name : "?");
+        if (prof_on) {
+            if (ncpu < 2) prof_sample(saved->rip, user, c->in_idle || cur == c->idle, cur->proc ? cur->proc->name : "?");
+            else for (int i = 0; i < ncpu; i++) if (i != c->id) lapic_ipi_raw(cpus[i].apic_id, 0x4400);
+        }
     }
 
     /* 1 kHz tick, 10 ms time slice. A task that is no longer runnable gives

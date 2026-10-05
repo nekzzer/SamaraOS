@@ -12,6 +12,8 @@ static inline uint64_t prof_tsc(void) {
 }
 
 void prof_sample(uint64_t rip, bool user, bool idle, const char* name);
+struct regs;
+void prof_nmi(struct regs* r);
 void prof_sys(int nr, uint64_t cyc);
 void prof_cmd(const char* s, uint32_t n);
 int prof_dump(char* buf, int cap);

@@ -7,6 +7,7 @@
 #include "boot/gdt.h"
 #include "drivers/vga.h"
 #include "proc/proc.h"
+#include "core/prof.h"
 
 struct idt_entry {
     uint16_t off_lo;
@@ -75,6 +76,7 @@ static void exc_default(regs_t* f) {
 int last_vec;
 regs_t* isr_dispatch(regs_t* r) {
     int v = (int)r->vec;
+    if (v == 2) { prof_nmi(r); return r; }    // gs may still be the user's here, before this_cpu
     struct cpu* c = this_cpu();
     if (v == VEC_TLB) {                    // no lock, the sender holds it
         tlb_service();
@@ -96,6 +98,7 @@ regs_t* isr_dispatch(regs_t* r) {
 /* back on the stack of the frame we return to: the old task is off cpu for
    good now, and the lock goes unless we stay in the kernel */
 void isr_leave(regs_t* f) {
+    if (f->vec == 2) return;                // nmi from the profiler, touches nothing
     struct cpu* c = this_cpu();
     if (c->prev) {
         __atomic_store_n(&c->prev->on_cpu, 0, __ATOMIC_RELEASE);
