@@ -58,6 +58,7 @@ static void set(const char *k, const char *v) {
     strcpy(conf, out);
     f = fopen(CONF, "w");
     if (f) { fputs(conf, f); fclose(f); }
+    th_load();
     sm_ctl(SM_CTL_RELOAD);
 }
 
@@ -175,7 +176,7 @@ static void click(int id) {
     char v[16];
     int m;
     switch (id) {
-    case 0: set("theme", "dark"); th_load(); break;
+    case 0: set("theme", "dark"); break;
     case 1: set("theme", "light"); break;
     case 2: set("layout", "us"); break;
     case 3: set("layout", "ru"); break;
