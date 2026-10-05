@@ -34,6 +34,8 @@ static inline bool dma_ok(const void* v) {
 #define PTE_US 0x004ul
 #define PTE_SHARED 0x200ul         /* avl bit: MAP_SHARED / shmat page, fork shares it */
 #define PTE_LAZY   0x400ul         /* avl bit, P=0: anon mmap page that gets a frame on first touch */
+#define PTE_COW    0x800ul         /* avl bit, P=1, RW=0: writable page whose frame is shared after fork, copied on the write fault */
+#define PTE_WR(e)  ((e) & (PTE_RW | PTE_COW))
 #define PTE_ADDR   0x000FFFFFFFFFF000ul
 
 /* frames: pmm_init(top of ram), then pmm_add() for each usable range */
@@ -72,7 +74,10 @@ uint64_t vmm_count_pages(uint64_t pd);                  /* mapped user pages */
 /* device memory (pci bars), anywhere in the physical space */
 void*    mmio_map(uint64_t pa, size_t len);
 
-/* After editing the live tables. */
+/* write fault on a PTE_COW page: own copy (or just RW when we are the last user). false = not a cow page / oom */
+bool     vmm_cow(uint64_t pd, uint64_t va);
+
+/* After editing the live tables. Single pages go through tlb_inval in vmm.c (SMP shootdown goes there) */
 void     vmm_flush(void);
 
 #endif

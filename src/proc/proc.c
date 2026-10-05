@@ -721,7 +721,9 @@ bool proc_interrupted(void) {
 
 bool proc_handle_fault(uint64_t addr, uint64_t err) {
     proc_t* p = proc_current();
-    if (!p || (err & 1)) return false;                   /* protection faults are real */
+    if (!p) return false;
+    if ((err & 3) == 3 && addr >= USER_BASE && addr < USER_TOP && vmm_cow(p->pd, addr)) return true;   /* fork's cow */
+    if (err & 1) return false;                           /* protection faults are real */
     /* lazy anon page: frame now. PROT_NONE (no US) and writes to read-only
        ones stay faults, java counts on those SIGSEGVs */
     uint64_t pte = vmm_pte(p->pd, addr & ~(PAGE_SIZE - 1));
@@ -823,7 +825,7 @@ static bool uword_ok(uint64_t a) { return a >= USER_BASE && a < USER_TOP - 4 && 
 
 /* tid pointers from clone: only writable mapped pages, no raw stores */
 static void put_tid(uint64_t pd, uint64_t a, int v) {
-    if (uword_ok(a) && (vmm_pte(pd, a) & PTE_RW)) vmm_copy_to(pd, a, &v, 4);
+    if (uword_ok(a) && PTE_WR(vmm_pte(pd, a))) vmm_copy_to(pd, a, &v, 4);
 }
 
 int proc_clone(regs_t* r) {

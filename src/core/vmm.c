@@ -70,12 +70,13 @@ static bool ours(uint64_t frame) {
     return i < max_pfn && refcnt[i] != 0xFF;
 }
 
+/* 254 is sticky: stays, never freed (too many forks of one page) */
 void pmm_ref(uint64_t frame) {
     if (ours(frame) && refcnt[frame >> 12] < 254) refcnt[frame >> 12]++;
 }
 
 void pmm_unref(uint64_t frame) {
-    if (!ours(frame) || !refcnt[frame >> 12]) return;
+    if (!ours(frame) || !refcnt[frame >> 12] || refcnt[frame >> 12] == 254) return;
     uint64_t f = irq_save();
     if (--refcnt[frame >> 12] == 0) pool_free++;
     irq_restore(f);
@@ -88,6 +89,44 @@ void pmm_unref(uint64_t frame) {
 void vmm_flush(void) {
     uint64_t cr3;
     __asm__ volatile ("mov %%cr3, %0; mov %0, %%cr3" : "=r"(cr3) : : "memory");
+}
+
+static uint64_t* pte_slot(uint64_t pd, uint64_t va, bool create);
+
+/* every change of a live leaf pte goes through here. SMP: shootdown for the other cpus goes in tlb_inval */
+static void tlb_inval(uint64_t va) {
+    __asm__ volatile ("invlpg (%0)" : : "r"(va) : "memory");
+}
+
+static void pte_put(uint64_t* p, uint64_t va, uint64_t v) {
+    *p = v;
+    tlb_inval(va);
+}
+
+/* writable now: a frame that somebody else holds too waits for the write fault */
+static void make_writable(uint64_t* p, uint64_t va) {
+    uint64_t e = *p;
+    if ((e & PTE_P) && !(e & PTE_SHARED) && ours(e & PTE_ADDR) && refcnt[(e & PTE_ADDR) >> 12] > 1)
+        pte_put(p, va, (e & ~PTE_RW) | PTE_COW);
+    else
+        pte_put(p, va, (e & ~PTE_COW) | PTE_RW);
+}
+
+bool vmm_cow(uint64_t pd, uint64_t va) {
+    va &= ~(PAGE_SIZE - 1);
+    uint64_t* p = pte_slot(pd, va, false);
+    if (!p || !(*p & PTE_P) || !(*p & PTE_COW)) return false;
+    uint64_t e = *p, fr = e & PTE_ADDR;
+    if (refcnt[fr >> 12] != 1) {
+        uint64_t nf = pmm_alloc();
+        if (!nf) return false;
+        memcpy(P2V(nf), P2V(fr), PAGE_SIZE);
+        pte_put(p, va, nf | (e & ~PTE_ADDR & ~PTE_COW) | PTE_RW);
+        pmm_unref(fr);
+        return true;
+    }
+    pte_put(p, va, (e & ~PTE_COW) | PTE_RW);
+    return true;
 }
 
 uint64_t vmm_new_space(void) {
@@ -130,12 +169,12 @@ int vmm_alloc_range(uint64_t pd, uint64_t va, uint64_t len, bool writable) {
         uint64_t* p = pte_slot(pd, a, true);
         if (!p) return -1;
         if (*p & PTE_P) {
-            if (writable) *p |= PTE_RW;
+            if (writable) make_writable(p, a);
             continue;
         }
         uint64_t fr = pmm_alloc();
         if (!fr) return -1;
-        *p = fr | PTE_P | PTE_US | (writable ? PTE_RW : 0);
+        pte_put(p, a, fr | PTE_P | PTE_US | (writable ? PTE_RW : 0));
     }
     return 0;
 }
@@ -145,7 +184,9 @@ void vmm_set_writable(uint64_t pd, uint64_t va, uint64_t len, bool writable) {
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
         uint64_t* p = pte_slot(pd, a, false);
         if (!p || !(*p & (PTE_P | PTE_LAZY))) continue;
-        if (writable) *p |= PTE_RW; else *p &= ~PTE_RW;
+        if (!writable) pte_put(p, a, *p & ~(PTE_RW | PTE_COW));
+        else if (*p & PTE_P) make_writable(p, a);
+        else pte_put(p, a, *p | PTE_RW);
     }
 }
 
@@ -154,7 +195,7 @@ int vmm_map_frame(uint64_t pd, uint64_t va, uint64_t fr, bool rw) {
     if (!p) return -1;
     pmm_ref(fr);
     if (*p & PTE_P) pmm_unref(*p & PTE_ADDR);
-    *p = fr | PTE_P | PTE_US | (rw ? PTE_RW : 0) | PTE_SHARED;   /* every caller maps something shared */
+    pte_put(p, va, fr | PTE_P | PTE_US | (rw ? PTE_RW : 0) | PTE_SHARED);   /* every caller maps something shared */
     return 0;
 }
 
@@ -168,7 +209,7 @@ int vmm_lazy_range(uint64_t pd, uint64_t va, uint64_t len, bool rw, bool user) {
         uint64_t* p = pte_slot(pd, a, true);
         if (!p) return -1;
         if (*p & PTE_P) pmm_unref(*p & PTE_ADDR);
-        *p = PTE_LAZY | (rw ? PTE_RW : 0) | (user ? PTE_US : 0);
+        pte_put(p, a, PTE_LAZY | (rw ? PTE_RW : 0) | (user ? PTE_US : 0));
     }
     return 0;
 }
@@ -178,7 +219,7 @@ bool vmm_fault_in(uint64_t pd, uint64_t va) {
     if (!p || (*p & PTE_P) || !(*p & PTE_LAZY)) return false;
     uint64_t fr = pmm_alloc();                     /* zeroed */
     if (!fr) return false;
-    *p = fr | PTE_P | (*p & (PTE_RW | PTE_US));
+    pte_put(p, va & ~(PAGE_SIZE - 1), fr | PTE_P | (*p & (PTE_RW | PTE_US)));
     return true;
 }
 
@@ -188,7 +229,7 @@ void vmm_set_user(uint64_t pd, uint64_t va, uint64_t len, bool user) {
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
         uint64_t* p = pte_slot(pd, a, false);
         if (!p || !(*p & (PTE_P | PTE_LAZY))) continue;
-        if (user) *p |= PTE_US; else *p &= ~PTE_US;
+        pte_put(p, a, user ? *p | PTE_US : *p & ~PTE_US);
     }
 }
 
@@ -199,7 +240,7 @@ void vmm_free_range(uint64_t pd, uint64_t va, uint64_t len) {
         uint64_t* p = pte_slot(pd, a, false);
         if (!p || !(*p & (PTE_P | PTE_LAZY))) continue;
         if (*p & PTE_P) pmm_unref(*p & PTE_ADDR);
-        *p = 0;
+        pte_put(p, a, 0);
     }
 }
 
@@ -282,16 +323,15 @@ static bool clone_level(uint64_t src, uint64_t dst, int lvl, uint64_t base) {
             continue;
         }
         uint64_t fr = e & PTE_ADDR;
-        /* device pages (the lfb mapped by xorg) are shared, not copied */
-        if ((e & PTE_RW) && ours(fr) && !(e & PTE_SHARED)) {   /* shm/memfd: shared, not copied */
-            uint64_t nf = pmm_alloc();
-            if (!nf) return false;
-            memcpy(P2V(nf), P2V(fr), PAGE_SIZE);
-            d[i] = nf | (e & ~PTE_ADDR);
-        } else {
-            pmm_ref(fr);                 /* read-only text: share */
-            d[i] = e;
+        /* device pages (the lfb mapped by xorg) are shared as they are, shm/memfd too.
+           private writable ones are cow now: both sides lose RW, the first write copies */
+        if (PTE_WR(e) && ours(fr) && !(e & PTE_SHARED)) {
+            e = (e & ~PTE_RW) | PTE_COW;
+            s[i] = e;
+            tlb_inval(base | ((uint64_t)i << 12));
         }
+        pmm_ref(fr);
+        d[i] = e;
     }
     return true;
 }
@@ -320,6 +360,10 @@ int vmm_copy_to(uint64_t pd, uint64_t va, const void* src, uint64_t len) {
         uint64_t pte = vmm_pte(pd, va);
         if (!(pte & PTE_P)) {
             if (!vmm_fault_in(pd, va)) return -1;
+            pte = vmm_pte(pd, va);
+        }
+        if (pte & PTE_COW) {
+            if (!vmm_cow(pd, va)) return -1;
             pte = vmm_pte(pd, va);
         }
         uint64_t off = va & 0xFFF;
