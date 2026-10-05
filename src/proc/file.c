@@ -9,6 +9,7 @@
 #include "core/task.h"
 #include "boot/pit.h"
 #include "drivers/ata.h"
+#include "fs/mount.h"
 #include "net/sock.h"
 #include "drivers/fbdev.h"
 #include "drivers/drm.h"
@@ -226,6 +227,8 @@ static int node_reserve(fs_node_t* n, uint32_t need) {
 int node_write_at(fs_node_t* n, uint32_t off, const char* buf, uint32_t len) {
     if (n->type != FS_FILE) return -EISDIR;
     uint32_t end = off + len;
+    int g = mnt_grow(n, end);
+    if (g < 0) return g;
     if (node_reserve(n, end > n->size ? end : n->size) < 0) return -ENOMEM;
     if (off > n->size) memset(n->data + n->size, 0, off - n->size);
     memcpy(n->data + off, buf, len);
@@ -238,6 +241,8 @@ int node_write_at(fs_node_t* n, uint32_t off, const char* buf, uint32_t len) {
 
 int node_truncate(fs_node_t* n, uint32_t len) {
     if (n->type != FS_FILE) return -EISDIR;
+    int g = mnt_grow(n, len);
+    if (g < 0) return g;
     if (n->data && !n->cap && node_reserve(n, n->size) < 0) return -ENOMEM;   /* borrowed */
     if (len > n->size) {
         if (node_reserve(n, len) < 0) return -ENOMEM;

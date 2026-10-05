@@ -6,6 +6,7 @@
 #include "core/smp.h"
 #include "core/io.h"
 #include "boot/pit.h"
+#include "fs/mount.h"
 
 /* ext2 volumes, the same way FAT works here: the whole tree is read into
    ramfs nodes at mount, changes mark the volume dirty and a task writes
@@ -79,12 +80,15 @@ static int wblk(ev_t* v, uint32_t b, const void* buf) {
 }
 
 /* statfs of the volume n sits on, false if it isn't ext2. free count is from the last sync */
-bool ext2_statfs(fs_node_t* n, uint32_t* bs, uint64_t* tot, uint64_t* fr) {
+bool ext2_statfs(fs_node_t* n, uint32_t* bs, uint64_t* tot, uint64_t* fr, uint32_t* ino) {
     fs_node_t* o = n ? fs_owner(n) : NULL;
     if (!o || o->mount_id < E2_ID0 || o->mount_id >= E2_ID0 + E2_MAX) return false;
     ev_t* v = &vols[o->mount_id - E2_ID0];
     if (!v->used) return false;
     *bs = v->bs; *tot = v->nblocks; *fr = rd32(v->sb + 12);
+    uint32_t rs = rd32(v->sb + 8);
+    *fr = *fr > rs ? *fr - rs : 0;                        /* what a user can have */
+    ino[0] = v->ninodes; ino[1] = rd32(v->sb + 16);
     return true;
 }
 
@@ -1076,5 +1080,38 @@ int ext2_mount(int disk, fs_node_t* at) {
     v->root = at;
     at->mount_id = (uint8_t)v->id;
     if (!started && !v->ro) { started = true; task_spawn("e2sync", e2syncd); }
+    char dn[24] = "/dev/";
+    strcat(dn, ata_drive_name(disk));
+    mnt_add(v->incompat & 0x40 ? "ext4" : v->compat & 4 ? "ext3" : "ext2", dn, at, disk);
+    if (v->ro) mnt_set_ro(at);
     return v->ro ? 1 : 0;
+}
+
+int ext2_umount(fs_node_t* at) {
+    ev_t* v = NULL;
+    for (int i = 0; i < E2_MAX; i++) if (vols[i].used && vols[i].root == at) v = &vols[i];
+    if (!v) return -22;
+    if (!v->ro && v->dirty) {
+        fs_sync_begin();
+        lock();
+        v->dirty = false;
+        int r = sync_vol(v);
+        unlock();
+        fs_sync_end();
+        if (r < 0) { v->dirty = true; return -5; }
+    }
+    lock();
+    at->mount_id = 0;
+    v->used = false;
+    unlock();
+    fs_free_tree(at);
+    kfree(v->gdt); kfree(v->mgdt);
+    if (v->bbm) kfree(v->bbm);
+    if (v->ibm) kfree(v->ibm);
+    if (v->gdirty) kfree(v->gdirty);
+    if (v->bhash) kfree(v->bhash);
+    if (v->E) kfree(v->E);
+    if (v->tab) kfree(v->tab);
+    memset(v, 0, sizeof *v);
+    return 0;
 }

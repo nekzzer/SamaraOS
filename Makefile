@@ -109,6 +109,7 @@ KERN_SRC := \
     src/drivers/ahci.c \
     src/drivers/nvme.c \
     src/fs/part.c \
+    src/fs/mount.c \
     src/apps/doom.c \
     src/apps/mediaplayer.c \
     src/apps/paint.c \

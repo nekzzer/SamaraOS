@@ -6,6 +6,7 @@
 #include "core/smp.h"
 #include "core/io.h"
 #include "boot/pit.h"
+#include "fs/mount.h"
 
 #define ENOENT  2
 #define EIO     5
@@ -708,6 +709,9 @@ int fatfs_mount(int disk, fs_node_t* at) {
     v->used = true;
     v->dirty = false;
     at->mount_id = (uint8_t)v->id;
+    char dn[24] = "/dev/";
+    strcat(dn, ata_drive_name(disk));
+    mnt_add("vfat", dn, at, disk);
     return 0;
 fail:
     if (v->fat) kfree(v->fat);

@@ -42,6 +42,7 @@
 #include "fs/fatfs.h"
 #include "fs/ext2.h"
 #include "fs/part.h"
+#include "fs/mount.h"
 #include "shell/commands.h"
 #include "drivers/drm.h"
 
@@ -317,6 +318,7 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
     }
 
     boot_step("disks");
+    mnt_init();
     ata_init_all();
     part_scan_all();
     if (ata_primary() < 0) {
@@ -383,6 +385,9 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
             }
         }
     }
+
+    mnt_tmpfs_boot("/tmp");
+    mnt_tmpfs_boot("/dev/shm");
 
     /* Background services from /etc/rc: the dropbear ssh server and telnetd
        (both on a pty per session). Skipped with "noservices". */

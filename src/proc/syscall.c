@@ -23,6 +23,7 @@
 #include "net/sock.h"
 #include "fs/fatfs.h"
 #include "fs/ext2.h"
+#include "fs/mount.h"
 #include "net/net.h"
 #include "drivers/drm.h"
 #include "drivers/snd.h"
@@ -41,6 +42,7 @@
 #define EACCES 13
 #define EFAULT 14
 #define EBUSY 16
+#define EROFS 30
 #define EEXIST 17
 #define EXDEV 18
 #define EMLINK 31
@@ -389,6 +391,8 @@ static int do_open(int dirfd, const char* path, int flags, int mode) {
         char name[FS_NAME_MAX];
         fs_node_t* parent = lookup_parent(dirfd, path, name, &err);
         if (!parent) return err;
+        if (mnt_ro(parent)) return -EROFS;
+        if ((err = mnt_newnode(parent)) < 0) return err;
         n = fs_create(parent, name, FS_FILE);
         if (!n) return -EACCES;
         n->mode = (uint16_t)(mode & ~me()->sh->umask & 07777);
@@ -396,6 +400,7 @@ static int do_open(int dirfd, const char* path, int flags, int mode) {
     }
     if ((flags & O_DIRECTORY) && n->type != FS_DIR) return -ENOTDIR;
     if (n->type == FS_DIR && (flags & O_ACCMODE) != 0) return -EISDIR;
+    if (!n->dev && n->type == FS_FILE && ((flags & O_ACCMODE) || (flags & O_TRUNC)) && mnt_ro(n)) return -EROFS;
     if ((flags & O_TRUNC) && n->type == FS_FILE && !n->dev && (flags & O_ACCMODE)) { uint32_t os = n->size; node_truncate(n, 0); if (os) ino_node(n, 2); }
     file_t* f = file_open_node(n, flags & ~(O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC));
     if (!f) return n->dev == FS_DEV_TTY ? -ENXIO : -ENOMEM;     // xterm dies on ENOMEM here
@@ -545,6 +550,7 @@ static int do_unlink(int dirfd, const char* path, int flags) {
     }
     fs_node_t* parent = n->parent;
     if (!parent) return -EBUSY;
+    if (mnt_ro(parent)) return -EROFS;
     if (is_shm(n) && !n->xl && !n->hl) shm_drop(n);       // mappings keep their own refs
     ino_ev(parent, 0x200 | (n->type == FS_DIR ? 0x40000000 : 0), n->name, 0);
     ino_gone(n, !n->xl && !n->hl);
@@ -559,6 +565,8 @@ static int do_mkdir(int dirfd, const char* path, int mode) {
     char name[FS_NAME_MAX];
     fs_node_t* parent = lookup_parent(dirfd, path, name, &err);
     if (!parent) return err;
+    if (mnt_ro(parent)) return -EROFS;
+    if ((err = mnt_newnode(parent)) < 0) return err;
     fs_node_t* n = fs_create(parent, name, FS_DIR);
     if (!n) return -EEXIST;
     n->mode = (uint16_t)(mode & ~me()->sh->umask & 07777);
@@ -579,6 +587,8 @@ static int do_rename(int ofd, const char* from, int nfd, const char* to) {
     char name[FS_NAME_MAX];
     fs_node_t* parent = lookup_parent(nfd, to, name, &err);
     if (!parent) return err;
+    if (mnt_ro(parent) || (src->parent && mnt_ro(src->parent))) return -EROFS;
+    if (fs_owner(src->parent) != fs_owner(parent) && (err = mnt_newnode(parent)) < 0) return err;
     if ((src->hl || src->xl) && fs_owner(src->parent) != fs_owner(parent)) return -EXDEV;
     // to another volume: lazy ext2 files have to come along in memory, fat sync reads ->data
     if (fs_owner(src->parent) != fs_owner(parent)) fs_need_tree(src);
@@ -625,6 +635,7 @@ static int do_link(int ofd, const char* from, int nfd, const char* to, int flags
     if (fs_child(par, name)) return -EEXIST;
     fs_node_t* ow = fs_owner(src);
     if (ow != fs_owner(par)) return -EXDEV;
+    if (mnt_ro(par)) return -EROFS;
     if (ow->mount_id && ow->mount_id < 8) return -EPERM;       /* fat */
     if (src->xl > 60000) return -EMLINK;
     if (fs_hlink(src, par, name) < 0) return -ENOMEM;
@@ -1447,30 +1458,7 @@ static int do_sigprocmask(int how, const uint64_t* set, uint64_t* old, uint64_t 
 static int do_statfs(uint64_t* b, fs_node_t* at) {
     UCHK(b, 120);
     memset(b, 0, 120);
-    uint32_t cs, tc, fc;
-    /* f_type, bsize, blocks, bfree, bavail, files, ffree, fsid, namelen, frsize */
-    if (at && fatfs_statfs(fatfs_owner(at), &cs, &tc, &fc)) {
-        b[0] = 0x4d44;                                  /* MSDOS_SUPER_MAGIC */
-        b[1] = cs;
-        b[2] = tc; b[3] = b[4] = fc;
-        b[8] = 255; b[9] = cs;
-        return 0;
-    }
-    uint64_t tb, fb;
-    if (at && ext2_statfs(at, &cs, &tb, &fb)) {
-        b[0] = 0xEF53;
-        b[1] = cs;
-        b[2] = tb; b[3] = fb; b[4] = fb;
-        b[8] = 255; b[9] = cs;
-        return 0;
-    }
-    b[0] = 0x858458f6;                                  /* RAMFS_MAGIC */
-    b[1] = 4096;
-    b[2] = pmm_total_frames();
-    b[3] = b[4] = pmm_free_frames();
-    b[8] = 255;
-    b[9] = 4096;
-    return 0;
+    return mnt_statfs(at, b);
 }
 
 static int do_sysinfo(uint64_t* s) {
@@ -2444,6 +2432,8 @@ static int64_t dispatch(regs_t* r) {
             fs_node_t* par = lookup_parent(dfd, lp, name, &err);
             if (!par) return err;
             if (fs_child(par, name)) return -EEXIST;
+            if (mnt_ro(par)) return -EROFS;
+            if ((err = mnt_newnode(par)) < 0) return err;
             return fs_symlink(par, name, tg) ? 0 : -ENOMEM;
         }
         case 86:  return do_link(AT_FDCWD, (const char*)a, AT_FDCWD, (const char*)b, 0);
@@ -2509,33 +2499,26 @@ static int64_t dispatch(regs_t* r) {
             return fatfs_sync_all();
         case 165: {                                                  /* mount */
             UCHK((void*)b, 1);
-            if (e & 32) return 0;                                    /* MS_REMOUNT */
-            if (d) {
-                UCHK((void*)d, 1);
-                const char* t = (const char*)d;
-                if (!strcmp(t, "proc") || !strcmp(t, "ramfs") || !strcmp(t, "tmpfs") ||
-                    !strcmp(t, "sysfs") || !strcmp(t, "devtmpfs")) return 0;
-                if (strcmp(t, "vfat") && strcmp(t, "msdos") && strcmp(t, "fat")) return -19;  /* ENODEV */
-            }
-            UCHK((void*)a, 1);
-            fs_node_t* src = lookup(AT_FDCWD, (const char*)a, &err);
-            if (!src) return err;
-            if (!FS_DEV_IS_DISK(src->dev)) return -15;                  /* ENOTBLK */
+            const char* t = NULL;
+            const char* dt = NULL;
+            fs_node_t* src = NULL;
+            if (c) { UCHK((void*)c, 1); t = (const char*)c; }
+            if (e) { UCHK((void*)e, 1); dt = (const char*)e; }
+            if (a) { UCHK((void*)a, 1); src = lookup(AT_FDCWD, (const char*)a, &err); }
             fs_node_t* dst = lookup(AT_FDCWD, (const char*)b, &err);
             if (!dst) return err;
-            return fatfs_mount(src->dev - FS_DEV_DISK, dst);
+            return mnt_mount(src, dst, t, d, dt);
         }
         case 166: {                                                  /* umount2 */
             UCHK((void*)a, 1);
             n = lookup(AT_FDCWD, (const char*)a, &err);
             if (!n) return err;
-            if (FS_DEV_IS_DISK(n->dev)) return -EINVAL;              /* give the mount point */
             for (int i = 0; i < proc_count(); i++) {
                 proc_t* q = proc_at(i);
                 for (fs_node_t* w = q ? q->sh->cwd : NULL; w; w = w->parent)
-                    if (w == n) return -EBUSY;
+                    if (w == n && !FS_DEV_IS_DISK(n->dev)) return -EBUSY;
             }
-            return fatfs_umount(n);
+            return mnt_umount(n);
         }
         case 92: case 93: case 94: case 260:                         /* chown & co */
         case 105: case 106: case 113: case 114: case 117: case 119: case 116:

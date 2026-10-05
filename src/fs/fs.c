@@ -5,6 +5,7 @@
 #include "core/string.h"
 #include "core/clock.h"
 #include "drivers/ata.h"
+#include "fs/mount.h"
 
 static fs_node_t* root_;
 
@@ -84,6 +85,7 @@ void (*fs_dirty_hook)(int mount_id);
 void fs_touch(fs_node_t* n) {
     for (; n; n = n->parent)
         if (n->mount_id) {
+            if (mnt_ro_id(n->mount_id) || n->mount_id >= 16) return;
             if (n->mount_id >= 8) { extern void ext2_dirty(int); ext2_dirty(n->mount_id); }
             else if (fs_dirty_hook) fs_dirty_hook(n->mount_id);
             return;
