@@ -850,6 +850,7 @@ static void run(req_t* q) {
         if (old != p) { t->proc = p; task_set_cr3(p->pd); }
         res = req_exec(q);
         if (old != p) { t->proc = old; task_set_cr3(old ? old->pd : 0); }
+        if (q->f && q->f->type == F_SOCKET) sock_pump();       // our baseline mask would be stale for the next wait
     }
     if (!q->pre && q->sqe.opcode == IORING_OP_ACCEPT && (q->sqe.ioprio & 1) && res >= 0) {
         uint32_t fl = irq_save();               // multishot accept: report it and wait for the next one
@@ -886,7 +887,10 @@ static int req_reg(req_t* q) {
     if (!q->f) return 0;
     wq_t* v[2];
     int n;
-    if (q->f->type == F_SOCKET) { v[0] = sock_wqp(q->f->sock); n = 1; }
+    if (q->f->type == F_SOCKET) {
+        q->we[0] = sock_wq_cb(q->f->sock, kick_cb, q);
+        return q->we[0] == NULL;
+    }
     else if (q->f->type == F_URING) { v[0] = &q->f->ur->wq; n = 1; }
     else n = file_wqs(q->f, v);
     if (n < 0) return 1;

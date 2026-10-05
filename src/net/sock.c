@@ -33,7 +33,7 @@
 #define TCP_PSH 0x08
 #define TCP_ACK 0x10
 
-#define MAX_SOCKS  256
+#define MAX_SOCKS  1024
 #define RX_CAP     (64u * 1024u)
 #define TX_CAP     (64u * 1024u)
 #define MSS        1400
@@ -728,6 +728,8 @@ int sock_listen(sock_t* s, int backlog) {
     if (s->state != S_CLOSED && s->state != S_LISTEN) return -EINVAL;
     if (!s->bound) { int r = sock_bind(s, zero_ip, 0); if (r < 0) return r; }
     s->state = S_LISTEN;
+    kfree(s->rx); kfree(s->tx);                       // 128k a head, listeners never carry data
+    s->rx = s->tx = NULL;
     s->backlog = backlog <= 0 ? 1 : backlog > ACCEPT_MAX ? ACCEPT_MAX : backlog;
     return 0;
 }
@@ -992,7 +994,13 @@ int sock_cmsg(sock_t* s, uint8_t* out, int cap) {
     return n;
 }
 
-wq_t* sock_wqp(sock_t* s) { return &s->wq; }
+wq_ent_t* sock_wq_cb(sock_t* s, void (*cb)(void*), void* arg) {
+    bool first = !s->wq.head;
+    wq_ent_t* e = wq_add_cb(&s->wq, cb, arg);
+    uint32_t m = smask(s);
+    if (e && m != s->rdy) { s->rdy = m; if (!first) wq_wake(&s->wq); }
+    return e;
+}
 
 /* queue a waiter; the first one sets the baseline, later ones wake the others if something changed meanwhile */
 wq_ent_t* sock_wq_add(sock_t* s, wq_w_t* w) {
