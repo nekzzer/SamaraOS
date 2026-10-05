@@ -64,6 +64,8 @@ int     ino_add(file_t* f, fs_node_t* n, uint32_t mask);
 int     ino_rm(file_t* f, int wd);
 void    ino_ev(fs_node_t* n, uint32_t mask, const char* name, uint32_t cookie);
 void    ino_node(fs_node_t* n, uint32_t mask);
+int     ino_any(void);
+int64_t node_nb_rw(file_t* f, char* ub, uint64_t n, int64_t pos, bool wr);   /* no bkl, NB_SLOW if not simple */
 void    ino_gone(fs_node_t* n, bool self);                            /* an eventfd counter went up */
 
 int     file_read(file_t* f, char* buf, uint32_t n);

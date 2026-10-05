@@ -260,6 +260,61 @@ int node_write_at(fs_node_t* n, uint32_t off, const char* buf, uint32_t len) {
     return (int)len;
 }
 
+/* read/write of a cached file without the big lock. user memory is only touched
+   outside the node lock (a fault there could want the bkl). pos < 0: use f->off */
+int64_t node_nb_rw(file_t* f, char* ub, uint64_t n, int64_t pos, bool wr) {
+    fs_node_t* nd = f->node;
+    if (nd->type != FS_FILE || nd->dev || nd->pc || nd->lazy || nd->hl || ino_any()) return NB_SLOW;
+    if (wr && (nd->cap == 0 || fs_syncing_now() || !strcmp(nd->name, "prof"))) return NB_SLOW;
+    char tmp[2048];
+    uint64_t off, k = 0;
+    if (pos >= 0) off = pos;
+    else for (;;) {
+        off = __atomic_load_n(&f->off, __ATOMIC_ACQUIRE);
+        if (wr && (f->flags & O_APPEND)) { off = nd->size; if (fs_owner(nd)->parent) return NB_SLOW; }
+        uint64_t sz = nd->size;
+        if (wr) {
+            k = n;
+            if (off + k > sz && fs_owner(nd)->parent) return NB_SLOW;    /* growing on a mount: quota, ext2 blocks */
+        } else k = off >= sz ? 0 : (sz - off < n ? sz - off : n);
+        if (off + k > 0xFFFFF000ull) return NB_SLOW;
+        if (__atomic_compare_exchange_n(&f->off, &off, off + k, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) break;
+    }
+    if (pos >= 0) {
+        uint64_t sz = nd->size;
+        if (wr) {
+            k = n;
+            if (off + k > sz && fs_owner(nd)->parent) return NB_SLOW;
+            if (off + k > 0xFFFFF000ull) return NB_SLOW;
+        } else k = off >= sz ? 0 : (sz - off < n ? sz - off : n);
+    }
+    uint64_t done = 0;
+    while (done < k) {
+        uint32_t c = k - done > sizeof(tmp) ? sizeof(tmp) : (uint32_t)(k - done);
+        if (wr) memcpy(tmp, ub + done, c);
+        uint64_t fl = irq_save();
+        node_lock(nd);
+        if (!nd->data || nd->pc || nd->lazy) { node_unlock(nd); irq_restore(fl); return done ? (int64_t)done : NB_SLOW; }
+        uint64_t lim = nd->cap ? nd->cap - 1 : nd->size;
+        if (wr) {
+            if (off + done + c > lim) { node_unlock(nd); irq_restore(fl); return done ? (int64_t)done : NB_SLOW; }
+            if (off + done > nd->size) memset(nd->data + nd->size, 0, off + done - nd->size);
+            memcpy(nd->data + off + done, tmp, c);
+            if (off + done + c > nd->size) { nd->size = off + done + c; nd->data[nd->size] = 0; }
+        } else {
+            if (off + done >= lim) { node_unlock(nd); irq_restore(fl); break; }
+            if (off + done + c > lim) c = lim - off - done;
+            memcpy(tmp, nd->data + off + done, c);
+        }
+        node_unlock(nd);
+        irq_restore(fl);
+        if (!wr) memcpy(ub + done, tmp, c);
+        done += c;
+    }
+    if (wr && done) { nd->mtime = fs_now(); fs_touch(nd); }
+    return done;
+}
+
 int node_truncate(fs_node_t* n, uint32_t len) {
     if (n->type != FS_FILE) return -EISDIR;
     if (n->pc) pc_sync(n);

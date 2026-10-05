@@ -303,11 +303,34 @@ void fs_release(fs_node_t* n) {
 
 fs_node_t* fs_child(fs_node_t* dir, const char* name) { return find_child(dir, name); }
 
+void node_lock(fs_node_t* n) { while (__atomic_test_and_set(&n->nlk, __ATOMIC_ACQUIRE)) __builtin_ia32_pause(); }
+void node_unlock(fs_node_t* n) { __atomic_clear(&n->nlk, __ATOMIC_RELEASE); }
+
+static volatile int nb_wr, nb_rd;
+int nb_tree_enter(void) {
+    if (nb_wr) return 0;
+    __atomic_add_fetch(&nb_rd, 1, __ATOMIC_SEQ_CST);
+    if (nb_wr) { __atomic_sub_fetch(&nb_rd, 1, __ATOMIC_SEQ_CST); return 0; }
+    return 1;
+}
+void nb_tree_leave(void) { __atomic_sub_fetch(&nb_rd, 1, __ATOMIC_SEQ_CST); }
+void nb_tree_close(void) {
+    __atomic_add_fetch(&nb_wr, 1, __ATOMIC_SEQ_CST);
+    while (nb_rd) __builtin_ia32_pause();
+}
+void nb_tree_open(void) { __atomic_sub_fetch(&nb_wr, 1, __ATOMIC_SEQ_CST); }
+
 void fs_data_free(fs_node_t* n) {
-    if (n->data && n->cap) kfree(n->data);
+    uint64_t fl = irq_save();
+    node_lock(n);
+    char* d = n->data;
+    uint32_t c = n->cap;
     n->data = NULL;
     n->cap = 0;
     n->lazy = 0;                       /* whoever frees it puts new bytes in */
+    node_unlock(n);
+    irq_restore(fl);
+    if (d && c) kfree(d);
 }
 
 void fs_set_static(fs_node_t* n, const char* data, size_t len) {

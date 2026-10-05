@@ -28,6 +28,7 @@ typedef struct fs_node {
     struct fs_node* hn;        /* real node: first extra name; extra name: the next one */
     uint16_t xl;               /* real node: how many extra names */
     struct pcn* pc;            /* page cache of mapped pages, see core/pcache.c */
+    volatile uint8_t nlk;      /* guards data/cap against the bkl-less readers, irqs off while held */
 } fs_node_t;
 
 enum { FS_DEV_NONE = 0, FS_DEV_NULL, FS_DEV_ZERO, FS_DEV_TTY, FS_DEV_RANDOM, FS_DEV_FB, FS_DEV_INPUT,
@@ -43,7 +44,14 @@ enum { FS_DEV_NONE = 0, FS_DEV_NULL, FS_DEV_ZERO, FS_DEV_TTY, FS_DEV_RANDOM, FS_
 
 void        fs_add_disk_nodes(void);      /* after disks are probed */
 
+bool        fs_syncing_now(void);
 void        fs_init(void);
+void        node_lock(fs_node_t* n);
+void        node_unlock(fs_node_t* n);
+int         nb_tree_enter(void);          /* bkl-less readers of the tree, irqs off */
+void        nb_tree_leave(void);
+void        nb_tree_close(void);          /* tree changing syscalls, waits for the readers */
+void        nb_tree_open(void);
 fs_node_t*  fs_root(void);
 fs_node_t*  fs_resolve(fs_node_t* cwd, const char* path);   /* NULL if missing; follows symlinks */
 fs_node_t*  fs_resolve_nf(fs_node_t* cwd, const char* path);  /* the last one is not followed */

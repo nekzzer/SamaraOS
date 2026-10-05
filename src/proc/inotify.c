@@ -69,6 +69,8 @@ void ino_ev(fs_node_t* n, uint32_t mask, const char* name, uint32_t cookie) {
 }
 
 /* something happened to n itself: tell n's watchers and the parent dir's */
+int ino_any(void) { return nw; }
+
 void ino_node(fs_node_t* n, uint32_t mask) {
     if (!nw || !n) return;
     if (n->type == FS_DIR) mask |= IN_ISDIR;

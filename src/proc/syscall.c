@@ -3235,6 +3235,7 @@ int sys_statx(int dirfd, const char* path, int flags, uint32_t mask, void* out) 
    process died inside a write, every sync after that hung and X sat on a
    black screen waiting in open() */
 static volatile bool fs_syncing;
+bool fs_syncing_now(void) { return fs_syncing; }
 
 void fs_write_begin(void) {
     proc_t* p = proc_current();
@@ -3324,6 +3325,7 @@ void syscall_dispatch(regs_t* r) {
     if (mut) {
         ext2_throttle();                      /* before: the sync waits for writers */
         fs_write_begin();
+        nb_tree_close();
     }
     int64_t ret;
     uint64_t t0 = prof_tsc();
@@ -3340,7 +3342,7 @@ void syscall_dispatch(regs_t* r) {
         pc->ujb_on = false;
         ret = -EFAULT;
     } else ret = dispatch(r);
-    if (mut) fs_write_end();
+    if (mut) { nb_tree_open(); fs_write_end(); }
     prof_sys((int)nr, prof_tsc() - t0);
     switch (nr) {      // io that can make a waiter in poll/read/write ready
         case 0: case 1: case 3: case 17: case 18: case 19: case 20: case 42: case 43: case 44: case 45:
@@ -3387,6 +3389,90 @@ void syscall_dispatch(regs_t* r) {
         if (!keep) ret = (int64_t)r->rax;
     }
     proc_deliver_signal(r, keep ? -1 : (int)nr, keep ? 0 : (int32_t)ret);
+}
+
+/* /proc, /sys and /dev change behind the tree gate's back, they keep the bkl */
+static bool nb_odd(fs_node_t* n) {
+    for (; n; n = n->parent)
+        if (n->parent == fs_root() && (!strcmp(n->name, "proc") || !strcmp(n->name, "sys") || !strcmp(n->name, "dev"))) return true;
+    return false;
+}
+
+static int64_t nb_getdents(file_t* f, uint8_t* ub, uint64_t n) {
+    fs_node_t* dir = f->node;
+    uint8_t tmp[2048];
+    if (dir->type != FS_DIR || nb_odd(dir) || dir->dev) return NB_SLOW;
+    if (n > sizeof(tmp)) n = sizeof(tmp);
+    uint64_t fl = irq_save();
+    if (!nb_tree_enter()) { irq_restore(fl); return NB_SLOW; }
+    uint64_t o = f->off;
+    uint32_t pos = 0, idx = 0;
+    fs_node_t* c = dir->child;
+    int64_t ret = 0;
+    for (;; idx++) {
+        const char* name;
+        fs_node_t* node;
+        if (idx == 0)      { name = ".";  node = dir; }
+        else if (idx == 1) { name = ".."; node = dir->parent ? dir->parent : dir; }
+        else {
+            if (!c) break;
+            name = c->name; node = c->hl ? c->hl : c; c = c->next;
+        }
+        if (idx < o) continue;
+        uint32_t nl = strlen(name);
+        uint32_t reclen = (19 + nl + 1 + 7) & ~7u;
+        if (pos + reclen > n) { if (pos == 0) ret = -EINVAL; break; }
+        uint8_t* d = tmp + pos;
+        uint64_t ino = ((uint64_t)node >> 4) & 0x0FFFFFFF;
+        int64_t next = idx + 1;
+        memcpy(d, &ino, 8);
+        memcpy(d + 8, &next, 8);
+        uint16_t rl = (uint16_t)reclen;
+        memcpy(d + 16, &rl, 2);
+        d[18] = node->dev ? 2 : node->type == FS_DIR ? 4 : node->type == FS_LINK ? 10 : 8;
+        memcpy(d + 19, name, nl + 1);
+        pos += reclen;
+        o = idx + 1;
+    }
+    nb_tree_leave();
+    irq_restore(fl);
+    if (ret) return ret;
+    f->off = o;
+    memcpy(ub, tmp, pos);
+    return pos;
+}
+
+static int64_t nb_statat(proc_t* p, int dirfd, const char* path, kstat64_t* ust, int flags) {
+    char pb[256];
+    kstat64_t st;
+    if (!ustr_ok(path)) return -EFAULT;
+    int i = 0;
+    while (i < 255 && path[i]) { pb[i] = path[i]; i++; }
+    if (path[i] || !i) return NB_SLOW;
+    pb[i] = 0;
+    for (i = 0; pb[i]; i++) if (pb[i] == '.' && (i == 0 || pb[i - 1] == '/')) return NB_SLOW;
+    fs_node_t* base = p->sh->cwd;
+    file_t* df = NULL;
+    if (pb[0] != '/' && dirfd != -100) {
+        df = getf_ref(dirfd);
+        if (!df) return NB_SLOW;
+        if (df->type != F_NODE || df->node->type != FS_DIR) { file_close(df); return NB_SLOW; }
+        base = df->node;
+    }
+    int64_t ret = NB_SLOW;
+    if (pb[0] == '/' ? strncmp(pb, "/proc", 5) && strncmp(pb, "/sys", 4) && strncmp(pb, "/dev", 4) : !nb_odd(base)) {
+        uint64_t fl = irq_save();
+        if (nb_tree_enter()) {
+            fs_node_t* n = fs_peek(base, pb, !(flags & 0x100));
+            if (!n) ret = -ENOENT;
+            else if (!nb_odd(n)) { fill_stat_node(&st, n); ret = 0; }
+            nb_tree_leave();
+        }
+        irq_restore(fl);
+    }
+    if (df) file_close(df);
+    if (ret == 0) memcpy(ust, &st, sizeof(st));
+    return ret;
 }
 
 /* syscalls that run without the big lock (see syscall_enter). everything in here
@@ -3440,12 +3526,62 @@ int64_t syscall_nobkl(regs_t* r) {
             break;
         }
         case 202: ret = do_futex(a, (uint32_t)b, (uint32_t)c, r->r10, r->r8, (uint32_t)r->r9); break;
-        case 0: case 1: {                            /* pipes and eventfd only */
+        case 0: case 1: {                            /* pipes, eventfd, cached files */
             file_t* f = getf_ref((int)a);
+            if (f && f->type == F_NODE) {
+                if (!uok((void*)b, c)) ret = -EFAULT;
+                else if ((f->flags & O_ACCMODE) == (nr == 0 ? O_WRONLY : 0)) ret = -EBADF;
+                else ret = node_nb_rw(f, (char*)b, c, -1, nr == 1);
+                file_close(f);
+                break;
+            }
             if (!f || (f->type != F_PIPE_R && f->type != F_PIPE_W && f->type != F_EVENTFD)) { file_close(f); ret = NB_SLOW; break; }
             if (nr == 0 ? f->type == F_PIPE_W : f->type == F_PIPE_R) ret = -EBADF;
             else if (!uok((void*)b, c)) ret = -EFAULT;
             else ret = nr == 0 ? file_read(f, (char*)b, c) : file_write(f, (const char*)b, c);
+            file_close(f);
+            break;
+        }
+        case 17: case 18: {
+            file_t* f = getf_ref((int)a);
+            if (!f || f->type != F_NODE || (int64_t)r->r10 < 0) { file_close(f); ret = NB_SLOW; break; }
+            if (!uok((void*)b, c)) ret = -EFAULT;
+            else if ((f->flags & O_ACCMODE) == (nr == 17 ? O_WRONLY : 0)) ret = -EBADF;
+            else ret = node_nb_rw(f, (char*)b, c, r->r10, nr == 18);
+            file_close(f);
+            break;
+        }
+        case 8: {
+            file_t* f = getf_ref((int)a);
+            if (!f || f->type != F_NODE || c > 2) { file_close(f); ret = NB_SLOW; break; }
+            int64_t base = c == 0 ? 0 : c == 1 ? (int64_t)f->off : (int64_t)f->node->size;
+            ret = base + (int64_t)b < 0 ? -EINVAL : base + (int64_t)b;
+            if (ret >= 0) f->off = ret;
+            file_close(f);
+            break;
+        }
+        case 5: {
+            file_t* f = getf_ref((int)a);
+            if (!f || f->type != F_NODE || nb_odd(f->node)) { file_close(f); ret = NB_SLOW; break; }
+            kstat64_t st;
+            UCHK2((void*)b, sizeof(st));
+            fill_stat_node(&st, f->node);
+            file_close(f);
+            memcpy((void*)b, &st, sizeof(st));
+            ret = 0;
+            break;
+        }
+        case 262: {
+            UCHK2((void*)r->rdx, sizeof(kstat64_t));
+            if (r->r10 & 0x1000) ret = NB_SLOW;              /* AT_EMPTY_PATH: rare, bkl */
+            else ret = nb_statat(p, (int)a, (const char*)b, (kstat64_t*)c, (int)r->r10);
+            break;
+        }
+        case 217: {
+            file_t* f = getf_ref((int)a);
+            if (!f || f->type != F_NODE) { file_close(f); ret = NB_SLOW; break; }
+            if (!uok((void*)b, c)) ret = -EFAULT;
+            else ret = nb_getdents(f, (uint8_t*)b, c);
             file_close(f);
             break;
         }
@@ -3481,6 +3617,6 @@ int64_t syscall_nobkl(regs_t* r) {
 
 void syscall_init(void) {
     fs_free_hook = shm_drop_ino;
-    static const uint16_t nb[] = { 0, 1, 9, 10, 11, 39, 186, 102, 104, 107, 108, 96, 228, 229, 24, 35, 230, 202 };
+    static const uint16_t nb[] = { 0, 1, 5, 8, 17, 18, 217, 262, 9, 10, 11, 39, 186, 102, 104, 107, 108, 96, 228, 229, 24, 35, 230, 202 };
     for (unsigned i = 0; i < sizeof(nb) / sizeof(nb[0]); i++) nobkl_tab[nb[i]] = 1;
 }
