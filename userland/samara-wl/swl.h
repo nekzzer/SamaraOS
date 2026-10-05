@@ -108,3 +108,4 @@ void xwm_focus(struct tl *t);
 void xwm_sel_own(bool on);
 void xwm_sel_get(int fd);
 void xwm_surf_commit(struct surf *s);
+void xwm_surf_gone(struct surf *s);

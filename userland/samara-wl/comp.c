@@ -314,6 +314,7 @@ static void surf_free(struct wl_resource *r) {
     wl_list_for_each_safe(f, fn, &s->frames, link) wl_resource_destroy(f->res);
     wl_list_for_each_safe(f, fn, &s->pframes, link) wl_resource_destroy(f->res);
     wl_list_remove(&s->glink);
+    xwm_surf_gone(s);
     free(s->pix);
     free(s);
 }
