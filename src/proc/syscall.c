@@ -761,6 +761,17 @@ static int do_ioctl(int fd, uint32_t req, uint64_t arg) {
         *(int*)arg = n;
         return 0;
     }
+    if (f->type == F_RTC) {
+        switch (req) {
+            case 0x80247009: UCHK((void*)arg, 36); clock_rtc_get((int*)arg); return 0;    /* RTC_RD_TIME */
+            case 0x4024700a: UCHK((void*)arg, 36); return clock_rtc_set((const int*)arg) ? -EINVAL : 0;   /* RTC_SET_TIME */
+            case 0x7003: f->cnt = clock_rtc_ups(); clock_rtc_uie(1); return 0;             /* UIE_ON */
+            case 0x7004: clock_rtc_uie(0); return 0;
+            case 0x7001: case 0x7002: case 0x7005: case 0x7006: return 0;                  /* AIE, PIE: nothing */
+            case 0x8008700b: UCHK((void*)arg, 8); *(uint64_t*)arg = 1900; return 0;        /* RTC_EPOCH_READ */
+        }
+        return -ENOTTY;
+    }
     if (f->type == F_DRM) return drm_ioctl(f->drm, req, (void*)arg);
     if (f->type == F_SND) {
         uint32_t len = (req >> 16) & 0x3FFF;
@@ -1857,6 +1868,7 @@ int file_wqs(file_t* f, wq_t** v) {
         case F_PIPE_R: case F_PIPE_W: v[0] = &f->pipe->wq; return 1;
         case F_SPAIR: v[0] = &f->pipe->wq; v[1] = &f->pipe2->wq; return 2;
         case F_EVENTFD: v[0] = &f->wq; return 1;
+        case F_RTC: { extern wq_t rtc_wq; v[0] = &rtc_wq; return 1; }
         case F_INOTIFY: v[0] = &f->pipe->wq; return 1;
         case F_TTY: v[0] = &tty_wq; return 1;
         case F_PTM: case F_PTS: v[0] = pty_wq(f->pty); return v[0] ? 1 : 0;
@@ -3076,6 +3088,17 @@ static int64_t dispatch(regs_t* r) {
         case 228: return do_clock_gettime((int)a, (int64_t*)b);
         case 229:
             if (b) { UCHK((void*)b, 16); memset((void*)b, 0, 16); ((int64_t*)b)[1] = 1000000; }
+            return 0;
+        case 164: {                                                  /* settimeofday */
+            if (!a) return 0;
+            UCHK((void*)a, 16);
+            clock_set((uint32_t)((int64_t*)a)[0], (uint32_t)((int64_t*)a)[1] * 1000);
+            return 0;
+        }
+        case 227:                                                    /* clock_settime */
+            if (a != 0) return -EINVAL;
+            UCHK((void*)b, 16);
+            clock_set((uint32_t)((int64_t*)b)[0], (uint32_t)((int64_t*)b)[1]);
             return 0;
         case 132: case 235: case 280: {                              /* utime(s)/utimensat */
             const char* path = (const char*)(r->rax == 280 ? b : a);

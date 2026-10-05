@@ -9,6 +9,7 @@
 #include "core/string.h"
 #include "core/task.h"
 #include "boot/pit.h"
+#include "core/clock.h"
 #include "drivers/ata.h"
 #include "fs/mount.h"
 #include "net/sock.h"
@@ -96,6 +97,11 @@ file_t* file_open_node(fs_node_t* n, int flags) {
         if (me && me->ctty > 0) return open_pty_slave(me->ctty - 1, flags | 0x100);
         if (me && me->ctty < 0) return NULL;                  /* no terminal (setsid, daemons) */
     }
+    if (n->dev == FS_DEV_RTC) {
+        file_t* f = file_new(F_RTC, flags);
+        if (f) f->cnt = clock_rtc_ups();
+        return f;
+    }
     if (n->dev == FS_DEV_PMEM) {
         file_t* f = file_new(F_PMEM, flags);
         if (f) f->cnt = atoi(n->parent->name) ? atoi(n->parent->name) : proc_current()->pid;
@@ -156,6 +162,7 @@ void file_close(file_t* f) {
     if (f->type == F_PTS) pty_slave_close(f->pty);
     if (f->type == F_USOCK || f->type == F_ULISTEN) ux_release(f);
     if (f->type == F_EVENTFD) wq_drain(&f->wq);
+    if (f->type == F_RTC) clock_rtc_uie(0);
     if (f->type == F_EPOLL && f->ep) kfree(f->ep);
     if (f->type == F_URING && f->ur) uring_release(f->ur);
     if (f->type == F_SPAIR) {
@@ -367,6 +374,7 @@ bool file_readable(file_t* f) {
         case F_INPUT:  return input_pending(f->disk);
         case F_DRM:    return drm_readable(f->drm);
         case F_SND:    return false;
+        case F_RTC: return clock_rtc_ups() != f->cnt;
         case F_PIDFD: { proc_t* q = proc_by_pid((int)f->cnt); return !q || q->state != P_ALIVE; }
         case F_PTM:    return pty_readable(f->pty, true);
         case F_PTS:    return pty_readable(f->pty, false);
@@ -497,9 +505,26 @@ void efd_wake(void) {
 }
 
 
+extern wq_t rtc_wq;
 int file_read(file_t* f, char* buf, uint32_t n) {
     switch (f->type) {
         case F_URING: case F_PIDFD: return -22;
+        case F_RTC: {
+            if (n < 8) return -22;
+            WQ_W(w);
+            for (;;) {
+                uint32_t u = clock_rtc_ups();
+                if (u != f->cnt) {
+                    uint64_t v = ((uint64_t)(u - (uint32_t)f->cnt) << 8) | 0x10;
+                    f->cnt = u;
+                    memcpy(buf, &v, 8);
+                    return 8;
+                }
+                if (f->flags & O_NONBLOCK) return -11;
+                if (proc_interrupted()) return -4;
+                wq_wait(&rtc_wq, &w, 100);
+            }
+        }
         case F_INOTIFY: return ino_read(f, buf, n);
         case F_NULL: case F_NETLINK: case F_USOCK: case F_ULISTEN: case F_EPOLL: return 0;   // netlink goes through recv
         case F_EVENTFD: case F_TIMERFD: {               /* both hand out a u64 */
@@ -598,7 +623,7 @@ int file_write(file_t* f, const char* buf, uint32_t n) {
             wq_wake(&f->wq);
             return 8;
         }
-        case F_TIMERFD: case F_SIGNALFD: case F_INOTIFY: case F_PIDFD: return -22;
+        case F_TIMERFD: case F_SIGNALFD: case F_INOTIFY: case F_PIDFD: case F_RTC: return -22;
         case F_USOCK: case F_ULISTEN: return -107;   /* ENOTCONN */
         case F_EPOLL: case F_URING: return -22;
         case F_TTY:  return tty_write(buf, (int)n);
