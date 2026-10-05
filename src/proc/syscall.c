@@ -2173,6 +2173,18 @@ static int64_t dispatch(regs_t* r) {
             fl->off = save;
             return res;
         }
+        case 295: case 296: case 327: case 328: {                    /* preadv/pwritev (+v2) */
+            file_t* fl = getf((int)a);
+            if (!fl) return -EBADF;
+            bool w = r->rax == 296 || r->rax == 328;
+            if (r->rax > 300 && (int64_t)d == -1) return do_rwv((int)a, (iovec_t*)b, (int)c, w);
+            if (fl->type != F_NODE) return -ESPIPE;
+            uint64_t save = fl->off;
+            fl->off = d;
+            int64_t res = do_rwv((int)a, (iovec_t*)b, (int)c, w);
+            fl->off = save;
+            return res;
+        }
         case 2:   return do_open(AT_FDCWD, (const char*)a, (int)b, (int)c);
         case 85:  return do_open(AT_FDCWD, (const char*)a, O_CREAT | O_WRONLY | O_TRUNC, (int)b);
         case 257: return do_open((int)a, (const char*)b, (int)c, (int)d);
