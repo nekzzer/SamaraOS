@@ -40,6 +40,9 @@ mkdir -p var/cache/xbps root etc/dropbear tmp
 chmod 1777 tmp
 printf 'SamaraOS\n' > etc/issue
 
+# the kernel fs has no hard links: every link becomes its own file
+find . -type f -links +1 | while read f; do cp -p "$f" "$f.hl" && mv "$f.hl" "$f"; done
+
 rm -f $IMG
 truncate -s $SIZE $IMG
 mke2fs -q -t ext2 -b 4096 -O ^dir_index,^resize_inode -L / -d $D $IMG
