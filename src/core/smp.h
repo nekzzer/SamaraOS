@@ -18,6 +18,7 @@ void spin_unlock(spin_t* l, uint64_t f);
 void smp_init(void);                    /* wake the other cpus */
 void tlb_service(void);                 /* no lock needed, called from ipi and from lock spins */
 void tlb_unload(uint64_t pd);           /* before the page tables of pd are freed */
+void tlb_shootdown_pd(uint64_t pd);     /* same, only cpus running pd */
 void tlb_shootdown(void);               /* other cpus on our address space flush, waits */
 void kick_idle(void);                   /* poke a parked cpu so it looks for work */
 

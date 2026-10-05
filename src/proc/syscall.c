@@ -2885,6 +2885,30 @@ int64_t syscall_nobkl(regs_t* r) {
             break;
         }
         case 202: ret = do_futex(a, (uint32_t)b, (uint32_t)c, r->r10, r->r8, (uint32_t)r->r9); break;
+        case 9: {                                    /* anon only, the rest keeps the lock */
+            if (!(r->r10 & MAP_ANON)) { ret = NB_SLOW; break; }
+            uint64_t len = (b + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+            if (!b) { ret = -EINVAL; break; }
+            bool fx = r->r10 & MAP_FIXED;
+            if (fx && ((a & (PAGE_SIZE - 1)) || a < USER_BASE || a + len > USER_TOP || a + len < a)) { ret = -EINVAL; break; }
+            uint64_t m = vmm_map_anon(p->pd, a, fx, USER_MMAP_BASE, USER_STACK_TOP - USER_STACK_MAX, len, (c & PROT_WRITE) != 0, c != 0);
+            ret = m ? (int64_t)m : -ENOMEM;
+            break;
+        }
+        case 11:
+            if ((a & (PAGE_SIZE - 1)) || !b) ret = -EINVAL;
+            else { if (a >= USER_BASE && a < USER_TOP) vmm_free_range(p->pd, a, b); ret = 0; }
+            break;
+        case 10:
+            if (a & (PAGE_SIZE - 1)) ret = -EINVAL;
+            else {
+                if (a >= USER_BASE && a < USER_TOP) {
+                    vmm_set_writable(p->pd, a, b, (c & PROT_WRITE) != 0);
+                    vmm_set_user(p->pd, a, b, c != 0);
+                }
+                ret = 0;
+            }
+            break;
         default: ret = NB_SLOW;
     }
     proc_current()->ujb_on = false;
@@ -2893,6 +2917,6 @@ int64_t syscall_nobkl(regs_t* r) {
 
 void syscall_init(void) {
     fs_free_hook = shm_drop;
-    static const uint16_t nb[] = { 39, 186, 102, 104, 107, 108, 96, 228, 229, 24, 35, 230, 202 };
+    static const uint16_t nb[] = { 9, 10, 11, 39, 186, 102, 104, 107, 108, 96, 228, 229, 24, 35, 230, 202 };
     for (unsigned i = 0; i < sizeof(nb) / sizeof(nb[0]); i++) nobkl_tab[nb[i]] = 1;
 }

@@ -103,18 +103,26 @@ static uint64_t* pte_slot(uint64_t pd, uint64_t va, bool create);
 /* every change of a live leaf pte goes through here. other cpus may hold the old pte
    (threads of one process), so they get a shootdown too. range loops batch it: sd_defer */
 static int sd_defer[MAX_CPUS], sd_need[MAX_CPUS];
+static uint64_t sd_pd[MAX_CPUS];       /* space the locked section works on */
 #define SD_DEFER sd_defer[this_cpu()->id]
 #define SD_NEED sd_need[this_cpu()->id]
+#define SD_PD sd_pd[this_cpu()->id]
 
 static void tlb_inval(uint64_t va) {
     __asm__ volatile ("invlpg (%0)" : : "r"(va) : "memory");
     if (ncpu < 2) return;
     if (SD_DEFER) SD_NEED = 1;
-    else tlb_shootdown();
+    else tlb_shootdown_pd(SD_PD);
+}
+
+static uint64_t MMLOCK(uint64_t pd) {
+    uint64_t f = spin_lock(MML(pd));
+    SD_PD = pd;
+    return f;
 }
 
 static void sd_end(void) {
-    if (--SD_DEFER == 0 && SD_NEED) { SD_NEED = 0; tlb_shootdown(); }
+    if (--SD_DEFER == 0 && SD_NEED) { SD_NEED = 0; tlb_shootdown_pd(SD_PD); }
 }
 
 /* not present before: nobody can have it cached */
@@ -152,7 +160,7 @@ static bool vmm_cow_nl(uint64_t pd, uint64_t va) {
 }
 
 bool vmm_cow(uint64_t pd, uint64_t va) {
-    uint64_t f = spin_lock(MML(pd));
+    uint64_t f = MMLOCK(pd);
     bool r = vmm_cow_nl(pd, va);
     spin_unlock(MML(pd), f);
     return r;
@@ -212,7 +220,7 @@ static int vmm_alloc_range_nl(uint64_t pd, uint64_t va, uint64_t len, bool writa
 }
 
 int vmm_alloc_range(uint64_t pd, uint64_t va, uint64_t len, bool writable) {
-    uint64_t f = spin_lock(MML(pd));
+    uint64_t f = MMLOCK(pd);
     int r = vmm_alloc_range_nl(pd, va, len, writable);
     spin_unlock(MML(pd), f);
     return r;
@@ -232,7 +240,7 @@ static void vmm_set_writable_nl(uint64_t pd, uint64_t va, uint64_t len, bool wri
 }
 
 void vmm_set_writable(uint64_t pd, uint64_t va, uint64_t len, bool writable) {
-    uint64_t f = spin_lock(MML(pd));
+    uint64_t f = MMLOCK(pd);
     vmm_set_writable_nl(pd, va, len, writable);
     spin_unlock(MML(pd), f);
 }
@@ -247,7 +255,7 @@ static int vmm_map_frame_nl(uint64_t pd, uint64_t va, uint64_t fr, bool rw) {
 }
 
 int vmm_map_frame(uint64_t pd, uint64_t va, uint64_t fr, bool rw) {
-    uint64_t f = spin_lock(MML(pd));
+    uint64_t f = MMLOCK(pd);
     int r = vmm_map_frame_nl(pd, va, fr, rw);
     spin_unlock(MML(pd), f);
     return r;
@@ -272,7 +280,7 @@ static int vmm_lazy_range_nl(uint64_t pd, uint64_t va, uint64_t len, bool rw, bo
 }
 
 int vmm_lazy_range(uint64_t pd, uint64_t va, uint64_t len, bool rw, bool user) {
-    uint64_t f = spin_lock(MML(pd));
+    uint64_t f = MMLOCK(pd);
     int r = vmm_lazy_range_nl(pd, va, len, rw, user);
     spin_unlock(MML(pd), f);
     return r;
@@ -288,7 +296,7 @@ static bool vmm_fault_in_nl(uint64_t pd, uint64_t va) {
 }
 
 bool vmm_fault_in(uint64_t pd, uint64_t va) {
-    uint64_t f = spin_lock(MML(pd));
+    uint64_t f = MMLOCK(pd);
     bool r = vmm_fault_in_nl(pd, va);
     spin_unlock(MML(pd), f);
     return r;
@@ -307,7 +315,7 @@ static void vmm_set_user_nl(uint64_t pd, uint64_t va, uint64_t len, bool user) {
 }
 
 void vmm_set_user(uint64_t pd, uint64_t va, uint64_t len, bool user) {
-    uint64_t f = spin_lock(MML(pd));
+    uint64_t f = MMLOCK(pd);
     vmm_set_user_nl(pd, va, len, user);
     spin_unlock(MML(pd), f);
 }
@@ -326,7 +334,7 @@ static void vmm_free_range_nl(uint64_t pd, uint64_t va, uint64_t len) {
 }
 
 void vmm_free_range(uint64_t pd, uint64_t va, uint64_t len) {
-    uint64_t f = spin_lock(MML(pd));
+    uint64_t f = MMLOCK(pd);
     vmm_free_range_nl(pd, va, len);
     spin_unlock(MML(pd), f);
 }
@@ -373,6 +381,17 @@ uint64_t vmm_find_free(uint64_t pd, uint64_t from, uint64_t limit, uint64_t len)
         if (run >= len) return start;
     }
     return 0;
+}
+
+/* anon mmap for the threads that mmap at once: find the hole and claim it under one lock */
+uint64_t vmm_map_anon(uint64_t pd, uint64_t addr, bool fixed, uint64_t lo, uint64_t hi, uint64_t len, bool rw, bool user) {
+    uint64_t f = MMLOCK(pd);
+    if (fixed) vmm_free_range_nl(pd, addr, len);
+    else if (!(addr && !(addr & 0xFFF) && addr >= lo && addr + len <= hi && vmm_range_unmapped(pd, addr, len)))
+        addr = vmm_find_free(pd, lo, hi, len);
+    if (addr && vmm_lazy_range_nl(pd, addr, len, rw, user) < 0) { vmm_free_range_nl(pd, addr, len); addr = 0; }
+    spin_unlock(MML(pd), f);
+    return addr;
 }
 
 static void free_tables(uint64_t tbl, int lvl) {
@@ -429,7 +448,7 @@ uint64_t vmm_clone_space(uint64_t pd) {
     if (!npd) return 0;
     uint64_t* s = (uint64_t*)P2V(pd);
     uint64_t* d = (uint64_t*)P2V(npd);
-    uint64_t fl = spin_lock(MML(pd));
+    uint64_t fl = MMLOCK(pd);
     SD_DEFER++;
     for (int i = 0; i < 256; i++) {
         if (!(s[i] & PTE_P)) continue;

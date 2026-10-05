@@ -53,13 +53,13 @@ void bkl_take(struct cpu* c) {
 #ifdef LOCKDEP
     if (c->bkl) { dbg("lockdep: bkl twice, cpu ", c->id); dbg(" from ", (int)(uint64_t)ra); }
     uint32_t n = 0;
-    uint64_t t0 = tsc_ms();
+    uint64_t t0 = 0;
 #endif
     while (__atomic_load_n(&tk_serve, __ATOMIC_ACQUIRE) != t) {
         tlb_service();
         __asm__ volatile ("pause");
 #ifdef LOCKDEP
-        if (!(++n & 0x3FFFFF) && tsc_ms() - t0 > 3000) {
+        if (!(++n & 0x3FFFFF) && (!t0 ? (t0 = tsc_ms(), 0) : tsc_ms() - t0 > 3000)) {
             dbg("lockdep: bkl hang, cpu ", c->id); dbg(" owner cpu ", bkl_cpu);
             dbg(" owner pc ", (int)(uint64_t)bkl_pc); dbg(" my pc ", (int)(uint64_t)ra);
             t0 = tsc_ms();
@@ -81,14 +81,14 @@ uint64_t spin_lock(spin_t* l) {
         dbg(" held from ", (int)(uint64_t)l->pc); dbg(" again from ", (int)(uint64_t)ra);
     }
     uint32_t n = 0;
-    uint64_t t0 = tsc_ms();
+    uint64_t t0 = 0;
 #endif
     while (__atomic_exchange_n(&l->v, 1, __ATOMIC_ACQUIRE)) {
         while (l->v) {
             tlb_service();
             __asm__ volatile ("pause");
 #ifdef LOCKDEP
-            if (!(++n & 0x3FFFFF) && tsc_ms() - t0 > 3000) {
+            if (!(++n & 0x3FFFFF) && (!t0 ? (t0 = tsc_ms(), 0) : tsc_ms() - t0 > 3000)) {
                 dbg("lockdep: spin hang ", (int)(uint64_t)l); dbg(" cpu ", c->id);
                 dbg(" owner cpu ", l->cpu); dbg(" owner pc ", (int)(uint64_t)l->pc);
                 dbg(" my pc ", (int)(uint64_t)ra);
@@ -120,12 +120,15 @@ void bkl_yield(struct cpu* c) {
     bkl_take(c);
 }
 
-void tlb_shootdown(void) {
+/* pd != 0: only the cpus that have that space loaded. whoever loads it later flushes by
+   loading it. the fence pairs with the cr3 write on the other side */
+void tlb_shootdown_pd(uint64_t pd) {
     struct cpu* me = this_cpu();
     uint32_t mask = 0;
+    __sync_synchronize();
     for (int i = 0; i < ncpu; i++) {
         struct cpu* c = &cpus[i];
-        if (c == me || !c->online) continue;
+        if (c == me || !c->online || (pd && c->cr3 != pd)) continue;
         __atomic_store_n(&c->tlb_req, 1, __ATOMIC_SEQ_CST);
         lapic_ipi(c->apic_id, VEC_TLB);
         mask |= 1 << i;
@@ -133,6 +136,8 @@ void tlb_shootdown(void) {
     for (int i = 0; i < ncpu; i++)
         while ((mask & (1 << i)) && __atomic_load_n(&cpus[i].tlb_req, __ATOMIC_ACQUIRE)) { tlb_service(); __asm__ volatile ("pause"); }
 }
+
+void tlb_shootdown(void) { tlb_shootdown_pd(0); }
 
 void kick_idle(void) {
     struct cpu* me = this_cpu();
