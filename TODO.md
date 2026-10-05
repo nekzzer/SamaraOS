@@ -141,7 +141,7 @@ over-engineering. Talk to the user in Russian, informally.
   regions, multishot poll is sampled by workers (no real wakeups), UDP sends
   over MSS fail (send_recv test)
 
-- perf: page cache для .so (общие страницы файлов между процессами) не сделан, ext2 читает файл целиком в память, так что readahead не нужен
+- page cache: mmap и exec берут страницы из общего кэша (pcache.c), 20 bash делят код. своп: сырой диск с mkswap, `swapon /dev/vdb`, только анонимные страницы, файла-свопа нет. oom убивает самый жирный процесс. nice и sched_* есть, cfs-lite по vrt
 - perf: fc-cache/xkb-каталог добавлены в build-x64root.sh, образ не пересобирали, эффект не замерен (TCG до/после xterm не мерили)
 - perf: прогреть xkb-кэш Xwayland при сборке образа (сейчас кэш появится после первого старта)
 - wl: GL via mesa swrast (es2gears_wayland / glxgears) not tried yet
