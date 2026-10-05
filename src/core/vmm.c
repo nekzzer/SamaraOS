@@ -398,6 +398,17 @@ uint64_t vmm_map_anon(uint64_t pd, uint64_t addr, bool fixed, uint64_t lo, uint6
     return addr;
 }
 
+/* same hole search as vmm_map_anon but leaves a PROT_NONE lazy claim, the real mapping overwrites it.
+   find + mmap in two steps raced with the lock-free anon mmap of another thread (es2gears, malloc vs xkb files) */
+uint64_t vmm_reserve(uint64_t pd, uint64_t addr, uint64_t lo, uint64_t hi, uint64_t len) {
+    uint64_t f = MMLOCK(pd);
+    if (!(addr && !(addr & 0xFFF) && addr >= lo && addr + len <= hi && vmm_range_unmapped(pd, addr, len)))
+        addr = vmm_find_free(pd, lo, hi, len);
+    if (addr && vmm_lazy_range_nl(pd, addr, len, false, false) < 0) { vmm_free_range_nl(pd, addr, len); addr = 0; }
+    spin_unlock(MML(pd), f);
+    return addr;
+}
+
 static void free_tables(uint64_t tbl, int lvl) {
     uint64_t* t = (uint64_t*)P2V(tbl);
     for (int i = 0; i < 512; i++) {

@@ -985,29 +985,26 @@ static int64_t do_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd,
         if ((addr & (PAGE_SIZE - 1)) || addr < USER_BASE || addr + len > USER_TOP || addr + len < addr)
             return -EINVAL;
         vmm_free_range(p->pd, addr, len);
-    } else if (addr && !(addr & (PAGE_SIZE - 1)) && addr >= lo && addr + len <= hi &&
-               vmm_range_unmapped(p->pd, addr, len)) {
-        /* honour the hint */
     } else {
-        addr = vmm_find_free(p->pd, lo, hi, len);
+        addr = vmm_reserve(p->pd, addr, lo, hi, len);
         if (!addr) return -ENOMEM;
     }
     if (f && f->type == F_SOCKET) {
         int sr = sock_pkt_mmap(f->sock, p->pd, addr, len);
-        if (sr < 0) return sr;
+        if (sr < 0) { vmm_free_range(p->pd, addr, len); return sr; }
         vmm_flush();
         return (int64_t)addr;
     }
     if (f && f->type == F_URING) {
         int ur = uring_mmap(f->ur, p->pd, addr, len, off);
-        if (ur < 0) return ur;
+        if (ur < 0) { vmm_free_range(p->pd, addr, len); return ur; }
         vmm_flush();
         return (int64_t)addr;
     }
     if (f && f->type == F_NODE && (flags & MAP_SHARED) && is_shm(f->node)) {
         uint64_t first = off / PAGE_SIZE, np = len / PAGE_SIZE;
         uint64_t* fr = shm_frames(f->node, first + np);
-        if (!fr) return -ENOMEM;
+        if (!fr) { vmm_free_range(p->pd, addr, len); return -ENOMEM; }
         for (uint64_t k = 0; k < np; k++)
             vmm_map_frame(p->pd, addr + k * PAGE_SIZE, fr[first + k], (prot & PROT_WRITE) != 0);
         vmm_flush();
