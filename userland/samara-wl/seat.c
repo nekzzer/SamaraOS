@@ -218,14 +218,86 @@ void seat_init(void) {
 
 /* ---- clipboard: wl_data_device_manager, selection only ---- */
 
-struct dsrc { struct wl_resource *res; char mime[8][64]; int n; bool x; };
+struct dsrc { struct wl_resource *res; char mime[8][64]; int n; bool x, k; char *kb; int kn; };
 static struct dsrc *sel;
 static struct wl_list ddevs;
 struct dd { struct wl_resource *r; struct wl_list link; };
 
+/* kernel clipboard <-> wl selection. polled, 4 times a second */
+struct dd;
+static void send_sel(struct dd *d);
+static char kseen[65536];
+static int kseen_n = -1;
+static char *gbuf;
+static int gn, gfd;
+static struct wl_event_source *gsrc;
+
+static void clip_done(void) {
+    wl_event_source_remove(gsrc);
+    gsrc = NULL;
+    close(gfd);
+    if (gn > 0) {
+        memcpy(kseen, gbuf, gn);
+        kseen_n = gn;
+        sm(12, (long)gbuf, gn, 0);
+    }
+    free(gbuf);
+    gbuf = NULL;
+}
+
+static int clip_read(int fd, uint32_t mask, void *data) {
+    int r = read(fd, gbuf + gn, 65535 - gn);
+    if (r > 0) { gn += r; if (gn < 65535) return 0; }
+    clip_done();
+    return 0;
+}
+
+static void clip_grab(void) {
+    int p[2];
+    const char *m = NULL;
+    if (gsrc || !sel || sel->k || sel->x || !sel->res) return;
+    for (int i = 0; i < sel->n; i++)
+        if (!strcmp(sel->mime[i], "text/plain;charset=utf-8") || !strcmp(sel->mime[i], "UTF8_STRING")) m = sel->mime[i];
+    if (!m) for (int i = 0; i < sel->n; i++) if (!strcmp(sel->mime[i], "text/plain")) m = sel->mime[i];
+    if (!m || pipe(p) < 0) return;
+    wl_data_source_send_send(sel->res, m, p[1]);
+    close(p[1]);
+    wl_display_flush_clients(dpy);
+    gbuf = malloc(65536);
+    gn = 0;
+    gfd = p[0];
+    gsrc = wl_event_loop_add_fd(wl_display_get_event_loop(dpy), p[0], WL_EVENT_READABLE, clip_read, NULL);
+}
+
+static struct wl_event_source *ctimer;
+static int clip_poll(void *data) {
+    static char tmp[65536];
+    int n = sm(11, (long)tmp, 65536, 0);
+    wl_event_source_timer_update(ctimer, 250);
+    if (n <= 0 || gsrc) return 0;
+    if (n == kseen_n && !memcmp(tmp, kseen, n)) return 0;
+    memcpy(kseen, tmp, n);
+    kseen_n = n;
+    struct dsrc *old = sel, *s = calloc(1, sizeof(*s));
+    struct dd *d;
+    s->k = true;
+    s->kb = malloc(n);
+    memcpy(s->kb, tmp, n);
+    s->kn = n;
+    strcpy(s->mime[0], "text/plain;charset=utf-8");
+    strcpy(s->mime[1], "text/plain");
+    s->n = 2;
+    sel = s;
+    if (old && old->res) wl_data_source_send_cancelled(old->res);
+    if (old && (old->x || old->k)) { free(old->kb); free(old); }
+    wl_list_for_each(d, &ddevs, link) send_sel(d);
+    return 0;
+}
+
 static void off_accept(struct wl_client *c, struct wl_resource *r, uint32_t s, const char *m) {}
 static void off_receive(struct wl_client *c, struct wl_resource *r, const char *m, int fd) {
     if (sel && sel->x) { xwm_sel_get(fd); return; }
+    if (sel && sel->k) { write(fd, sel->kb, sel->kn); close(fd); return; }
     if (sel) wl_data_source_send_send(sel->res, m, fd);
     close(fd);
 }
@@ -269,9 +341,10 @@ static void dd_set_sel(struct wl_client *c, struct wl_resource *r, struct wl_res
     struct dsrc *old = sel;
     sel = s ? wl_resource_get_user_data(s) : NULL;
     if (old && old != sel && old->res) wl_data_source_send_cancelled(old->res);
-    if (old && old != sel && old->x) free(old);
+    if (old && old != sel && (old->x || old->k)) { free(old->kb); free(old); }
     wl_list_for_each(d, &ddevs, link) send_sel(d);
     if (sel) xwm_sel_own(true);
+    if (sel) clip_grab();
 }
 
 /* x11 client took CLIPBOARD */
@@ -284,13 +357,13 @@ void data_set_x(void) {
     strcpy(sel->mime[1], "UTF8_STRING");
     sel->n = 2;
     if (old && old->res) wl_data_source_send_cancelled(old->res);
-    if (old && old->x) free(old);
+    if (old && (old->x || old->k)) { free(old->kb); free(old); }
     wl_list_for_each(d, &ddevs, link) send_sel(d);
 }
 
 /* for xwm: current wl selection, returns the mime to ask for or NULL */
 const char *data_wl_mime(void) {
-    if (!sel || sel->x) return NULL;
+    if (!sel || sel->x || sel->k) return NULL;
     for (int i = 0; i < sel->n; i++)
         if (!strcmp(sel->mime[i], "text/plain;charset=utf-8") || !strcmp(sel->mime[i], "UTF8_STRING")) return sel->mime[i];
     for (int i = 0; i < sel->n; i++)
@@ -333,5 +406,7 @@ static void ddm_bind(struct wl_client *c, void *d, uint32_t ver, uint32_t id) {
 
 void data_init(void) {
     wl_list_init(&ddevs);
+    ctimer = wl_event_loop_add_timer(wl_display_get_event_loop(dpy), clip_poll, NULL);
+    wl_event_source_timer_update(ctimer, 250);
     wl_global_create(dpy, &wl_data_device_manager_interface, 3, NULL, ddm_bind);
 }
