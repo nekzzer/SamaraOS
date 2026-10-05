@@ -44,6 +44,12 @@ printf 'SamaraOS\n' > etc/issue
 # wayland side of the desktop (userland/samara-wl/build.sh)
 [ -x $ROOT/build/samara-wl ] && install -m755 $ROOT/build/samara-wl usr/bin/samara-wl
 
+# fontconfig cache, else every font app scans all fonts at start (works in userns chroot, musl binary)
+chroot $D /usr/bin/fc-cache -f 2>/dev/null || echo "fc-cache failed, skipped"
+# xkbcomp output cache for Xwayland, must be writable
+mkdir -p var/lib/xkb
+chmod 1777 var/lib/xkb
+
 rm -f $IMG
 truncate -s $SIZE $IMG
 mke2fs -q -t ext2 -b 4096 -O ^dir_index,^resize_inode -L / -d $D $IMG

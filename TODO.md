@@ -137,3 +137,10 @@ over-engineering. Talk to the user in Russian, informally.
   open-close single-issuer; examples io_uring-cp link-cp echo-server (pbuf ring + multishot recv, nc). failing:
   send_recv (vectorized send), recv-multishot (needs dgram socketpair + recvmsg multishot), buf-ring-upgrade,
   fixed-reuse, io_uring_register, ring-leak, defer-taskrun, read-write (buf select with readv)
+* io_uring: no SQPOLL, no provided buffer rings (PBUF_RING), no registered wait
+  regions, multishot poll is sampled by workers (no real wakeups), UDP sends
+  over MSS fail (send_recv test)
+
+- perf: page cache для .so (общие страницы файлов между процессами) не сделан, ext2 читает файл целиком в память, так что readahead не нужен
+- perf: fc-cache/xkb-каталог добавлены в build-x64root.sh, образ не пересобирали, эффект не замерен (TCG до/после xterm не мерили)
+- perf: прогреть xkb-кэш Xwayland при сборке образа (сейчас кэш появится после первого старта)

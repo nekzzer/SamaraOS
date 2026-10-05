@@ -139,6 +139,7 @@ void file_close(file_t* f) {
     } else if (f->pipe) {
         if (pipe_end(f->pipe, f->type == F_PIPE_R ? -1 : 0, f->type == F_PIPE_R ? 0 : -1)) kfree(f->pipe);
     }
+    if (f->type != F_NODE) io_wake();     // hup for whoever polls the other end
     kfree(f);
 }
 

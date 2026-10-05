@@ -454,6 +454,7 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
     sti();
 
     boot_autorun();
+    if (strstr(boot_cmdline, "deskrun") && console_gfx_start()) shell_run_line("desktop");   // perf tests, /deskrun.sh runs inside
     /* The shell runs on the graphical console (true colour, the terminal
        font) unless "textmode" asks for plain VGA text. */
     if (!strstr(boot_cmdline, "textmode") && console_gfx_start() && !strstr(boot_cmdline, "nologin")) {

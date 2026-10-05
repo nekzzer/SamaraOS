@@ -117,6 +117,8 @@ void cmd_disk(int argc, char **argv) {
 
 /* ===================== desktop entry ===================== */
 
+const char *kernel_cmdline(void);
+
 void cmd_desktop(int argc, char **argv) {
   (void)argc;
   (void)argv;
@@ -147,6 +149,7 @@ void cmd_desktop(int argc, char **argv) {
 
   /* wayland side of the DE, if it is installed */
   int wlpid = shell_launch_detached("/usr/bin/samara-wl");
+  if (strstr(kernel_cmdline(), "deskrun")) shell_launch_detached("/bin/sh /deskrun.sh");
 
   wm_run();
 

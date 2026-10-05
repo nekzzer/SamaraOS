@@ -5,11 +5,11 @@
  * gcc turning them back into calls to memcpy/memset themselves. */
 
 void* memset(void* dst, int v, size_t n) {
-    uint32_t b = (uint8_t)v;
-    uint32_t pat = b | (b << 8) | (b << 16) | (b << 24);
+    uint64_t b = (uint8_t)v;
+    uint64_t pat = b * 0x0101010101010101ULL;
     void* d = dst;
-    size_t words = n >> 2, tail = n & 3;
-    __asm__ volatile ("cld; rep stosl" : "+D"(d), "+c"(words) : "a"(pat) : "memory");
+    size_t words = n >> 3, tail = n & 7;
+    __asm__ volatile ("cld; rep stosq" : "+D"(d), "+c"(words) : "a"(pat) : "memory");
     __asm__ volatile ("rep stosb" : "+D"(d), "+c"(tail) : "a"(pat) : "memory");
     return dst;
 }
@@ -17,8 +17,8 @@ void* memset(void* dst, int v, size_t n) {
 void* memcpy(void* dst, const void* src, size_t n) {
     void* d = dst;
     const void* s = src;
-    size_t words = n >> 2, tail = n & 3;
-    __asm__ volatile ("cld; rep movsl" : "+D"(d), "+S"(s), "+c"(words) : : "memory");
+    size_t words = n >> 3, tail = n & 7;
+    __asm__ volatile ("cld; rep movsq" : "+D"(d), "+S"(s), "+c"(words) : : "memory");
     __asm__ volatile ("rep movsb" : "+D"(d), "+S"(s), "+c"(tail) : : "memory");
     return dst;
 }

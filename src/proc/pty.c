@@ -338,6 +338,7 @@ int pty_write(int i, bool master, const char* buf, int n, bool nonblock) {
         if (proc_interrupted()) return done ? done : -EINTR;
         wq_wait(&p->wq, &w, 0);
     }
+    io_wake();
     return done;
 }
 

@@ -26,6 +26,7 @@
 #include "net/net.h"
 #include "drivers/drm.h"
 #include "proc/uring.h"
+#include "core/prof.h"
 
 #define EPERM 1
 #define ENOENT 2
@@ -35,6 +36,7 @@
 #define ECHILD 10
 #define EAGAIN 11
 #define ENOMEM 12
+#define ENXIO 6
 #define EACCES 13
 #define EFAULT 14
 #define EBUSY 16
@@ -395,7 +397,7 @@ static int do_open(int dirfd, const char* path, int flags, int mode) {
     if (n->type == FS_DIR && (flags & O_ACCMODE) != 0) return -EISDIR;
     if ((flags & O_TRUNC) && n->type == FS_FILE && !n->dev && (flags & O_ACCMODE)) node_truncate(n, 0);
     file_t* f = file_open_node(n, flags & ~(O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC));
-    if (!f) return -ENOMEM;
+    if (!f) return n->dev == FS_DEV_TTY ? -ENXIO : -ENOMEM;     // xterm dies on ENOMEM here
     return install_fd(f, 0, (flags & O_CLOEXEC) != 0);
 }
 
@@ -412,6 +414,7 @@ static int do_write(int fd, const char* buf, uint64_t n) {
     if (!f) return -EBADF;
     if ((f->flags & O_ACCMODE) == 0 && f->type == F_NODE) return -EBADF;
     UCHK(buf, n);
+    if (f->type == F_NODE && !strcmp(f->node->name, "prof")) { prof_cmd(buf, n); return n; }
     return file_write(f, buf, n);
 }
 
@@ -2991,6 +2994,10 @@ void syscall_dispatch(regs_t* r) {
         fs_write_begin();
     }
     int64_t ret;
+    uint64_t t0 = prof_tsc();
+    if (g_ftrace && nr == 59 && ustr_ok((const char*)r->rdi)) {
+        klog("[x] "); klog_num(pit_uptime_ms()); klog(" exec "); klog((const char*)r->rdi); klog("\r\n");
+    }
     proc_t* pc = proc_current();
     if (pc && !setjmp((void*)pc->ujb)) {
         pc->ujb_on = true;
@@ -3002,6 +3009,11 @@ void syscall_dispatch(regs_t* r) {
         ret = -EFAULT;
     } else ret = dispatch(r);
     if (mut) fs_write_end();
+    prof_sys((int)nr, prof_tsc() - t0);
+    switch (nr) {      // io that can make a waiter in poll/read/write ready
+        case 0: case 1: case 3: case 17: case 18: case 19: case 20: case 42: case 43: case 44: case 45:
+        case 46: case 47: case 48: case 53: case 299: case 307: io_wake();
+    }
     if (g_strace && g_strace_pid && proc_current() && proc_current()->pid == g_strace_pid) {
         /* buffered: record now, print when the process exits (timing stays intact) */
         static struct { int32_t nr, a, b, c, ret; } rec[4096];
@@ -3017,7 +3029,7 @@ void syscall_dispatch(regs_t* r) {
         }
     } else if (g_strace && !g_strace_pid) {
         proc_t* p = proc_current();
-        klog("[strace] "); klog_num(p ? p->pid : 0);
+        klog("[strace] "); klog_num(pit_uptime_ms()); klog(" "); klog_num(p ? p->pid : 0);
         klog(" "); klog_num(nr);
         klog("("); klog_num(r->rdi); klog(", "); klog_num(r->rsi);
         klog(", "); klog_num(r->rdx); klog(") = "); klog_num(ret); klog("\r\n");

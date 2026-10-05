@@ -10,7 +10,7 @@
    82540EM = qemu -device e1000 and virtualbox default, 82545EM = vmware,
    82574L (e1000e) mostly works with the same legacy stuff */
 
-#define NRX 32
+#define NRX 256
 #define NTX 16
 
 typedef struct __attribute__((packed)) {

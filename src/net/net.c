@@ -523,8 +523,10 @@ static void on_ipv4(const uint8_t* pkt, int len) {
 void net_poll(void) {
     uint32_t irq = irq_save();
     uint8_t buf[PKT_BUF];                  /* on the stack: net_poll can nest via ARP */
+    bool got = false;
     for (int i = 0; i < 64 && g_loop_tail != g_loop_head; i++) {
         int slot = g_loop_tail;
+        got = true;
         g_loop_tail = (g_loop_tail + 1) % LOOP_SLOTS;
         memcpy(buf, g_loop[slot], g_loop_len[slot]);
         on_ipv4(buf, g_loop_len[slot]);
@@ -533,6 +535,7 @@ void net_poll(void) {
         for (int i = 0; i < 32; i++) {
             int n = nic_recv(&nifs[k], buf, sizeof(buf));
             if (n <= 0) break;
+            got = true;
             if (n < ETH_HDR) continue;
             const eth_hdr_t* eh = (const eth_hdr_t*)buf;
             uint16_t type = ntohs(eh->type);
@@ -541,6 +544,7 @@ void net_poll(void) {
             else if (type == 0x86DD) ip6_input(k, buf + ETH_HDR, n - ETH_HDR, eh->src);
         }
     ip6_poll();
+    if (got) io_wake();
     irq_restore(irq);
 }
 
