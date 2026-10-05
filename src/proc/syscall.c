@@ -265,9 +265,7 @@ static void fill_stat_node(kstat64_t* st, fs_node_t* n) {
     if (FS_DEV_IS_DISK(n->dev)) {
         int idx = n->dev - FS_DEV_DISK;
         st->st_mode = 0060000 | (n->mode & 07777);            /* S_IFBLK */
-        st->st_rdev = idx >= DISK_VIRTIO_BASE ? ((253u << 8) | (uint32_t)(idx - DISK_VIRTIO_BASE) * 16) :
-                      idx >= DISK_AHCI_BASE ? ((8u << 8) | (uint32_t)(idx - DISK_AHCI_BASE) * 16)
-                                            : ((3u << 8) | (uint32_t)idx * 64);
+        st->st_rdev = (uint32_t)ata_rdev(idx);
         st->st_size = (int64_t)ata_drive_sectors(idx) * 512;
     } else if (n->dev == FS_DEV_SOCK) {
         st->st_mode = 0140000 | (n->mode & 07777);                 /* S_IFSOCK */

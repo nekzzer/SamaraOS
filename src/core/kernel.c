@@ -41,6 +41,7 @@
 #include "net/sock.h"
 #include "fs/fatfs.h"
 #include "fs/ext2.h"
+#include "fs/part.h"
 #include "shell/commands.h"
 #include "drivers/drm.h"
 
@@ -317,6 +318,7 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
 
     boot_step("disks");
     ata_init_all();
+    part_scan_all();
     if (ata_primary() < 0) {
         boot_done("none");
     } else {
