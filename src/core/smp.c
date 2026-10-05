@@ -43,13 +43,69 @@ void tlb_unload(uint64_t pd) {
         while ((mask & (1 << i)) && __atomic_load_n(&cpus[i].unload, __ATOMIC_ACQUIRE)) { tlb_service(); __asm__ volatile ("pause"); }
 }
 
+static void dbg(const char* m, int v);
+static int bkl_cpu = -1;
+static void* bkl_pc;
+
 void bkl_take(struct cpu* c) {
+    void* ra = __builtin_return_address(0);
     uint32_t t = __atomic_fetch_add(&tk_next, 1, __ATOMIC_ACQUIRE);
+#ifdef LOCKDEP
+    if (c->bkl) { dbg("lockdep: bkl twice, cpu ", c->id); dbg(" from ", (int)(uint64_t)ra); }
+    uint32_t n = 0;
+    uint64_t t0 = tsc_ms();
+#endif
     while (__atomic_load_n(&tk_serve, __ATOMIC_ACQUIRE) != t) {
         tlb_service();
         __asm__ volatile ("pause");
+#ifdef LOCKDEP
+        if (!(++n & 0x3FFFFF) && tsc_ms() - t0 > 3000) {
+            dbg("lockdep: bkl hang, cpu ", c->id); dbg(" owner cpu ", bkl_cpu);
+            dbg(" owner pc ", (int)(uint64_t)bkl_pc); dbg(" my pc ", (int)(uint64_t)ra);
+            t0 = tsc_ms();
+        }
+#endif
     }
     c->bkl = 1;
+    bkl_cpu = c->id;
+    bkl_pc = ra;
+}
+
+uint64_t spin_lock(spin_t* l) {
+    uint64_t f = irq_save();
+    struct cpu* c = this_cpu();
+    void* ra = __builtin_return_address(0);
+#ifdef LOCKDEP
+    if (l->v && l->cpu == c->id) {
+        dbg("lockdep: recursive lock ", (int)(uint64_t)l); dbg(" cpu ", c->id);
+        dbg(" held from ", (int)(uint64_t)l->pc); dbg(" again from ", (int)(uint64_t)ra);
+    }
+    uint32_t n = 0;
+    uint64_t t0 = tsc_ms();
+#endif
+    while (__atomic_exchange_n(&l->v, 1, __ATOMIC_ACQUIRE)) {
+        while (l->v) {
+            tlb_service();
+            __asm__ volatile ("pause");
+#ifdef LOCKDEP
+            if (!(++n & 0x3FFFFF) && tsc_ms() - t0 > 3000) {
+                dbg("lockdep: spin hang ", (int)(uint64_t)l); dbg(" cpu ", c->id);
+                dbg(" owner cpu ", l->cpu); dbg(" owner pc ", (int)(uint64_t)l->pc);
+                dbg(" my pc ", (int)(uint64_t)ra);
+                t0 = tsc_ms();
+            }
+#endif
+        }
+    }
+    l->cpu = c->id;
+    l->pc = ra;
+    return f;
+}
+
+void spin_unlock(spin_t* l, uint64_t f) {
+    l->cpu = -1;
+    __atomic_store_n(&l->v, 0, __ATOMIC_RELEASE);
+    irq_restore(f);
 }
 
 void bkl_drop(struct cpu* c) {
@@ -75,7 +131,7 @@ void tlb_shootdown(void) {
         mask |= 1 << i;
     }
     for (int i = 0; i < ncpu; i++)
-        while ((mask & (1 << i)) && __atomic_load_n(&cpus[i].tlb_req, __ATOMIC_ACQUIRE)) __asm__ volatile ("pause");
+        while ((mask & (1 << i)) && __atomic_load_n(&cpus[i].tlb_req, __ATOMIC_ACQUIRE)) { tlb_service(); __asm__ volatile ("pause"); }
 }
 
 void kick_idle(void) {

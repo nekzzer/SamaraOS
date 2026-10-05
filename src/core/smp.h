@@ -9,6 +9,12 @@ void bkl_take(struct cpu* c);
 void bkl_drop(struct cpu* c);
 void bkl_yield(struct cpu* c);
 
+/* small spinlocks for the parts that run without the bkl. irq off while held,
+   so never touch user memory under one (a fault longjmps out with the lock held) */
+typedef struct { volatile uint32_t v; int cpu; void* pc; } spin_t;
+uint64_t spin_lock(spin_t* l);          /* returns the irq flags for spin_unlock */
+void spin_unlock(spin_t* l, uint64_t f);
+
 void smp_init(void);                    /* wake the other cpus */
 void tlb_service(void);                 /* no lock needed, called from ipi and from lock spins */
 void tlb_unload(uint64_t pd);           /* before the page tables of pd are freed */
