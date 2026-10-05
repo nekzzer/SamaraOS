@@ -395,6 +395,8 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
 
     mnt_tmpfs_boot("/tmp");
     mnt_tmpfs_boot("/dev/shm");
+    if (!fs_resolve(fs_root(), "/run")) fs_create(fs_root(), "/run", FS_DIR);
+    mnt_tmpfs_boot("/run");               // runit wants fifos in supervise/, those only live in ram
 
     /* Background services from /etc/rc: the dropbear ssh server and telnetd
        (both on a pty per session). Skipped with "noservices". */

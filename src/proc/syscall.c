@@ -273,6 +273,8 @@ static void fill_stat_node(kstat64_t* st, fs_node_t* n) {
         st->st_size = (int64_t)ata_drive_sectors(idx) * 512;
     } else if (n->dev == FS_DEV_SOCK) {
         st->st_mode = 0140000 | (n->mode & 07777);                 /* S_IFSOCK */
+    } else if (n->dev == FS_DEV_FIFO) {
+        st->st_mode = S_IFIFO | (n->mode & 07777);
     } else if (n->dev) {
         st->st_mode = S_IFCHR | (n->mode & 07777);
         st->st_rdev = n->dev == FS_DEV_TTY  ? (5u << 8) :
@@ -405,7 +407,13 @@ static int do_open(int dirfd, const char* path, int flags, int mode) {
     if (n->type == FS_DIR && (flags & O_ACCMODE) != 0) return -EISDIR;
     if (!n->dev && n->type == FS_FILE && ((flags & O_ACCMODE) || (flags & O_TRUNC)) && mnt_ro(n)) return -EROFS;
     if ((flags & O_TRUNC) && n->type == FS_FILE && !n->dev && (flags & O_ACCMODE)) { uint32_t os = n->size; node_truncate(n, 0); if (os) ino_node(n, 2); }
-    file_t* f = file_open_node(n, flags & ~(O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC));
+    file_t* f;
+    if (n->dev == FS_DEV_FIFO) {
+        int fr = fifo_open(n, flags & ~(O_CREAT | O_EXCL | O_TRUNC), &f);
+        if (fr < 0) return fr;
+        return install_fd(f, 0, (flags & O_CLOEXEC) != 0);
+    }
+    f = file_open_node(n, flags & ~(O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC));
     if (!f) return n->dev == FS_DEV_TTY ? -ENXIO : -ENOMEM;     // xterm dies on ENOMEM here
     ino_node(n, 0x20);
     return install_fd(f, 0, (flags & O_CLOEXEC) != 0);
@@ -2482,7 +2490,24 @@ static int64_t dispatch(regs_t* r) {
         }
         case 86:  return do_link(AT_FDCWD, (const char*)a, AT_FDCWD, (const char*)b, 0);
         case 265: return do_link((int)a, (const char*)b, (int)c, (const char*)d, (int)e);
-        case 133: case 259: return -EPERM;                            /* mknod */
+        case 133: case 259: {                                         /* mknod: fifos only */
+            bool at = r->rax == 259;
+            const char* pt = (const char*)(at ? b : a);
+            int md = (int)(at ? c : b);
+            UCHK(pt, 1);
+            if ((md & 0170000) != 0010000) return -EPERM;
+            char name[FS_NAME_MAX];
+            fs_node_t* par = lookup_parent(at ? (int)a : AT_FDCWD, pt, name, &err);
+            if (!par) return err;
+            if (fs_child(par, name)) return -EEXIST;
+            if (mnt_ro(par)) return -EROFS;
+            if ((err = mnt_newnode(par)) < 0) return err;
+            fs_node_t* nn = fs_create(par, name, FS_FILE);
+            if (!nn) return -ENOMEM;
+            nn->dev = FS_DEV_FIFO;
+            nn->mode = (uint16_t)(md & ~me()->sh->umask & 0777);
+            return 0;
+        }
         case 87:  return do_unlink(AT_FDCWD, (const char*)a, 0);
         case 263: return do_unlink((int)a, (const char*)b, (int)c);
         case 84:  return do_unlink(AT_FDCWD, (const char*)a, AT_REMOVEDIR);

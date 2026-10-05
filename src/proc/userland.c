@@ -251,8 +251,20 @@ int userland_install(void) {
              "    [ -f $C ] || dropbearkey -t ed25519 -f $C >/dev/null 2>&1\n"
              "    for h in /root /home/user; do mkdir -p $h/.ssh; cp $C $h/.ssh/id_dropbear; done\n"
              "fi\n"
-             "dropbear -B -r $K -p 0.0.0.0:22\n"
-             "telnetd -l /bin/login -p 23\n");
+             "telnetd -l /bin/login -p 23\n"
+             "# runit (xbps-install runit runit-void) supervises the rest, sv status/stop/start\n"
+             "if [ -x /usr/bin/runsvdir ]; then\n"
+             "    SV=/etc/runit/runsvdir/default\n"
+             "    mkdir -p /run/lock /run/runit /var/log/socklog $SV /etc/sv/dropbear\n"
+             "    rm -f $SV/agetty-*\n"
+             "    printf '#!/bin/sh\\nexec dropbear -F -B -r %s -p 0.0.0.0:22 2>&1\\n' $K > /etc/sv/dropbear/run\n"
+             "    chmod 755 /etc/sv/dropbear/run\n"
+             "    for s in dropbear crond; do [ -d /etc/sv/$s ] && ln -sf /etc/sv/$s $SV/; done\n"
+             "    mkdir -p /run/runit/runsvdir\n"
+             "    ln -sfn $SV /run/runit/runsvdir/current\n"
+             "    exec runsvdir -P /run/runit/runsvdir/current\n"
+             "fi\n"
+             "dropbear -B -r $K -p 0.0.0.0:22\n");
     fs_node_t* rc = fs_resolve(fs_root(), "/etc/rc");
     if (rc) rc->mode = 0755;
     put_text("/etc/group", "root:x:0:\n");
