@@ -75,7 +75,12 @@ static int xlat_key(int ch, int mods) {
         if (ch == 0x94) return FK_F5;
         return 0;
     }
-    if (ch >= 0x80) return cp866_uni(ch);
+    if (ch >= 0x80) {
+        int u = cp866_uni(ch);
+        // ctrl+cyrillic -> same physical key on latin layout, so hotkeys work on ru
+        if ((mods & MOD_CTRL) && u >= 0x430 && u <= 0x44F) return "f,dult;pbqrkvyjghcnea[wxio]sm'.z"[u - 0x430];
+        return u;
+    }
     if (ch == '\n') return FK_ENTER;
     if (ch == 0x1B) return FK_ESC;
     if (ch == '\t') return FK_TAB;
