@@ -38,6 +38,7 @@
 #define BUF_MAX    (4u * 1024u * 1024u)
 #define BUF_MIN    (16u * 1024u)
 #define MSS_MAX    1460
+#define LO_MSS     16000                /* loopback: no real mtu, see net.c loop_pkt */
 #define ACCEPT_MAX 64
 #define UDP_QMAX   32
 
@@ -314,15 +315,20 @@ static uint32_t rx_window(sock_t* s) {
     return (w >> s->rcv_ws) << s->rcv_ws;
 }
 
+static bool is_lo(const uint8_t* a) { return is4(a) && a[12] == 127; }
+static int link_mss(const uint8_t* rip) { return is_lo(rip) ? LO_MSS : is4(rip) ? MSS_MAX : MSS_MAX - 20; }
+
 static void put32(uint8_t* p, uint32_t v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
 
 static void tcp_segment(sock_t* s, uint32_t seq, uint8_t flags, uint32_t len) {
-    uint8_t buf[60 + MSS_MAX + 16];
+    uint8_t sbuf[60 + MSS_MAX + 16];
+    uint8_t* buf = sbuf;
+    if (len > MSS_MAX) { buf = net_buf_get(1); if (!buf) return; }
     tcph_t* h = (tcph_t*)buf;
     uint8_t* o = buf + 20;
     uint32_t now = pit_uptime_ms();
     if (flags & TCP_SYN) {
-        int mss = is4(s->rip) ? MSS_MAX : MSS_MAX - 20;
+        int mss = link_mss(s->rip);
         *o++ = 2; *o++ = 4; *o++ = mss >> 8; *o++ = mss & 0xFF;
         if (s->ts_ok) {
             if (s->sack_ok) { *o++ = 4; *o++ = 2; } else { *o++ = 1; *o++ = 1; }
@@ -360,8 +366,9 @@ static void tcp_segment(sock_t* s, uint32_t seq, uint8_t flags, uint32_t len) {
         if (len > n1) memcpy(buf + hl + n1, s->tx, len - n1);
         s->last_data_ms = now;
     }
-    h->sum = be16(l4_sum(s->lip, s->rip, 6, buf, (int)(hl + len)));
+    if (!is_lo(s->rip)) h->sum = be16(l4_sum(s->lip, s->rip, 6, buf, (int)(hl + len)));
     ip_out(s->lip, s->rip, 6, buf, (int)(hl + len));
+    if (buf != sbuf) net_buf_put(buf, 1);
 }
 
 static void send_rst(const uint8_t* src, const uint8_t* dst, const tcph_t* in, int datalen) {
@@ -749,11 +756,12 @@ static void tcp_in(const uint8_t* src, const uint8_t* dst, const uint8_t* seg, i
         c->snd_wnd = be16(h->win);
         c->nodelay = s->nodelay; c->ka_on = s->ka_on; c->cc = s->cc;
         c->ka_idle = s->ka_idle; c->ka_intvl = s->ka_intvl; c->ka_cnt = s->ka_cnt;
-        if (s->want_rx || s->want_tx) {
+        if (is_lo(src) && !s->want_rx && !s->want_tx) tcp_setbuf(c, 1 << 20, 1 << 20);
+        else if (s->want_rx || s->want_tx) {
             c->want_rx = s->want_rx; c->want_tx = s->want_tx;
             tcp_setbuf(c, s->want_rx ? s->want_rx : BUF_DEF, s->want_tx ? s->want_tx : BUF_DEF);
         }
-        int link = is4(src) ? MSS_MAX : MSS_MAX - 20;
+        int link = link_mss(src);
         int pm = o.mss ? o.mss : 536;
         if (pm > link) pm = link;
         c->ts_ok = o.ts; c->ts_recent = o.tsval;
@@ -778,7 +786,7 @@ static void tcp_in(const uint8_t* src, const uint8_t* dst, const uint8_t* seg, i
 
     if (s->state == S_SYN_SENT) {
         if ((fl & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK) && ack == s->snd_nxt) {
-            int link = is4(s->rip) ? MSS_MAX : MSS_MAX - 20;
+            int link = link_mss(s->rip);
             int pm = o.mss ? o.mss : 536;
             if (pm > link) pm = link;
             s->ts_ok = s->ts_ok && o.ts;
@@ -1264,6 +1272,7 @@ int sock_connect(sock_t* s, const uint8_t* ip, uint16_t port, bool nonblock) {
         s->tx_seq = s->iss + 1;
         s->ws_ok = s->ts_ok = s->sack_ok = true;
         s->rcv_ws = 7;
+        if (is_lo(ip) && !s->want_rx && !s->want_tx) tcp_setbuf(s, 1 << 20, 1 << 20);
         s->state = S_SYN_SENT;
         s->err = 0;
         s->retries = 0;
