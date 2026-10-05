@@ -7,6 +7,7 @@
 #include "core/string.h"
 #include "boot/pit.h"
 #include "drivers/xhci.h"
+#include "drivers/virtio.h"
 #include "drivers/input.h"
 
 /* UHCI only (qemu -usb, piix3 and friends), no irq, everything polled.
@@ -171,7 +172,8 @@ static void usb_task(void) {
         if (devs[i].class_c == 0x0C && devs[i].subclass == 3 && devs[i].prog_if == 0) { d = &devs[i]; break; }
     input_init();
     int xh = xhci_up();
-    if (!d && !xh) { setst("no usb"); return; }
+    int vi = vinput_up();
+    if (!d && !xh && !vi) { setst("no usb"); return; }
     if (xh) setst("xhci up");
     if (d) {
         uhci_up(d);
@@ -180,6 +182,7 @@ static void usb_task(void) {
     int tick = 0;
     for (;;) {
         xhci_poll();
+        if (vi) vinput_poll();
         if (!d) {
             task_sleep_ms(1);
             continue;

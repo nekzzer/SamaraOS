@@ -128,7 +128,7 @@ KERN_SRC := \
     src/drivers/vgpu.c \
     src/drivers/drm.c \
     src/fs/ext2.c \
-    src/drivers/usb.c src/drivers/xhci.c src/drivers/hid.c src/drivers/usbms.c src/drivers/part.c \
+    src/drivers/usb.c src/drivers/xhci.c src/drivers/hid.c src/drivers/usbms.c src/drivers/part.c src/drivers/vinput.c \
     src/net/net.c \
     src/net/ipv6.c \
     src/net/sock.c \
