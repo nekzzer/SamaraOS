@@ -6,6 +6,8 @@
 #include "core/task.h"
 #include "core/string.h"
 #include "boot/pit.h"
+#include "drivers/xhci.h"
+#include "drivers/input.h"
 
 /* UHCI only (qemu -usb, piix3 and friends), no irq, everything polled.
    xhci/ehci later, maybe. Only HID boot mice for now. */
@@ -36,7 +38,7 @@ static char status[48] = "no uhci";
 static int m_addr, m_ep, m_ls, m_len, m_tog, m_port = -1;
 #define itd (&tds[23])
 
-static void slog(const char* s) {
+void slog(const char* s) {
     for (const char* m = "samara: usb: "; *m; m++) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, *m); }
     for (; *s; s++) { while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, *s); }
     while (!(inb(0x3F8 + 5) & 0x20)) {} outb(0x3F8, '\r');
@@ -167,11 +169,21 @@ static void usb_task(void) {
     int n = pci_scan(devs, 32);
     for (int i = 0; i < n; i++)
         if (devs[i].class_c == 0x0C && devs[i].subclass == 3 && devs[i].prog_if == 0) { d = &devs[i]; break; }
-    if (!d) { setst("no uhci"); return; }
-    uhci_up(d);
-    setst("uhci up");
+    input_init();
+    int xh = xhci_up();
+    if (!d && !xh) { setst("no usb"); return; }
+    if (xh) setst("xhci up");
+    if (d) {
+        uhci_up(d);
+        setst("uhci up");
+    }
     int tick = 0;
     for (;;) {
+        xhci_poll();
+        if (!d) {
+            task_sleep_ms(1);
+            continue;
+        }
         if (m_port < 0) {
             if (++tick >= 100) {                          // ~400ms
                 tick = 0;
