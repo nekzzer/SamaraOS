@@ -207,6 +207,7 @@ void seat_init(void) {
     km_size = strlen(str) + 1;
     km_fd = syscall(SYS_memfd_create, "keymap", 0);
     ftruncate(km_fd, km_size);
+    write(km_fd, str, km_size);       /* private mmaps read this copy, shared ones the frames below */
     char *m = mmap(NULL, km_size, PROT_READ | PROT_WRITE, MAP_SHARED, km_fd, 0);
     memcpy(m, str, km_size);
     munmap(m, km_size);

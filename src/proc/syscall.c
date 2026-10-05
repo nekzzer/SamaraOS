@@ -2382,7 +2382,13 @@ static int64_t dispatch(regs_t* r) {
             file_t* fl = getf((int)a);
             if (!fl) return -EBADF;
             if (fl->type != F_NODE) return -EINVAL;
-            return node_truncate(fl->node, b);
+            if (is_shm(fl->node) && b > (1u << 20) && !fl->node->data) {   /* frames come at mmap, no point in a shadow copy (foot asks for 512M) */
+                fl->node->size = b;
+                return 0;
+            }
+            int tr = node_truncate(fl->node, b);
+            if (tr < 0) { klog("ftruncate fail "); klog_num(b); klog("\r\n"); }
+            return tr;
         }
         case 137: {                                                  /* statfs */
             UCHK((void*)a, 1);
