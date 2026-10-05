@@ -4,6 +4,7 @@
 #include "core/string.h"
 #include "core/io.h"
 #include "core/vmm.h"
+#include "core/smp.h"
 
 /* AHCI 1.x SATA driver: polled DMA, one command slot per port.
 
@@ -288,6 +289,8 @@ int  ahci_port(int i) { return ahci_present(i) ? disks[i].port : -1; }
 
 /* Controller DMA wants word-aligned, physically contiguous buffers (kernel
    identity or direct-map memory); bounce anything else. */
+static spin_t ahci_lk;
+
 static int xfer(int i, uint32_t lba, int count, void* buf, bool write) {
     if (!ahci_present(i) || count <= 0) return -1;
     ahci_disk_t* d = &disks[i];
@@ -299,6 +302,7 @@ static int xfer(int i, uint32_t lba, int count, void* buf, bool write) {
         if (!bounce) return -1;
     }
     int rc = 0;
+    uint64_t fl = spin_lock(&ahci_lk);      /* one slot, syncd and the shutdown sync raced on it */
     while (count > 0) {
         int chunk = count > MAX_SECTORS_PER_CMD ? MAX_SECTORS_PER_CMD : count;
         uint32_t bytes = (uint32_t)chunk * 512;
@@ -312,6 +316,7 @@ static int xfer(int i, uint32_t lba, int count, void* buf, bool write) {
         count -= chunk;
     }
     if (write && rc == 0) issue(d, ATA_FLUSH_EXT, 0, 0, NULL, 0, false);
+    spin_unlock(&ahci_lk, fl);
     if (bounce) kfree(bounce);
     return rc;
 }
