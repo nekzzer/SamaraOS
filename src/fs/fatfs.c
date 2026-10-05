@@ -3,6 +3,7 @@
 #include "core/heap.h"
 #include "core/string.h"
 #include "core/task.h"
+#include "core/smp.h"
 #include "core/io.h"
 #include "boot/pit.h"
 
@@ -191,6 +192,17 @@ static int load_entry(vol_t* v, fs_node_t* dir, const char* name, const uint8_t*
         n->data = (char*)kmalloc_big(size + 1);
         if (!n->data) { kfree(d); return -ENOMEM; }
         memcpy(n->data, d, size < len ? size : len);
+        /* remember what is on disk, else the first sync rewrites every file (polled, irqs off) */
+        uint8_t* sc = (uint8_t*)kmalloc(v->csize);
+        uint32_t c = first;
+        for (uint32_t i = 0; sc && i * v->csize < len && c >= 2 && c < v->nclus + 2; i++, c = fat_get(v, c)) {
+            uint32_t off = i * v->csize, k = size > off ? size - off : 0;
+            if (k > v->csize) k = v->csize;
+            memset(sc, 0, v->csize);
+            memcpy(sc, d + off, k);
+            v->clus_hash[c] = fnv(sc, v->csize);
+        }
+        if (sc) kfree(sc);
         kfree(d);
         n->size = size < len ? size : len;
         n->cap = size + 1;
@@ -347,8 +359,18 @@ static void assign(layout_t* L, fs_node_t* n, bool is_root) {
     L->next_clus += count;
     for (uint32_t h = hash_ptr(n, L->mapcap);; h = (h + 1) & (L->mapcap - 1))
         if (!L->map[h]) { L->map[h] = L->npl; break; }
-    if (n->type == FS_DIR)
-        for (fs_node_t* c = n->child; c; c = c->next) if (!c->dev) assign(L, c, false);
+    if (n->type == FS_DIR) {
+        /* child list is newest first, walk it oldest first = disk order, so
+           files that stay don't move (and aren't rewritten) when something new shows up */
+        uint32_t k = 0;
+        for (fs_node_t* c = n->child; c; c = c->next) k++;
+        fs_node_t** a = (fs_node_t**)kmalloc((k + 1) * sizeof(fs_node_t*));
+        if (!a) { L->err = -ENOMEM; return; }
+        k = 0;
+        for (fs_node_t* c = n->child; c; c = c->next) a[k++] = c;
+        while (k--) if (!a[k]->dev) assign(L, a[k], false);
+        kfree(a);
+    }
 }
 
 /* ---------------- writing: output ---------------- */
@@ -447,7 +469,14 @@ static int emit_dir(layout_t* L, fs_node_t* d, place_t* self, uint32_t parent_fi
         uint8_t sn[11], nt;
         if (!c->dev && as_short(c->name, sn, &nt)) memcpy(used[nused++], sn, 11);
     }
-    for (fs_node_t* c = d->child; c; c = c->next) {
+    fs_node_t** kids = (fs_node_t**)kmalloc((uint32_t)(nchild + 1) * sizeof(fs_node_t*));
+    if (!kids) { kfree(buf); kfree(used); return -ENOMEM; }
+    {
+        int k = nchild;
+        for (fs_node_t* c = d->child; c; c = c->next) kids[--k] = c;       /* oldest first, same as assign() */
+    }
+    for (int ki = 0; ki < nchild; ki++) {
+        fs_node_t* c = kids[ki];
         if (c->dev) continue;
         place_t* p = find_place(L, c);
         uint8_t sn[11], nt = 0;
@@ -493,9 +522,10 @@ static int emit_dir(layout_t* L, fs_node_t* d, place_t* self, uint32_t parent_fi
     }
     kfree(used);
     kfree(buf);
-    if (r < 0) return r;
+    if (r < 0) { kfree(kids); return r; }
 
-    for (fs_node_t* c = d->child; c; c = c->next) {
+    for (int ki = 0; ki < nchild; ki++) {
+        fs_node_t* c = kids[ki];
         if (c->dev) continue;
         place_t* p = find_place(L, c);
         if (!p) continue;
@@ -504,9 +534,10 @@ static int emit_dir(layout_t* L, fs_node_t* d, place_t* self, uint32_t parent_fi
         } else if (p->count) {
             r = write_clusters(v, p->first, p->count, (const uint8_t*)c->data, (uint32_t)c->size, scratch);
         }
-        if (r < 0) return r;
+        if (r < 0) break;
     }
-    return 0;
+    kfree(kids);
+    return r;
 }
 
 static int sync_vol(vol_t* v) {
@@ -588,8 +619,10 @@ static void mark_dirty(int id) {
     vols[id - 1].dirty_ms = pit_uptime_ms();
 }
 
+static spin_t sync_lk;
+
 static int sync_one(vol_t* v) {
-    uint32_t f = irq_save();
+    uint64_t f = spin_lock(&sync_lk);
     v->dirty = false;
     int r = sync_vol(v);
     if (r < 0) {
@@ -597,7 +630,7 @@ static int sync_one(vol_t* v) {
         v->dirty_ms = pit_uptime_ms() + 5000;         /* back off after an error */
         klog("[fatfs] sync failed\r\n");
     }
-    irq_restore(f);
+    spin_unlock(&sync_lk, f);
     return r;
 }
 

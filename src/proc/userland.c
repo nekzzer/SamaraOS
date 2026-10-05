@@ -219,8 +219,10 @@ int userland_install(void) {
 
     /* file manager, x86_64 static (make fm) */
     mkdir_p("/etc");
+    fs_unlink(fs_root(), "/usr/bin/fm");   // tar has an old one, create would fail
     fs_node_t* fm = fs_create(fs_root(), "/usr/bin/fm", FS_FILE);
     if (fm) { fs_set_static(fm, _binary_userland_fm_start, _binary_userland_fm_end - _binary_userland_fm_start); fm->mode = 0755; }
+    fs_unlink(fs_root(), "/etc/samara-fm.conf");
     fs_node_t* fc = fs_create(fs_root(), "/etc/samara-fm.conf", FS_FILE);
     if (fc) fs_set_static(fc, _binary_userland_samara_samara_fm_conf_start,
                           _binary_userland_samara_samara_fm_conf_end - _binary_userland_samara_samara_fm_conf_start);
