@@ -150,7 +150,32 @@ enum {
     IORING_REGISTER_ENABLE_RINGS, IORING_REGISTER_FILES2, IORING_REGISTER_FILES_UPDATE2,
     IORING_REGISTER_BUFFERS2, IORING_REGISTER_BUFFERS_UPDATE,
     IORING_REGISTER_IOWQ_MAX_WORKERS = 19,
+    IORING_REGISTER_PBUF_RING = 22, IORING_UNREGISTER_PBUF_RING = 23,
+    IORING_REGISTER_PBUF_STATUS = 26,
 };
+
+struct io_uring_buf {
+    __u64 addr;
+    __u32 len;
+    __u16 bid;
+    __u16 resv;
+};
+
+struct io_uring_buf_reg {
+    __u64 ring_addr;
+    __u32 ring_entries;
+    __u16 bgid;
+    __u16 flags;
+    __u64 resv[3];
+};
+
+struct io_uring_buf_status {
+    __u32 buf_group;
+    __u32 head;
+    __u32 resv[8];
+};
+
+#define IORING_RECV_MULTISHOT   (1U << 1)
 
 struct io_uring_getevents_arg {
     __u64 sigmask;

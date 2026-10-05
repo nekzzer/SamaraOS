@@ -21,6 +21,8 @@
 int file_wqs(struct file* f, wq_t** v);
 
 #define EEXIST 17
+#define ENOBUFS 105
+#define E2BIG 7
 #define EBADFD 77
 #define EPERM 1
 #define ENXIO 6
@@ -58,6 +60,7 @@ typedef struct req {
     uint32_t seq;
     uint32_t deadline, start_ncq;       /* timeouts: uptime ms, cqes seen when armed */
     uint32_t count, ms;
+    uint32_t cflags;
     int16_t last;
     uint32_t gen;
     wq_ent_t* we[2];                    /* our callbacks on the file queues */
@@ -106,6 +109,7 @@ typedef struct uring {
     struct { uint64_t base, len; } *bufs;
     uint32_t nbufs;
     struct file* efd;
+    struct bgrp* bgs;                   /* provided buffer groups */
     int waiter;                         /* task blocked in enter, -1 none */
     struct proc* sqp;                   /* sqpoll: whose files and memory the thread uses */
     int sqt;                            /* its task, -1 no thread */
@@ -119,6 +123,120 @@ static void req_start(req_t* q);
 static void sq_start(uring_t* r);
 static int sq_submit(uring_t* r, uint32_t n);
 static void sq_wake(uring_t* r);
+
+// buffer groups: PROVIDE_BUFFERS keeps a fifo here, a buf ring lives in user memory and
+// we only track the head. both are used from workers that run in the submitter's mm
+typedef struct { uint64_t a; uint32_t len, bid; } lbuf_t;
+
+typedef struct bgrp {
+    struct bgrp* next;
+    uint32_t id;
+    bool ring;
+    uint64_t ra;
+    uint32_t ent;
+    uint16_t head;
+    lbuf_t* v;
+    uint32_t h, n, cap;
+} bgrp_t;
+
+static int do_sock(req_t* q, int call);
+static int do_rw(req_t* q, char* buf, uint32_t n, bool wr);
+
+static bgrp_t* bg_find(uring_t* r, uint32_t id) {
+    for (bgrp_t* g = r->bgs; g; g = g->next) if (g->id == id) return g;
+    return NULL;
+}
+
+static void bg_free(uring_t* r, bgrp_t* g) {
+    for (bgrp_t** pp = &r->bgs; *pp; pp = &(*pp)->next)
+        if (*pp == g) { *pp = g->next; break; }
+    kfree(g->v);
+    kfree(g);
+}
+
+// look at the next buffer without taking it
+static int bg_peek(bgrp_t* g, uint64_t* a, uint32_t* len, uint32_t* bid) {
+    if (g->ring) {
+        uint16_t tail = *(volatile uint16_t*)(uintptr_t)(g->ra + 14);
+        if (tail == g->head) return -ENOBUFS;
+        struct io_uring_buf* e = (struct io_uring_buf*)(uintptr_t)g->ra + (g->head & (g->ent - 1));
+        *a = e->addr; *len = e->len; *bid = e->bid;
+        return 0;
+    }
+    if (!g->n) return -ENOBUFS;
+    *a = g->v[g->h].a; *len = g->v[g->h].len; *bid = g->v[g->h].bid;
+    return 0;
+}
+
+static void bg_take(bgrp_t* g) {
+    if (g->ring) g->head++;
+    else { g->h++; g->n--; }
+}
+
+static int bg_provide(uring_t* r, struct io_uring_sqe* s) {
+    int nr = s->fd;
+    uint32_t len = s->len, bid = (uint32_t)s->off;
+    if (nr <= 0 || nr > 65535 || !len || !s->addr) return -EINVAL;
+    if (bid + (uint32_t)nr > 65536) return -E2BIG;
+    if (!sys_uok((void*)(uintptr_t)s->addr, 1)) return -EFAULT;
+    bgrp_t* g = bg_find(r, s->buf_group);
+    if (g && g->ring) return -EEXIST;
+    if (!g) {
+        g = kmalloc(sizeof(*g));
+        if (!g) return -ENOMEM;
+        memset(g, 0, sizeof(*g));
+        g->id = s->buf_group;
+        g->next = r->bgs;
+        r->bgs = g;
+    }
+    if (g->h + g->n + nr > g->cap) {
+        uint32_t cap = g->n + nr + 16;
+        lbuf_t* v = kmalloc(cap * sizeof(lbuf_t));
+        if (!v) return -ENOMEM;
+        if (g->n) memcpy(v, g->v + g->h, g->n * sizeof(lbuf_t));
+        kfree(g->v);
+        g->v = v; g->h = 0; g->cap = cap;
+    }
+    for (int i = 0; i < nr; i++) {
+        lbuf_t* b = &g->v[g->h + g->n++];
+        b->a = s->addr + (uint64_t)i * len;
+        b->len = len;
+        b->bid = (bid + i) & 0xFFFF;
+    }
+    return 0;
+}
+
+static int bg_remove(uring_t* r, struct io_uring_sqe* s) {
+    int nr = s->fd;
+    if (nr <= 0 || nr > 65535) return -EINVAL;
+    bgrp_t* g = bg_find(r, s->buf_group);
+    if (!g || g->ring || !g->n) return -ENOENT;
+    int k = 0;
+    while (k < nr && g->n) { bg_take(g); k++; }
+    return k;
+}
+
+// read / recv into a buffer picked from the group. cqe flags say which one
+static int do_bsel(req_t* q, int call) {
+    struct io_uring_sqe* s = &q->sqe;
+    bgrp_t* g = bg_find(q->r, s->buf_group);
+    uint64_t a;
+    uint32_t len, bid;
+    if (!g) return -ENOBUFS;
+    int e = bg_peek(g, &a, &len, &bid);
+    if (e < 0) return e;
+    uint64_t sa = s->addr;
+    uint32_t sl = s->len;
+    if (sl && sl < len) len = sl;
+    s->addr = a; s->len = len;
+    int res = call ? do_sock(q, call) : do_rw(q, (char*)(uintptr_t)a, len, false);
+    s->addr = sa; s->len = sl;
+    if (res > 0) {
+        bg_take(g);
+        q->cflags = IORING_CQE_F_BUFFER | (bid << 16);
+    }
+    return res;
+}
 
 /* kmalloc is first fit over every block and kfree walks the whole heap, thousands of
    requests in flight made that crawl. reqs come from chunks that are never given back */
@@ -285,7 +403,7 @@ int uring_setup(uint32_t entries, void* params) {
     pr->flags = r->flags;
     pr->features = IORING_FEAT_SINGLE_MMAP | IORING_FEAT_NODROP | IORING_FEAT_SUBMIT_STABLE |
                    IORING_FEAT_RW_CUR_POS | IORING_FEAT_CUR_PERSONALITY | IORING_FEAT_FAST_POLL |
-                   IORING_FEAT_POLL_32BITS | IORING_FEAT_EXT_ARG | IORING_FEAT_NATIVE_WORKERS;
+                   IORING_FEAT_POLL_32BITS | IORING_FEAT_EXT_ARG | IORING_FEAT_NATIVE_WORKERS | IORING_FEAT_CQE_SKIP;
     pr->sq_off.head = 0; pr->sq_off.tail = 64; pr->sq_off.ring_mask = 256;
     pr->sq_off.ring_entries = 264; pr->sq_off.dropped = 272; pr->sq_off.flags = 276;
     pr->sq_off.array = arr;
@@ -331,7 +449,7 @@ static void req_done(req_t* q, int res) {
     req_t* prev = NULL;
     for (req_t** pp = &reqs; *pp; prev = *pp, pp = &(*pp)->next)
         if (*pp == q) { *pp = q->next; if (reqs_tl == q) reqs_tl = prev; break; }
-    cq_post(r, q->sqe.user_data, res, 0);
+    if (!((q->sqe.flags & IOSQE_CQE_SKIP_SUCCESS) && res >= 0)) cq_post(r, q->sqe.user_data, res, q->cflags);
     if (q->sqe.opcode == IORING_OP_TIMEOUT && (res == -ETIME || res == 0)) { r->ncq--; r->ntmo++; }      // expiries do not count for other timeouts
     req_t* lt = q->lt;
     req_t* nx = q->link;
@@ -407,7 +525,7 @@ static req_t* prep(uring_t* r, struct io_uring_sqe* s) {
         case IORING_OP_LINK_TIMEOUT: case IORING_OP_ASYNC_CANCEL: case IORING_OP_OPENAT:
         case IORING_OP_STATX: case IORING_OP_POLL_REMOVE:
             needf = false; break;
-        case IORING_OP_REMOVE_BUFFERS: needf = false; q->bad = -ENOENT; break;      // nothing is ever provided
+        case IORING_OP_PROVIDE_BUFFERS: case IORING_OP_REMOVE_BUFFERS: needf = false; break;
         case IORING_OP_CLOSE: needf = false; break;
         case IORING_OP_READV: case IORING_OP_WRITEV: case IORING_OP_READ: case IORING_OP_WRITE:
         case IORING_OP_SYNC_FILE_RANGE:
@@ -417,6 +535,8 @@ static req_t* prep(uring_t* r, struct io_uring_sqe* s) {
             break;
         default: q->bad = -EINVAL; needf = false;
     }
+    if ((s->flags & IOSQE_BUFFER_SELECT) && !q->bad && op != IORING_OP_READ && op != IORING_OP_RECV) q->bad = -EINVAL;
+    if (op == IORING_OP_RECV && (s->ioprio & IORING_RECV_MULTISHOT) && !q->bad && !(s->flags & IOSQE_BUFFER_SELECT)) q->bad = -EINVAL;
     if (op == IORING_OP_ACCEPT && (s->ioprio & 1) && s->file_index && s->file_index != ~0u) q->bad = -EINVAL;
     if ((op == IORING_OP_SENDMSG || op == IORING_OP_RECVMSG) && !q->bad && !sys_uok((void*)(uintptr_t)s->addr, 56)) q->bad = -EFAULT;
     if (needf && !q->bad) {
@@ -560,12 +680,12 @@ static int do_probe(void* arg, uint32_t nr) {
         IORING_OP_SENDMSG, IORING_OP_RECVMSG, IORING_OP_TIMEOUT, IORING_OP_TIMEOUT_REMOVE,
         IORING_OP_ACCEPT, IORING_OP_ASYNC_CANCEL, IORING_OP_LINK_TIMEOUT, IORING_OP_CONNECT,
         IORING_OP_OPENAT, IORING_OP_CLOSE, IORING_OP_STATX, IORING_OP_READ, IORING_OP_WRITE,
-        IORING_OP_SEND, IORING_OP_RECV };
+        IORING_OP_SEND, IORING_OP_RECV, IORING_OP_PROVIDE_BUFFERS, IORING_OP_REMOVE_BUFFERS };
     if (!sys_uok(p, sizeof(*p) + nr * sizeof(p->ops[0]))) return -EFAULT;
     if (p->resv || p->resv2[0] || p->resv2[1] || p->resv2[2]) return -EINVAL;
     memset(p, 0, sizeof(*p) + nr * sizeof(p->ops[0]));
-    p->last_op = IORING_OP_RECV;
-    p->ops_len = nr > IORING_OP_RECV + 1 ? IORING_OP_RECV + 1 : nr;
+    p->last_op = IORING_OP_REMOVE_BUFFERS;
+    p->ops_len = nr > IORING_OP_REMOVE_BUFFERS + 1 ? IORING_OP_REMOVE_BUFFERS + 1 : nr;
     for (uint32_t i = 0; i < sizeof(ok); i++)
         if (ok[i] < p->ops_len) p->ops[ok[i]].flags = IO_URING_OP_SUPPORTED;
     return 0;
@@ -577,6 +697,7 @@ static int req_exec(req_t* q) {
     switch (s->opcode) {
         case IORING_OP_NOP: return (s->rw_flags & 1) ? (int)s->len : 0;       // INJECT_RESULT
         case IORING_OP_READ: case IORING_OP_WRITE:
+            if (s->flags & IOSQE_BUFFER_SELECT) return do_bsel(q, 0);
             return do_rw(q, (char*)(uintptr_t)s->addr, s->len, s->opcode == IORING_OP_WRITE);
         case IORING_OP_READV: case IORING_OP_WRITEV: return do_rwv(q, s->opcode == IORING_OP_WRITEV);
         case IORING_OP_READ_FIXED: case IORING_OP_WRITE_FIXED: {
@@ -588,7 +709,11 @@ static int req_exec(req_t* q) {
         }
         case IORING_OP_FSYNC: case IORING_OP_SYNC_FILE_RANGE: ext2_sync_all(); fatfs_sync_all(); return 0;
         case IORING_OP_SEND: return do_sock(q, 11);
-        case IORING_OP_RECV: return do_sock(q, 12);
+        case IORING_OP_RECV:
+            if (s->flags & IOSQE_BUFFER_SELECT) return do_bsel(q, 12);
+            return do_sock(q, 12);
+        case IORING_OP_PROVIDE_BUFFERS: return bg_provide(r, s);
+        case IORING_OP_REMOVE_BUFFERS: return bg_remove(r, s);
         case IORING_OP_SENDMSG: return do_sock(q, 16);
         case IORING_OP_RECVMSG: return do_sock(q, 17);
         case IORING_OP_ACCEPT:
@@ -729,6 +854,16 @@ static void run(req_t* q) {
     if (!q->pre && q->sqe.opcode == IORING_OP_ACCEPT && (q->sqe.ioprio & 1) && res >= 0) {
         uint32_t fl = irq_save();               // multishot accept: report it and wait for the next one
         cq_post(r, q->sqe.user_data, res, IORING_CQE_F_MORE);
+        q->st = R_WAIT;
+        q->fired = true;
+        irq_restore(fl);
+        r->running--;
+        return;
+    }
+    if (!q->pre && q->sqe.opcode == IORING_OP_RECV && (q->sqe.ioprio & IORING_RECV_MULTISHOT) && res > 0) {
+        uint32_t fl = irq_save();
+        cq_post(r, q->sqe.user_data, res, q->cflags | IORING_CQE_F_MORE);
+        q->cflags = 0;
         q->st = R_WAIT;
         q->fired = true;
         irq_restore(fl);
@@ -979,6 +1114,7 @@ void uring_release(uring_t* r) {
     purge(r, NULL);
     drop_files(r);
     kfree(r->bufs);
+    while (r->bgs) bg_free(r, r->bgs);
     file_close(r->efd);
     while (r->ovf) { ovf_t* o = r->ovf; r->ovf = o->next; uint32_t fl = irq_save(); ovf_put(o); irq_restore(fl); }
     for (uint32_t i = 0; i < r->rings_np; i++) pmm_unref(r->rings_pa + i * PAGE_SIZE);
@@ -1154,6 +1290,38 @@ int uring_register(int fd, uint32_t op, void* arg, uint32_t nr) {
             file_close(r->efd); r->efd = NULL;
             return 0;
         case IORING_REGISTER_PROBE: return do_probe(arg, nr);
+        case IORING_REGISTER_PBUF_RING: {
+            struct io_uring_buf_reg* g = arg;
+            if (nr != 1 || !sys_uok(g, sizeof(*g))) return -EINVAL;
+            if (g->flags || g->resv[0] || g->resv[1] || g->resv[2]) return -EINVAL;
+            uint32_t n = g->ring_entries;
+            if (!n || n > 32768 || (n & (n - 1))) return -EINVAL;
+            if (!g->ring_addr || (g->ring_addr & 15) || !sys_uok((void*)(uintptr_t)g->ring_addr, n * 16)) return -EFAULT;
+            if (bg_find(r, g->bgid)) return -EEXIST;
+            bgrp_t* b = kmalloc(sizeof(*b));
+            if (!b) return -ENOMEM;
+            memset(b, 0, sizeof(*b));
+            b->id = g->bgid; b->ring = true; b->ra = g->ring_addr; b->ent = n;
+            b->next = r->bgs;
+            r->bgs = b;
+            return 0;
+        }
+        case IORING_UNREGISTER_PBUF_RING: {
+            struct io_uring_buf_reg* g = arg;
+            if (nr != 1 || !sys_uok(g, sizeof(*g))) return -EINVAL;
+            bgrp_t* b = bg_find(r, g->bgid);
+            if (!b || !b->ring) return -ENOENT;
+            bg_free(r, b);
+            return 0;
+        }
+        case IORING_REGISTER_PBUF_STATUS: {
+            struct io_uring_buf_status* st = arg;
+            if (nr != 1 || !sys_uok(st, sizeof(*st))) return -EINVAL;
+            bgrp_t* b = bg_find(r, st->buf_group);
+            if (!b || !b->ring) return -ENOENT;
+            st->head = b->head;
+            return 0;
+        }
         case IORING_REGISTER_ENABLE_RINGS:
             if (!(r->flags & IORING_SETUP_R_DISABLED) || r->issuer >= 0) return -EBADFD;
             r->issuer = task_current()->id;
