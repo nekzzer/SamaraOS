@@ -761,6 +761,25 @@ static int do_ioctl(int fd, uint32_t req, uint64_t arg) {
         *(int*)arg = n;
         return 0;
     }
+    if (f->type == F_DRM && (req & 0xffff) == 0x642d) {            /* prime handle -> fd */
+        UCHK((void*)arg, 12);
+        uint32_t* pa = (uint32_t*)arg;
+        struct drm_fd* nd = drm_prime_export(f->drm, pa[0]);
+        if (!nd) return -ENOENT;
+        file_t* nf = file_new(F_DRM, 2);
+        if (!nf) { drm_close(nd); return -ENOMEM; }
+        nf->drm = nd; nf->disk = 1;
+        int fd = install_fd(nf, 0, (pa[1] & 02000000) != 0);
+        if (fd < 0) return fd;
+        pa[2] = (uint32_t)fd;
+        return 0;
+    }
+    if (f->type == F_DRM && (req & 0xffff) == 0x642e) {            /* prime fd -> handle */
+        UCHK((void*)arg, 12);
+        uint32_t* pa = (uint32_t*)arg;
+        file_t* sf = getf((int)pa[2]);
+        if (!sf || sf->type != F_DRM) return -EBADF;
+        return drm_prime_import(f->drm, sf->drm, &pa[0]);
     if (f->type == F_RTC) {
         switch (req) {
             case 0x80247009: UCHK((void*)arg, 36); clock_rtc_get((int*)arg); return 0;    /* RTC_RD_TIME */
@@ -921,6 +940,28 @@ static uint64_t* shm_frames(fs_node_t* n, uint32_t pages) {
     shm[s].fr = fr;
     shm[s].n = pages;
     return fr;
+}
+
+/* read()/write() on shm and memfd go to the same frames mmap hands out */
+int shm_rw(fs_node_t* n, uint64_t off, char* buf, uint32_t len, bool wr) {
+    if (!is_shm(n)) return -1;
+    if (!wr) {
+        if (off >= n->size) return 0;
+        if (len > n->size - off) len = n->size - off;
+    }
+    if (!len) return 0;
+    uint64_t* fr = shm_frames(n, (off + len + PAGE_SIZE - 1) / PAGE_SIZE);
+    if (!fr) return -ENOMEM;
+    for (uint32_t d = 0; d < len; ) {
+        uint64_t o = off + d;
+        uint32_t k = PAGE_SIZE - (o & (PAGE_SIZE - 1));
+        if (k > len - d) k = len - d;
+        char* pg = (char*)P2V(fr[o / PAGE_SIZE]) + (o & (PAGE_SIZE - 1));
+        if (wr) memcpy(pg, buf + d, k); else memcpy(buf + d, pg, k);
+        d += k;
+    }
+    if (wr && off + len > n->size) n->size = off + len;
+    return len;
 }
 
 /* SysV shm, the four calls end up in do_ipc. a segment is a

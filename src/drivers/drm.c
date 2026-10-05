@@ -45,7 +45,7 @@ bool user_ok(const void* p, uint32_t len);       /* syscall.c */
 #define OBJ_FB   0xfbfbfbfb
 #define OBJ_PLANE 0xeeeeeeee
 
-#define MAXGEM 64
+#define MAXGEM 512
 #define GEM_SLOT 0x4000000u          /* mmap offset of handle n = n * 64M */
 #define FOURCC_XR24 0x34325258
 #define FOURCC_AR24 0x34325241
@@ -62,6 +62,7 @@ typedef struct { uint32_t type, len; uint64_t ud; uint32_t sec, usec, seq, crtc;
 
 typedef struct drm_fd {
     bool master, render, univ, atomic;
+    uint32_t ctx, dma;               /* virgl context id, gem of a prime fd */
     ev_t ev[64];
     int head, tail;
 } dfd_t;
@@ -73,6 +74,7 @@ typedef struct {
     uintptr_t* pg;
     uint32_t res, res_a;             /* virtio resource ids, res_a = argb twin for the cursor */
     uint32_t aw, ah;
+    uint32_t root;                   /* gem that owns res (prime copies share it) */
 } gem_t;
 
 typedef struct { dfd_t* owner; uint32_t id, gem, w, h, pitch, fmt; } fb_t;
@@ -80,6 +82,8 @@ typedef struct { dfd_t* owner; uint32_t id, gem, w, h, pitch, fmt; } fb_t;
 static int be;                        /* 0 none, 1 virtio-gpu, 2 bochs */
 static pci_dev_t pdev;
 static gem_t gems[MAXGEM];
+static uint16_t resref[MAXGEM];
+static uint32_t ctx_next = 1;
 static fb_t fbs[32];
 static uint32_t next_fb = FB_FIRST;
 static dfd_t* master;
@@ -151,7 +155,7 @@ static gem_t* gem_get(dfd_t* d, uint32_t h) {
 static void gem_free(uint32_t h) {
     gem_t* g = &gems[h];
     if (be == 1) {
-        if (g->res) vg_unref(g->res);
+        if (g->res && (g->root == 0 || --resref[g->root] == 0)) vg_unref(g->res);
         if (g->res_a) vg_unref(g->res_a);
     }
     for (int i = 0; i < g->np; i++) pmm_unref(g->pg[i]);
@@ -396,6 +400,7 @@ void drm_close(dfd_t* d) {
         if (crtc.cur_gem == h) { crtc.cur_gem = 0; if (be == 1) vg_cursor(0, 0, 0, 0, 0); }
         gem_free(h);
     }
+    if (d->ctx) vg_ctx_destroy(d->ctx);
     if (flip.fd == d) flip.pending = false;
     for (int i = 0; i < 8; i++) if (vbl[i].fd == d) vbl[i].fd = NULL;
     if (master == d) { master = NULL; release(); }
@@ -417,6 +422,7 @@ int drm_read(dfd_t* d, char* buf, uint32_t n) {
 
 int drm_mmap(dfd_t* d, uint64_t pd, uint64_t va, uint64_t len, uint64_t off, bool rw) {
     uint32_t h = off / GEM_SLOT, in = off % GEM_SLOT;
+    if (d->dma) { h = d->dma; in = off; }
     gem_t* g = gem_get(d, h);
     if (!g || in >= g->size) return -EINVAL;
     for (uint32_t k = 0; k < len / 4096 && in / 4096 + k < (uint32_t)g->np; k++)
@@ -527,7 +533,7 @@ static int io_cap(s_cap* c) {
         case 2: c->val = 1; break;                 /* vblank high crtc */
         case 3: c->val = 24; break;
         case 4: c->val = 0; break;
-        case 5: c->val = 0; break;                 /* prime */
+        case 5: c->val = be == 1 && vg_virgl() ? 3 : 0; break;   /* prime */
         case 6: c->val = 1; break;                 /* monotonic timestamps */
         case 7: c->val = 0; break;
         case 8: case 9: c->val = be == 1 ? 64 : 0; break;
@@ -960,6 +966,184 @@ static int io_gemclose(dfd_t* d, uint32_t h) {
     return 0;
 }
 
+typedef struct { uint32_t flags, size; uint64_t cmd, bos; uint32_t nbo; int32_t fence_fd; } s_exec;
+typedef struct { uint32_t target, fmt, bind, w, h, depth, array, last, ns, flags, bo, res, size, stride; } s_vcreate;
+typedef struct { uint32_t bo, pad; uint64_t off; uint32_t level, stride, lstride, box[6]; } s_vxfer;
+
+static int ctx_get(dfd_t* d) {
+    if (d->ctx) return 0;
+    uint32_t c = ctx_next++;
+    if (vg_ctx_create(c) < 0) return -ENOMEM;
+    d->ctx = c;
+    return 0;
+}
+
+static int gem_alloc(dfd_t* d, uint32_t size, uint32_t* out) {
+    uint32_t h;
+    for (h = 1; h < MAXGEM; h++) if (!gems[h].pg) break;
+    if (h == MAXGEM) return -ENOMEM;
+    gem_t* g = &gems[h];
+    memset(g, 0, sizeof *g);
+    g->size = (size + 4095) & ~4095u;
+    g->np = (int)(g->size / 4096);
+    g->pg = kmalloc((size_t)g->np * sizeof(uintptr_t));
+    if (!g->pg) return -ENOMEM;
+    for (int i = 0; i < g->np; i++) {
+        uint32_t fr = pmm_alloc();
+        if (!fr) { g->np = i; gem_free(h); return -ENOMEM; }
+        g->pg[i] = fr;
+    }
+    g->owner = d;
+    *out = h;
+    return 0;
+}
+
+static int io_vcreate(dfd_t* d, s_vcreate* c) {
+    uint32_t h;
+    if (!c->size) return -EINVAL;
+    int r = gem_alloc(d, c->size, &h);
+    if (r < 0) return r;
+    gem_t* g = &gems[h];
+    g->res = 100 + h * 2;
+    g->root = h; resref[h] = 1;
+    g->w = c->w; g->h = c->h; g->pitch = c->stride;
+    uint32_t p[10] = { c->target, c->fmt, c->bind, c->w, c->h, c->depth, c->array, c->last, c->ns, c->flags };
+    if (vg_create3d(g->res, p) < 0 || vg_attach(g->res, g->pg, g->np) < 0) {
+        vg_unref(g->res);
+        g->res = 0;
+        gem_free(h);
+        return -ENOMEM;
+    }
+    c->bo = h; c->res = g->res; c->size = g->size;
+    return 0;
+}
+
+static int io_vxfer(dfd_t* d, s_vxfer* t, bool to) {
+    gem_t* g = gem_get(d, t->bo);
+    if (!g || !g->res) return -ENOENT;
+    if (ctx_get(d) < 0) return -ENOMEM;
+    vg_ctx_attach(d->ctx, g->res);
+    return vg_xfer3d(d->ctx, g->res, to, t->box, t->off, t->level, t->stride, t->lstride) < 0 ? -EINVAL : 0;
+}
+
+static int io_exec(dfd_t* d, s_exec* e) {
+    if (!e->size || e->size > (1u << 20)) return -EINVAL;
+    U(PTR(e->cmd), e->size);
+    if (ctx_get(d) < 0) return -ENOMEM;
+    if (e->nbo) {
+        U(PTR(e->bos), e->nbo * 4);
+        uint32_t* bo = PTR(e->bos);
+        for (uint32_t i = 0; i < e->nbo; i++) {
+            gem_t* g = gem_get(d, bo[i]);
+            if (!g || !g->res) return -ENOENT;
+            vg_ctx_attach(d->ctx, g->res);
+        }
+    }
+    uint8_t* b = kmalloc(e->size);
+    if (!b) return -ENOMEM;
+    memcpy(b, PTR(e->cmd), e->size);
+    int r = vg_submit(d->ctx, b, e->size);
+    kfree(b);
+    e->fence_fd = -1;
+    return r < 0 ? -EINVAL : 0;
+}
+
+/* a = cap_set_id, cap_set_ver, addr (u64), size */
+static int io_caps(uint32_t* a) {
+    uint32_t n = vg_ncaps(), id = 0, ver = 0, sz = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (vg_capset_info(i, &id, &ver, &sz) < 0) continue;
+        if (id == a[0] && ver >= a[1]) break;
+        sz = 0;
+    }
+    if (!sz) return -EINVAL;
+    uint8_t* b = kmalloc(sz);
+    if (!b) return -ENOMEM;
+    if (vg_capset(a[0], a[1], b, sz) < 0) { kfree(b); return -EINVAL; }
+    uint32_t out = a[4];
+    uint64_t addr = *(uint64_t*)(a + 2);
+    if (out > sz) out = sz;
+    if (!user_ok(PTR(addr), out)) { kfree(b); return -EFAULT; }
+    memcpy(PTR(addr), b, out);
+    kfree(b);
+    return 0;
+}
+
+static int io_virtgpu(dfd_t* d, int n, void* arg) {
+    uint32_t* a = arg;
+    uint64_t* q = arg;
+    switch (n) {
+    case 0:                                           /* map */
+        if (!gem_get(d, a[0])) return -ENOENT;
+        q[1] = (uint64_t)a[0] * GEM_SLOT;
+        return 0;
+    case 1: return io_exec(d, arg);
+    case 2: {                                         /* getparam */
+        uint64_t v = 0;
+        if (q[0] == 1 || q[0] == 2) v = 1;
+        else if (q[0] == 7) v = 6;
+        else return -EINVAL;
+        U(PTR(q[1]), 8);
+        *(uint64_t*)PTR(q[1]) = v;
+        return 0;
+    }
+    case 3: return io_vcreate(d, arg);
+    case 4: {                                         /* resource_info */
+        gem_t* g = gem_get(d, a[0]);
+        if (!g || !g->res) return -ENOENT;
+        a[1] = g->res; a[2] = g->size; a[3] = 0;
+        return 0;
+    }
+    case 5: return io_vxfer(d, arg, false);
+    case 6: return io_vxfer(d, arg, true);
+    case 7: return gem_get(d, a[0]) ? 0 : -ENOENT;    /* wait, nothing is async here */
+    case 8: return io_caps(arg);
+    }
+    return -ENOTTY;
+}
+
+/* prime: the dma-buf fd is a render fd that owns one copy of the gem. mesa
+   only imports into the same driver so this is enough */
+static uint32_t gem_dup(dfd_t* to, uint32_t src) {
+    uint32_t h;
+    gem_t* s = &gems[src];
+    for (h = 1; h < MAXGEM; h++) if (!gems[h].pg) break;
+    if (h == MAXGEM) return 0;
+    gem_t* g = &gems[h];
+    *g = *s;
+    g->pg = kmalloc((size_t)s->np * sizeof(uintptr_t));
+    if (!g->pg) { memset(g, 0, sizeof *g); return 0; }
+    for (int i = 0; i < s->np; i++) { g->pg[i] = s->pg[i]; pmm_ref(s->pg[i]); }
+    g->owner = to;
+    g->res_a = 0;
+    if (g->res) resref[g->root]++;
+    return h;
+}
+
+struct drm_fd* drm_prime_export(dfd_t* d, uint32_t handle) {
+    lock();
+    dfd_t* n = NULL;
+    if (gem_get(d, handle)) {
+        n = kmalloc(sizeof *n);
+        if (n) {
+            memset(n, 0, sizeof *n);
+            n->render = true;
+            n->dma = gem_dup(n, handle);
+            if (!n->dma) { kfree(n); n = NULL; }
+        }
+    }
+    unlock();
+    return n;
+}
+
+int drm_prime_import(dfd_t* d, dfd_t* src, uint32_t* handle) {
+    if (!src->dma) return -EINVAL;
+    lock();
+    *handle = gem_dup(d, src->dma);
+    unlock();
+    return *handle ? 0 : -ENOMEM;
+}
+
 int drm_ioctl(dfd_t* d, uint32_t req, void* arg) {
     uint32_t nr = req & 0xff, sz = (req >> 16) & 0x3fff;
     if (((req >> 8) & 0xff) != 'd') return -ENOTTY;
@@ -990,6 +1174,9 @@ int drm_ioctl(dfd_t* d, uint32_t req, void* arg) {
         else { d->master = false; master = NULL; release(); }
         break;
     case 0x3a: r = io_vblank(d, arg); break;
+    case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x46: case 0x47: case 0x48: case 0x49:
+        r = be == 1 && vg_virgl() ? io_virtgpu(d, nr - 0x41, arg) : -ENOTTY;
+        break;
     case 0xa0: r = io_getres(d, arg); break;
     case 0xa1: r = io_getcrtc(arg); break;
     case 0xa2: r = io_setcrtc(d, arg); break;
@@ -1119,6 +1306,7 @@ static void mk_sysfs(void) {
     snprintf(path, sizeof path, "%s/drm/card0/device", dev);
     fs_symlink(fs_resolve(fs_root(), "/sys/devices/pci0000:00/drm0/drm/card0"), "device", "../..");
     fs_symlink(fs_resolve(fs_root(), "/sys/devices/pci0000:00/drm0/drm/renderD128"), "device", "../..");
+    fs_symlink(fs_resolve(fs_root(), "/sys/devices/pci0000:00/drm0"), "subsystem", "../../../bus/pci");
     // connector dir, like card0-Virtual-1
     snprintf(path, sizeof path, "%s/drm/card0/card0-%s-1", dev, be == 1 ? "Virtual" : "VGA");
     mk_dir(path);

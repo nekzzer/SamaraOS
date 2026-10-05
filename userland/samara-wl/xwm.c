@@ -127,6 +127,12 @@ void xwm_surf_commit(struct surf *s) {
     if (w) x_try_map(w);
 }
 
+// surface died before its x window (menus): don't keep pointers to it
+void xwm_surf_gone(struct surf *s) {
+    struct xw *w = s->xwin ? xw_find(s->xwin) : NULL;
+    if (w && w->s == s) { w->s = NULL; w->t = NULL; }
+}
+
 void xwm_resize(struct tl *t, int w, int h) {
     uint32_t v[2] = { w, h };
     xcb_configure_window(xc, t->xwin, XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, v);

@@ -81,7 +81,7 @@ static void out_bind(struct wl_client *c, void *d, uint32_t ver, uint32_t id) {
     wl_resource_set_implementation(r, &out_impl, NULL, NULL);
     wl_output_send_geometry(r, 0, 0, scr_w * 25 / 100, scr_h * 25 / 100, 0, "samara", "de", 0);
     wl_output_send_mode(r, 3, scr_w, scr_h, 60000);
-    if (ver >= 2) { wl_output_send_scale(r, 1); wl_output_send_done(r); }
+    if (ver >= 2) { wl_output_send_scale(r, scale); wl_output_send_done(r); }
 }
 
 /* ---- regions (we never look at them) ---- */
@@ -171,6 +171,7 @@ struct surf *pick(struct tl *t, int x, int y, int *lx, int *ly) {
 
 static void surf_damage(struct surf *s, int x, int y, int w, int h) {
     if (w <= 0 || h <= 0) return;
+    x *= s->k; y *= s->k; w *= s->k; h *= s->k;
     if (s->dx1 <= s->dx0) { s->dx0 = x; s->dy0 = y; s->dx1 = x + w; s->dy1 = y + h; return; }
     if (x < s->dx0) s->dx0 = x;
     if (y < s->dy0) s->dy0 = y;
@@ -196,7 +197,21 @@ static void s_attach(struct wl_client *c, struct wl_resource *r, struct wl_resou
 }
 
 static void s_damage(struct wl_client *c, struct wl_resource *r, int32_t x, int32_t y, int32_t w, int32_t h) {
+    struct surf *s = wl_resource_get_user_data(r);
+    int o = s->k;
+    s->k = scale;     // surface coords are logical
+    surf_damage(s, x, y, w, h);
+    s->k = o;
+}
+
+static void s_dmgbuf(struct wl_client *c, struct wl_resource *r, int32_t x, int32_t y, int32_t w, int32_t h) {
     surf_damage(wl_resource_get_user_data(r), x, y, w, h);
+}
+
+static void s_bscale(struct wl_client *c, struct wl_resource *r, int32_t v) {
+    struct surf *s = wl_resource_get_user_data(r);
+    s->bs = v < 1 ? 1 : v;
+    s->k = scale > s->bs ? scale / s->bs : 1;
 }
 
 static void frame_free(struct wl_resource *r) {
@@ -240,11 +255,12 @@ static void s_commit(struct wl_client *c, struct wl_resource *r) {
     if (s->attached) {
         struct buf *b = s->pend;
         if (b) {
-            bool resized = !s->pix || s->w != b->w || s->h != b->h;
+            int k = s->k;
+            bool resized = !s->pix || s->w != b->w * k || s->h != b->h * k;
             if (resized) {
                 free(s->pix);
-                s->pix = malloc((size_t)b->w * b->h * 4);
-                s->w = b->w; s->h = b->h;
+                s->pix = malloc((size_t)b->w * b->h * k * k * 4);
+                s->w = b->w * k; s->h = b->h * k;
                 s->dx0 = s->dy0 = 0; s->dx1 = s->w; s->dy1 = s->h;
             }
             if (s->dx1 <= s->dx0) { s->dx0 = s->dy0 = 0; s->dx1 = s->w; s->dy1 = s->h; }
@@ -252,9 +268,11 @@ static void s_commit(struct wl_client *c, struct wl_resource *r) {
             if (s->dy0 < 0) s->dy0 = 0;
             if (s->dx1 > s->w) s->dx1 = s->w;
             if (s->dy1 > s->h) s->dy1 = s->h;
-            for (int y = s->dy0; y < s->dy1; y++)
-                memcpy(s->pix + y * s->w + s->dx0, (char *)b->pool->data + b->off + y * b->stride + s->dx0 * 4,
-                       (s->dx1 - s->dx0) * 4);
+            for (int y = s->dy0; y < s->dy1; y++) {
+                uint32_t *src = (uint32_t *)((char *)b->pool->data + b->off + y / k * b->stride);
+                if (k == 1) memcpy(s->pix + y * s->w + s->dx0, src + s->dx0, (s->dx1 - s->dx0) * 4);
+                else for (int x = s->dx0; x < s->dx1; x++) s->pix[y * s->w + x] = src[x / k];
+            }
             s->argb = b->fmt == WL_SHM_FORMAT_ARGB8888;
             s->has_buf = true;
             wl_buffer_send_release(b->res);
@@ -299,7 +317,7 @@ void commit_done(struct surf *s) {
 }
 
 static const struct wl_surface_interface surf_impl = {
-    s_destroy_req, s_attach, s_damage, s_frame, s_noop_reg, s_noop_reg, s_commit, s_noop_i, s_noop_i, s_damage, s_offset
+    s_destroy_req, s_attach, s_damage, s_frame, s_noop_reg, s_noop_reg, s_commit, s_noop_i, s_bscale, s_dmgbuf, s_offset
 };
 
 static void surf_free(struct wl_resource *r) {
@@ -314,12 +332,14 @@ static void surf_free(struct wl_resource *r) {
     wl_list_for_each_safe(f, fn, &s->frames, link) wl_resource_destroy(f->res);
     wl_list_for_each_safe(f, fn, &s->pframes, link) wl_resource_destroy(f->res);
     wl_list_remove(&s->glink);
+    xwm_surf_gone(s);
     free(s->pix);
     free(s);
 }
 
 static void comp_create_surface(struct wl_client *c, struct wl_resource *r, uint32_t id) {
     struct surf *s = calloc(1, sizeof(*s));
+    s->bs = s->k = 1;
     s->cl = c;
     s->res = wl_resource_create(c, &wl_surface_interface, wl_resource_get_version(r), id);
     wl_resource_set_implementation(s->res, &surf_impl, s, surf_free);
@@ -348,7 +368,7 @@ static void sub_destroy(struct wl_client *c, struct wl_resource *r) { wl_resourc
 static void sub_pos(struct wl_client *c, struct wl_resource *r, int32_t x, int32_t y) {
     struct surf *s = wl_resource_get_user_data(r);
     if (!s) return;
-    s->px = x; s->py = y;
+    s->px = x * scale; s->py = y * scale;
 }
 
 static void sub_order(struct wl_client *c, struct wl_resource *r, struct wl_resource *sib) {}
@@ -386,6 +406,9 @@ static void subc_bind(struct wl_client *c, void *d, uint32_t ver, uint32_t id) {
 void tl_open(struct tl *t) {
     // wl-copy has a 1x1 window, kernel wants 16 at least
     uopen_t o = { t->s->w < 16 ? 16 : t->s->w, t->s->h < 16 ? 16 : t->s->h, 1, F_WL, (uint64_t)(uintptr_t)t->title };
+    int ww = o.w, hh = o.h;
+    if (o.w > scr_w - 8) o.w = scr_w - 8;
+    if (o.h > scr_h - 80) o.h = scr_h - 80;
     long h = sm(OP_OPEN, (long)&o, 0, 0);
     if (h < 0) { fprintf(stderr, "samara-wl: window open failed %ld\n", h); return; }
     t->h = h;
@@ -393,6 +416,7 @@ void tl_open(struct tl *t) {
     t->pix = calloc((size_t)t->cw * t->ch, 4);
     compose(t, 0, 0, t->cw, t->ch);
     present(t);
+    if (!t->xwin && (o.w != ww || o.h != hh)) xdg_top_configure(t, o.w, o.h);
 }
 
 void tl_resized(struct tl *t, int cw, int ch) {

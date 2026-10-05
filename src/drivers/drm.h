@@ -16,6 +16,8 @@ int   drm_ioctl(struct drm_fd* d, uint32_t req, void* arg);
 bool  drm_readable(struct drm_fd* d);
 int   drm_read(struct drm_fd* d, char* buf, uint32_t n);
 int   drm_mmap(struct drm_fd* d, uint64_t pd, uint64_t va, uint64_t len, uint64_t off, bool rw);
+struct drm_fd* drm_prime_export(struct drm_fd* d, uint32_t handle);
+int   drm_prime_import(struct drm_fd* d, struct drm_fd* src, uint32_t* handle);
 bool  drm_active(void);                     /* a client drives the screen */
 
 /* virtio-gpu backed console framebuffer for gfx.c (NULL when there is no gpu) */
