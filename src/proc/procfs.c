@@ -331,6 +331,13 @@ static void fill_globals(char* mem, uint32_t cap) {
         sb_num(&b, rx); sb_puts(&b, " 0 0 0 0 0 0 0 "); sb_num(&b, tx); sb_puts(&b, " 0 0 0 0 0 0\n");
     }
     put(nd, "dev", &b);
+
+    fs_node_t* sn = ensure(proc_root, "sys", FS_DIR, 0555);
+    if (sn && (sn = ensure(sn, "net", FS_DIR, 0555)) && (sn = ensure(sn, "ipv4", FS_DIR, 0555))) {
+        b = (sb_t){ mem, 0, cap };
+        sb_puts(&b, "0\t2147483647\n");
+        put(sn, "ping_group_range", &b);
+    }
 }
 
 /* ---------------- refresh ---------------- */
