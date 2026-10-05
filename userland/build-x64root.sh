@@ -6,14 +6,15 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 D=$ROOT/build/x64root
 IMG=${1:-$ROOT/build/root-x64.img}
 SIZE=${SIZE:-4G}
-REPO=${REPO:-https://repo-default.voidlinux.org/current/musl}
+REPO=${REPO:-https://repo-fastly.voidlinux.org/current/musl}
 PKGS="base-files musl busybox coreutils findutils grep sed gawk tar gzip xz bash dash xbps \
       ca-certificates openssl curl wget nano htop dropbear openssh iproute2 file less \
       ncurses-base ncurses procps-ng util-linux shadow iputils \
       wayland libxkbcommon xkeyboard-config foot xterm xorg-server-xwayland \
       font-misc-misc dejavu-fonts-ttf fontconfig \
       mesa-dri mesa-demos xclock xeyes xcalc xev xclip xsel xdotool wl-clipboard wayland-utils \
-      xcursor-themes adwaita-icon-theme gtk+3-demo"
+      xcursor-themes adwaita-icon-theme gtk+3-demo \
+      alsa-utils alsa-lib mpg123 mpv SDL2"
 
 # everything inside a user namespace: files end up owned by root:root without sudo
 if [ -z "$IN_NS" ]; then

@@ -110,6 +110,8 @@ KERN_SRC := \
     src/apps/pterm.c \
     src/apps/imgdec.c \
     src/drivers/sb16.c \
+    src/drivers/hda.c \
+    src/drivers/snd.c \
     src/apps/wav.c \
     src/apps/synth.c \
     src/apps/embed.c \

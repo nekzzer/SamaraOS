@@ -12,6 +12,7 @@
 #include "net/sock.h"
 #include "drivers/fbdev.h"
 #include "drivers/drm.h"
+#include "drivers/snd.h"
 #include "drivers/input.h"
 
 #define O_ACCMODE  3
@@ -61,6 +62,15 @@ file_t* file_open_node(fs_node_t* n, int flags) {
         if (!f) { drm_close(d); return NULL; }
         f->drm = d;
         f->disk = n->dev == FS_DEV_DRMR;
+        return f;
+    }
+    if (n->dev == FS_DEV_SNDC || n->dev == FS_DEV_SNDP) {
+        struct snd_fd* s = snd_open(n->dev == FS_DEV_SNDP);
+        if (!s) return NULL;
+        file_t* f = file_new(F_SND, flags);
+        if (!f) { snd_close(s); return NULL; }
+        f->snd = s;
+        f->disk = n->dev == FS_DEV_SNDP;
         return f;
     }
     if (n->dev == FS_DEV_PTMX) {                               /* new pty pair */
@@ -125,6 +135,7 @@ void file_close(file_t* f) {
     if (f->type == F_SOCKET && f->sock) sock_close(f->sock);
     if (f->type == F_FB) fbdev_close();
     if (f->type == F_DRM) drm_close(f->drm);
+    if (f->type == F_SND) snd_close(f->snd);
     if (f->type == F_INPUT) input_close(f->disk);
     if (f->type == F_PTM) pty_master_close(f->pty);
     if (f->type == F_PTS) pty_slave_close(f->pty);
@@ -295,6 +306,7 @@ bool file_readable(file_t* f) {
         case F_USOCK:  return false;
         case F_INPUT:  return input_pending(f->disk);
         case F_DRM:    return drm_readable(f->drm);
+        case F_SND:    return false;
         case F_PTM:    return pty_readable(f->pty, true);
         case F_PTS:    return pty_readable(f->pty, false);
         default:       return true;
@@ -306,6 +318,7 @@ bool file_writable(file_t* f) {
     if (f->type == F_SOCKET) return sock_writable(f->sock);
     if (f->type == F_SPAIR) return (f->shut & 2) || f->pipe2->count < PIPE_SZ || f->pipe2->readers <= 0;
     if (f->type == F_PTM || f->type == F_PTS) return pty_writable(f->pty, f->type == F_PTM);
+    if (f->type == F_SND) return snd_writable(f->snd);
     if (f->type == F_USOCK || f->type == F_ULISTEN) return false;
     return f->type != F_PIPE_R;
 }
@@ -446,7 +459,7 @@ int file_read(file_t* f, char* buf, uint32_t n) {
         case F_PTM: case F_PTS:
             return pty_read(f->pty, f->type == F_PTM, buf, (int)n, (f->flags & O_NONBLOCK) != 0);
         case F_DISK: return disk_rw(f, buf, n, false);
-        case F_FB:   return -EBADF;
+        case F_FB: case F_SND: return -EBADF;
         case F_DRM:
             while (!drm_readable(f->drm)) {
                 if (f->flags & O_NONBLOCK) return -11;
@@ -496,6 +509,7 @@ int file_write(file_t* f, const char* buf, uint32_t n) {
         case F_PTM: case F_PTS:
             return pty_write(f->pty, f->type == F_PTM, buf, (int)n, (f->flags & O_NONBLOCK) != 0);
         case F_DISK: return disk_rw(f, (char*)buf, n, true);
+        case F_SND: return -EBADF;                    /* ioctl only */
         case F_INPUT: return (int)n;                  /* LED events from xorg: nothing to light */
         case F_FB: {
             int r = fbdev_write(f->off, buf, n);

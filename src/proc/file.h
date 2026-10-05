@@ -13,7 +13,7 @@ typedef enum { F_NODE = 1, F_TTY, F_PIPE_R, F_PIPE_W, F_NULL, F_ZERO, F_RANDOM, 
                F_NETLINK,                          /* AF_NETLINK, the answer waits in pipe */
                F_USOCK, F_ULISTEN,                 /* AF_UNIX not connected yet / listening (ux) */
                F_EPOLL,
-               F_EVENTFD, F_TIMERFD, F_DRM, F_SIGNALFD,
+               F_EVENTFD, F_TIMERFD, F_DRM, F_SIGNALFD, F_SND,
                F_URING } ftype_t;
 
 #define PIPE_SZ 65536           /* was 8k, x11 images through a socketpair crawled */
@@ -38,6 +38,7 @@ typedef struct file {
     pipe_t*    pipe;
     pipe_t*    pipe2;       /* F_SPAIR: transmit direction */
     int        shut;        /* F_SPAIR: 1 = rx shut, 2 = tx shut */
+    struct snd_fd* snd;     /* F_SND */
     struct drm_fd* drm;     /* F_DRM, disk = 1 for renderD128 */
     int        disk;        /* F_DISK: ata index */
     struct sock* sock;      /* F_SOCKET */

@@ -30,6 +30,8 @@
 #include "drivers/ahci.h"
 #include "apps/doom.h"
 #include "drivers/sb16.h"
+#include "drivers/hda.h"
+#include "drivers/snd.h"
 #include "apps/synth.h"
 #include "apps/embed.h"
 #include "core/clock.h"
@@ -405,9 +407,14 @@ void kmain(uint32_t magic, uint32_t mb_info_addr) {
     if (sb16_init()) vga_printf("ok (DSP %u.%u)\n", 0u, 0u); /* version not pretty-printed here */
     else             vga_printf("%s\n", sb16_status());
 
+    boot_step("hda");
+    if (hda_init()) vga_printf("ok\n");
+    else vga_printf("%s\n", hda_status());
+
     boot_step("usb");
     usb_init();
     drm_init();
+    snd_init();
     boot_done("uhci (polled)");
 
     BOOT_OK("synth wavs", synth_install_demo_wavs());
