@@ -557,7 +557,7 @@ void sock_init(void) { task_spawn("netd", netd); }
         while (!(cond)) {                                          \
             if (nonblock) return -EAGAIN;                          \
             if (proc_interrupted()) return -EINTR;                 \
-            task_yield();                                          \
+            task_wait_io(2);                                       \
             pump();                                                \
         }                                                          \
     } while (0)
@@ -631,7 +631,7 @@ sock_t* sock_accept(sock_t* s, bool nonblock, int* err, uint8_t* ip, uint16_t* p
     while (!s->aq_n) {
         if (nonblock) { *err = -EAGAIN; return NULL; }
         if (proc_interrupted()) { *err = -EINTR; return NULL; }
-        task_yield();
+        task_wait_io(2);
         pump();
     }
     sock_t* c = s->acceptq[0];
@@ -676,7 +676,7 @@ int sock_connect(sock_t* s, const uint8_t* ip, uint16_t port, bool nonblock) {
     pump();
     while (s->state == S_SYN_SENT) {
         if (proc_interrupted()) return -EINTR;
-        task_yield();
+        task_wait_io(2);
         pump();
     }
     if (s->state == S_ESTABLISHED || s->state == S_CLOSE_WAIT) return 0;
@@ -745,7 +745,7 @@ int sock_send(sock_t* s, const uint8_t* buf, uint32_t len, bool nonblock,
         if (!room) {
             if (nonblock) return done ? (int)done : -EAGAIN;
             if (proc_interrupted()) return done ? (int)done : -EINTR;
-            task_yield();
+            task_wait_io(2);
             pump();
             continue;
         }

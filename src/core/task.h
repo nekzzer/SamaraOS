@@ -30,6 +30,7 @@ typedef struct task {
     volatile int  on_cpu;      /* some cpu runs on this stack (or is still leaving it) */
     int           cpu;         /* the one that ran it last */
     int           ysw;         /* last yield went to somebody else */
+    volatile int  io_wait;     /* blocked in task_wait_io, io_wake lets it go early */
 } task_t;
 
 /* Frame built by every entry path (isr stubs, syscall_entry, see boot/entry.S),
@@ -52,6 +53,8 @@ int   task_spawn_frame(const char* name, uint8_t* stack, uint32_t stack_size,
 void  task_exit(void);
 void  task_yield(void);
 void  task_sleep_ms(uint32_t ms);   /* kernel tasks: give up the CPU for a while */
+void  task_wait_io(uint32_t ms);    /* sleep until io_wake() or ms passed */
+void  io_wake(void);                /* something readable/writable/closed happened, poll again */
 task_t* task_current(void);
 void  task_ready(task_t* t);        /* blocked -> ready, wakes a parked cpu */
 regs_t* task_reap(regs_t* f);        /* dead task in ring 3: send the cpu elsewhere */

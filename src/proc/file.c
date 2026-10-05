@@ -120,6 +120,7 @@ void file_close(file_t* f) {
         else                     f->pipe->writers--;
         if (f->pipe->readers <= 0 && f->pipe->writers <= 0) kfree(f->pipe);
     }
+    if (f->type != F_NODE) io_wake();     // hup for whoever polls the other end
     kfree(f);
 }
 
@@ -295,7 +296,7 @@ static int pipe_read(file_t* f, pipe_t* p, char* buf, uint32_t n) {
         if (p->writers <= 0) return 0;
         if (f->flags & O_NONBLOCK) return -EAGAIN;
         if (proc_interrupted()) return -EINTR;
-        task_yield();
+        task_wait_io(20);
     }
     uint32_t got = 0;
     while (got < n && p->count > 0) {                /* at most two runs around the ring */
@@ -321,7 +322,7 @@ static int pipe_write(file_t* f, pipe_t* p, const char* buf, uint32_t n) {
         if (p->count == PIPE_SZ) {
             if (f->flags & O_NONBLOCK) return put ? (int)put : -EAGAIN;
             if (proc_interrupted()) return put ? (int)put : -EINTR;
-            task_yield();
+            task_wait_io(20);
             continue;
         }
         uint32_t k = PIPE_SZ - (uint32_t)p->head, room = PIPE_SZ - (uint32_t)p->count;

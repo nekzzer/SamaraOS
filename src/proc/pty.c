@@ -275,7 +275,7 @@ int pty_read(int i, bool master, char* buf, int n, bool nonblock) {
             if (p->slave_seen && p->srefs <= 0) return -EIO;   /* shell gone */
             if (nonblock) return -EAGAIN;
             if (proc_interrupted()) return -EINTR;
-            task_sleep_ms(2);
+            task_wait_io(10);
         }
     }
     /* slave */
@@ -302,7 +302,7 @@ int pty_read(int i, bool master, char* buf, int n, bool nonblock) {
             if (pit_uptime_ms() - start >= tmo) return 0;
         }
         if (proc_interrupted()) return -EINTR;
-        task_sleep_ms(2);                                 /* idle shells used to spin here */
+        task_wait_io(10);                                 /* idle shells used to spin here */
     }
 }
 
@@ -326,8 +326,9 @@ int pty_write(int i, bool master, const char* buf, int n, bool nonblock) {
         if (done == n) break;
         if (nonblock) return done ? done : -EAGAIN;
         if (proc_interrupted()) return done ? done : -EINTR;
-        task_yield();
+        task_wait_io(10);
     }
+    io_wake();
     return done;
 }
 

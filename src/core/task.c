@@ -320,6 +320,32 @@ void task_sleep_ms(uint32_t ms) {
     irq_restore(f);
 }
 
+// poll/pipe/pty/socket waiters sleep here instead of 1ms naps or yield spins.
+// the ms is only for things nobody calls io_wake for (nic rx, timers, input irqs)
+void task_wait_io(uint32_t ms) {
+    uint32_t f = irq_save();
+    task_t* t = task_current();
+    if (t->id != 0) {
+        t->io_wait = 1;
+        t->wake_ms = pit_uptime_ms() + (ms ? ms : 1);
+        t->state = T_BLOCKED;
+        while (t->state == T_BLOCKED) task_yield();
+        t->io_wait = 0;
+    } else {
+        task_yield();
+    }
+    irq_restore(f);
+}
+
+void io_wake(void) {
+    uint32_t f = irq_save();
+    int woke = 0;
+    for (int i = 0; i < n_tasks; i++)
+        if (tasks[i].io_wait && tasks[i].state == T_BLOCKED) { tasks[i].wake_ms = 0; tasks[i].state = T_READY; woke++; }
+    if (woke) kick_idle();
+    irq_restore(f);
+}
+
 void task_install_timer(void) {
     if (apic_on) idt_set_sched(VEC_TIMER, schedule);
     else idt_set_sched(0x20, schedule);
