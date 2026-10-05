@@ -139,6 +139,16 @@ What X needed from the kernel: named AF_UNIX sockets with `SCM_RIGHTS`,
 `epoll`, `mmap` of the framebuffer, `FBIOPUT_VSCREENINFO`,
 `/sys/class/graphics/fb0`, SysV shm for MIT-SHM, evdev ioctls.
 
+## Wayland
+
+`desktop` in the shell now starts `/usr/bin/samara-wl` (source in
+`userland/samara-wl/`), a small Wayland compositor on top of the DE: each
+toplevel is a uwin window. Wayland clients (`foot`) connect to
+`$XDG_RUNTIME_DIR/wayland-0`, X11 apps (`xterm`) go through a rootless
+Xwayland that samara-wl manages as its WM. Menu has XTerm and Foot entries.
+Known gaps: shm only, no dmabuf/GL, no clipboard, no popups positioning
+beyond the basics.
+
 ## Kernel
 
 **Boot and CPU**
