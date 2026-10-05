@@ -18,6 +18,9 @@ void be_fill(int x, int y, int w, int h, uint32_t c) { sm_rect(W, x, y, w, h, c)
 void be_line(int x0, int y0, int x1, int y1, uint32_t c) { sm_line(W, x0, y0, x1, y1, c); }
 int be_text_w(const char *s, int font) { return sm_text_w(s, font == F_MONO ? SM_FONT_MONO : font); }
 int be_font_h(int font) { return sm_font_h(font == F_MONO ? SM_FONT_MONO : font); }
+void be_dnd_set(const char *s, int n) { sm_dnd_set(s, n); }
+int be_dnd_get(char *b, int cap) { return sm_dnd_get(b, cap); }
+void be_clip_set(const char *s, int n) { sm_clip_set(s, n); }
 int be_flip(void) { return sm_present(W); }
 
 void be_text(int x, int y, const char *s, uint32_t c, int font) {
@@ -75,7 +78,12 @@ static int xlat_key(int ch, int mods) {
         if (ch == 0x94) return FK_F5;
         return 0;
     }
-    if (ch >= 0x80) return cp866_uni(ch);
+    if (ch >= 0x80) {
+        int u = cp866_uni(ch);
+        // ctrl+cyrillic -> same physical key on latin layout, so hotkeys work on ru
+        if ((mods & MOD_CTRL) && u >= 0x430 && u <= 0x44F) return "f,dult;pbqrkvyjghcnea[wxio]sm'.z"[u - 0x430];
+        return u;
+    }
     if (ch == '\n') return FK_ENTER;
     if (ch == 0x1B) return FK_ESC;
     if (ch == '\t') return FK_TAB;
@@ -106,6 +114,7 @@ int be_wait(FmEv *e, int ms) {
         case SM_EV_MOUSE_UP: e->type = EV_UP; e->c = 1; return 1;
         case SM_EV_MOUSE_MOVE: e->type = EV_MOVE; return 1;
         case SM_EV_WHEEL: e->type = EV_WHEEL; return 1;
+        case SM_EV_DROP: e->type = EV_DROP; return 1;
         case SM_EV_RESIZE:
             if (sm_resize(W, s.a, s.b) < 0) continue;
             e->type = EV_RESIZE;

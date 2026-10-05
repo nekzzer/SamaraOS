@@ -48,7 +48,7 @@ enum { M_BROWSE, M_TEXT, M_IMG, M_HEX };
 enum { MD_NONE, MD_CONFIRM, MD_INPUT, MD_PROPS, MD_MSG, MD_PROG };
 enum { IA_RENAME = 1, IA_NEWDIR, IA_NEWFILE };
 enum { A_OPEN = 1, A_CUT, A_COPY, A_PASTE, A_RENAME, A_DELETE, A_NEWDIR, A_NEWFILE, A_PROPS,
-       A_SNAME, A_SSIZE, A_SDATE, A_VIEW, A_HIDDEN, A_REFRESH };
+       A_SNAME, A_SSIZE, A_SDATE, A_VIEW, A_HIDDEN, A_REFRESH, A_CPATH };
 
 typedef struct {
     char name[256];
@@ -93,7 +93,12 @@ static int bx_ok[4], bx_cancel[4];
 static MI menu[20];
 static int n_menu, menu_x, menu_y, menu_hot = -1, menu_on;
 
+static Edit flt;
+static int flt_on;
+static char tabs[8][1024];
+static int ntabs = 1, tab_cur;
 static int click_idx = -1;
+static int drag_i = -1, drag_x, drag_y, drag_on;
 static uint32_t click_ms;
 static int rb_on, rb_x0, rb_y0, rb_x1, rb_y1;
 static int sb_drag;
@@ -339,6 +344,7 @@ static void load_dir(void) {
         char p[1024];
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
         if (de->d_name[0] == '.' && !show_hid) continue;
+        if (flt.len && !strcasestr(de->d_name, flt.buf)) continue;
         join(p, cwd, de->d_name);
         if (lstat(p, &ls) < 0) continue;
         st = ls;
@@ -414,7 +420,8 @@ static void go_hist(int d) {
 }
 
 static int cont_x(void) { return SB_W + 1; }
-static int cont_y(void) { return TB_H + (grid ? 0 : HDR_H); }
+static int tabs_h(void) { return ntabs > 1 ? 26 : 0; }
+static int cont_y(void) { return TB_H + tabs_h() + (grid ? 0 : HDR_H); }
 static int cont_w(void) { return be_w() - SB_W - 1; }
 static int cont_h(void) { return be_h() - ST_H - cont_y(); }
 static int cols(void) { int c = (cont_w() - SCR_W) / CELL_W; return c < 1 ? 1 : c; }
@@ -1379,6 +1386,72 @@ static void draw_sidebar(void) {
     }
 }
 
+/* thumbnails for the icon view: one worker at a time, 48px, small files only */
+typedef struct { char path[1024]; time_t mt; uint32_t *px; int w, h; volatile int state; } Th;
+static Th thumbs[64];
+static int th_rr, th_busy;
+
+static void *th_run(void *a) {
+    Th *t = a;
+    struct stat st;
+    int fd = open(t->path, O_RDONLY), w = 0, h = 0;
+    uint8_t *b = 0;
+    uint32_t *px = 0;
+    if (fd < 0) goto fail;
+    if (fstat(fd, &st) || st.st_size <= 0 || st.st_size > (3 << 20)) { close(fd); goto fail; }
+    b = malloc(st.st_size);
+    if (!b || read(fd, b, st.st_size) != st.st_size) { close(fd); goto fail; }
+    close(fd);
+    if (img_peek(b, st.st_size, &w, &h) && (w * (long long)h > 8000000)) goto fail;
+    pthread_mutex_lock(&dec_mx);
+    px = load_pnm_bmp(b, st.st_size, &w, &h);
+    if (!px) px = img_decode(b, st.st_size, &w, &h);
+    pthread_mutex_unlock(&dec_mx);
+    if (!px) goto fail;
+    px = shrink_px(px, &w, &h, 48);
+    t->px = px; t->w = w; t->h = h;
+    free(b);
+    __sync_synchronize();
+    t->state = 2;
+    th_busy = 0;
+    return 0;
+fail:
+    free(b);
+    t->state = 3;
+    th_busy = 0;
+    return 0;
+}
+
+static Th *th_get(int i, int start) {
+    Th *t;
+    char p[1024];
+    int k;
+    join(p, cwd, ents[i].name);
+    for (k = 0; k < 64; k++) {
+        t = &thumbs[k];
+        if (t->state && !strcmp(t->path, p) && t->mt == ents[i].mtime) return t;
+    }
+    if (!start || th_busy || ents[i].size > (3 << 20)) return 0;
+    for (k = 0; k < 64; k++) {
+        t = &thumbs[(th_rr + k) % 64];
+        if (t->state != 1) break;
+    }
+    if (t->state == 1) return 0;
+    th_rr = (th_rr + k + 1) % 64;
+    free(t->px);
+    t->px = 0;
+    strcpy(t->path, p);
+    t->mt = ents[i].mtime;
+    t->state = 1;
+    th_busy = 1;
+    {
+        pthread_t id;
+        if (pthread_create(&id, 0, th_run, t)) { t->state = 3; th_busy = 0; return 0; }
+        pthread_detach(id);
+    }
+    return t;
+}
+
 static void draw_item(int i, int sx, int sy, int w, int h) {
     Ent *e = &ents[i];
     char t[300], b[64];
@@ -1388,7 +1461,11 @@ static void draw_item(int i, int sx, int sy, int w, int h) {
     else if (hot) be_fill(sx, sy, w, h, HOVER);
     if (i == cur) frame(sx, sy, w, h, e->sel ? ACC : FAINT);
     if (grid) {
-        ico(e->kind, sx + (w - 48) / 2, sy + 6, 48);
+        {
+            Th *t = e->kind == K_IMG ? th_get(i, 0) : 0;
+            if (t && t->state == 2) be_blit(sx + (w - t->w) / 2, sy + 6 + (48 - t->h) / 2, t->w, t->h, t->px, t->w, t->h);
+            else ico(e->kind, sx + (w - 48) / 2, sy + 6, 48);
+        }
         fit(e->name, w - 6, F_SMALL, t, sizeof t);
         be_text(sx + (w - be_text_w(t, F_SMALL)) / 2, sy + 62, t, col, F_SMALL);
         return;
@@ -1415,19 +1492,19 @@ static void draw_list_head(void) {
     int W = cont_w() - SCR_W, x = cont_x(), dx = x + W - 12;
     static const char *names[] = { "Name", "Size", "Modified" };
     char t[40];
-    be_fill(x, TB_H, cont_w(), HDR_H, BG2);
-    be_fill(x, TB_H + HDR_H - 1, cont_w(), 1, RULE);
-    be_text(x + 44, TB_H + (HDR_H - fh_small) / 2, "Name", sort_key == S_NAME ? INK : DIM, F_SMALL);
-    if (sort_key == S_NAME) be_text(x + 44 + be_text_w("Name", F_SMALL) + 6, TB_H + (HDR_H - fh_small) / 2, sort_rev ? "v" : "^", ACC, F_SMALL);
-    if (W > 560) { dx -= 100; be_text(dx, TB_H + (HDR_H - fh_small) / 2, "Rights", DIM, F_SMALL); }
+    be_fill(x, (TB_H + tabs_h()), cont_w(), HDR_H, BG2);
+    be_fill(x, (TB_H + tabs_h()) + HDR_H - 1, cont_w(), 1, RULE);
+    be_text(x + 44, (TB_H + tabs_h()) + (HDR_H - fh_small) / 2, "Name", sort_key == S_NAME ? INK : DIM, F_SMALL);
+    if (sort_key == S_NAME) be_text(x + 44 + be_text_w("Name", F_SMALL) + 6, (TB_H + tabs_h()) + (HDR_H - fh_small) / 2, sort_rev ? "v" : "^", ACC, F_SMALL);
+    if (W > 560) { dx -= 100; be_text(dx, (TB_H + tabs_h()) + (HDR_H - fh_small) / 2, "Rights", DIM, F_SMALL); }
     dx -= 140;
     if (W > 400) {
         sprintf(t, "%s%s", names[2], sort_key == S_DATE ? (sort_rev ? " v" : " ^") : "");
-        be_text(dx, TB_H + (HDR_H - fh_small) / 2, t, sort_key == S_DATE ? INK : DIM, F_SMALL);
+        be_text(dx, (TB_H + tabs_h()) + (HDR_H - fh_small) / 2, t, sort_key == S_DATE ? INK : DIM, F_SMALL);
     }
     dx -= 90;
     sprintf(t, "%s%s", names[1], sort_key == S_SIZE ? (sort_rev ? " v" : " ^") : "");
-    be_text(dx + 80 - be_text_w(t, F_SMALL), TB_H + (HDR_H - fh_small) / 2, t, sort_key == S_SIZE ? INK : DIM, F_SMALL);
+    be_text(dx + 80 - be_text_w(t, F_SMALL), (TB_H + tabs_h()) + (HDR_H - fh_small) / 2, t, sort_key == S_SIZE ? INK : DIM, F_SMALL);
 }
 
 /* which column header is at x (list view) */
@@ -1440,6 +1517,51 @@ static int head_hit(int px) {
     if (px >= dx - 6 && px < dx + 84) return S_SIZE;
     if (px < dx - 6) return S_NAME;
     return -1;
+}
+
+static void tab_go(int n) {
+    if (n < 0 || n >= ntabs || n == tab_cur) return;
+    strcpy(tabs[tab_cur], cwd);
+    tab_cur = n;
+    flt_on = 0; flt.len = flt.pos = 0; flt.buf[0] = 0;
+    enter_dir(tabs[n], 0);
+}
+
+static void tab_new(void) {
+    if (ntabs >= 8) return;
+    strcpy(tabs[ntabs], cwd);
+    strcpy(tabs[tab_cur], cwd);
+    tab_cur = ntabs++;
+    dirty = 1;
+    clamp_scroll();
+}
+
+static void tab_close(void) {
+    int i;
+    if (ntabs < 2) return;
+    for (i = tab_cur; i < ntabs - 1; i++) strcpy(tabs[i], tabs[i + 1]);
+    ntabs--;
+    if (tab_cur >= ntabs) tab_cur = ntabs - 1;
+    enter_dir(tabs[tab_cur], 0);
+}
+
+static int tab_w(void) { return (cont_w() - 8) / ntabs > 180 ? 180 : (cont_w() - 8) / ntabs; }
+
+static void draw_tabs(void) {
+    int i, x = cont_x() + 4, tw = tab_w();
+    be_fill(cont_x(), TB_H, cont_w(), tabs_h(), BAR);
+    for (i = 0; i < ntabs; i++) {
+        char t[300], u[300];
+        const char *s = i == tab_cur ? cwd : tabs[i], *b = strrchr(s, '/');
+        b = b && b[1] ? b + 1 : "/";
+        if (i == tab_cur) { be_fill(x, TB_H + 2, tw - 2, tabs_h() - 2, BG); be_fill(x, TB_H + 2, tw - 2, 2, ACC); }
+        else if (mx >= x && mx < x + tw - 2 && my >= TB_H && my < TB_H + tabs_h()) be_fill(x, TB_H + 2, tw - 2, tabs_h() - 2, HOVER);
+        fit(b, tw - 30, F_SMALL, t, sizeof t);
+        sprintf(u, "%s", t);
+        be_text(x + 8, TB_H + 4 + (tabs_h() - 4 - fh_small) / 2, u, i == tab_cur ? INK : DIM, F_SMALL);
+        be_text(x + tw - 18, TB_H + 4 + (tabs_h() - 4 - fh_small) / 2, "x", FAINT, F_SMALL);
+        x += tw;
+    }
 }
 
 static void draw_browse(void) {
@@ -1459,6 +1581,16 @@ static void draw_browse(void) {
     }
     if (!n_ents) be_text(cx + 20, cy + 20, "Empty folder", FAINT, F_REG);
     if (!grid) draw_list_head();
+    if (tabs_h()) draw_tabs();
+    if (flt_on) {
+        char t[600];
+        int fx = cx + cont_w() - 270, fy = cy + 6;
+        be_fill(fx, fy, 250, 28, WELL);
+        frame(fx, fy, 250, 28, ACC);
+        sprintf(t, "Find: %s", flt.buf);
+        fit(t, 236, F_REG, t + 0, sizeof t);
+        txt(fx + 8, fy, 0, 28, t, INK, F_REG);
+    }
     if (th > ch) {
         int th2 = ch * ch / th, ty;
         if (th2 < 24) th2 = 24;
@@ -1728,6 +1860,7 @@ static void open_menu(int px, int py, int on_ent) {
         add_mi(0, 0, 0);
         add_mi("Cut", A_CUT, 1);
         add_mi("Copy", A_COPY, 1);
+        add_mi("Copy path", A_CPATH, 1);
         add_mi("Paste", A_PASTE, ns == 1 && ents[cur].kind == K_DIR && clip_has());
         add_mi(0, 0, 0);
         add_mi("Rename", A_RENAME, ns == 1);
@@ -1791,6 +1924,16 @@ static void action(int id) {
     case A_CUT: clip_write("cut"); break;
     case A_COPY: clip_write("copy"); break;
     case A_PASTE: do_paste_into(); break;
+    case A_CPATH: {
+        char b[4096] = "", p[1024];
+        int i;
+        for (i = 0; i < n_ents; i++)
+            if (ents[i].sel && strlen(b) < 3000) { join(p, cwd, ents[i].name); if (b[0]) strcat(b, "\n"); strcat(b, p); }
+        if (!b[0]) strcpy(b, cwd);
+        be_clip_set(b, strlen(b));
+        say("path copied");
+        break;
+    }
     case A_RENAME: if (cur >= 0) ask_input("Rename", "New name:", ents[cur].name, IA_RENAME); break;
     case A_DELETE:
         if (!n_sel()) break;
@@ -1872,6 +2015,7 @@ static void type_ahead(int c) {
 static void key_browse(FmEv *e) {
     int c = e->a, m = e->mods, rows = cont_h() / (grid ? CELL_H : ROW_H), step = grid ? cols() : 1;
     if (rows < 1) rows = 1;
+    if ((m & MOD_CTRL) && (c == FK_PGUP || c == FK_PGDN)) { tab_go(c == FK_PGDN ? (tab_cur + 1) % ntabs : (tab_cur + ntabs - 1) % ntabs); return; }
     if (cur < 0 && n_ents && (c == FK_UP || c == FK_DOWN || c == FK_LEFT || c == FK_RIGHT)) { move_cur(0, m); return; }
     switch (c) {
     case FK_UP: move_cur(cur - step, m); break;
@@ -1897,11 +2041,17 @@ static void key_browse(FmEv *e) {
     default:
         if (m & MOD_CTRL) {
             if (c == 'a') { int i; for (i = 0; i < n_ents; i++) ents[i].sel = 1; dirty = 1; }
+            else if (c == 'c' && (m & MOD_SHIFT)) action(A_CPATH);
             else if (c == 'c' || c == 'x') { if (n_sel()) clip_write(c == 'c' ? "copy" : "cut"); }
             else if (c == 'v') action(A_PASTE);
             else if (c == 'h') action(A_HIDDEN);
             else if (c == 'l') { addr_on = 1; edit_set(&addr, cwd); dirty = 1; }
             else if (c == 'n') action(A_NEWDIR);
+            else if (c == 'f') { flt_on = 1; dirty = 1; }
+            else if (c == 't') tab_new();
+            else if (c == 'w') tab_close();
+            else if (c == FK_TAB || c == FK_PGDN) tab_go((tab_cur + 1) % ntabs);
+            else if (c == FK_PGUP) tab_go((tab_cur + ntabs - 1) % ntabs);
             else if (c == ' ' && cur >= 0) { ents[cur].sel = !ents[cur].sel; dirty = 1; }
         } else if (c == ' ' && cur >= 0 && (m & MOD_SHIFT)) { ents[cur].sel = !ents[cur].sel; dirty = 1; }
         else if (c > 32 && c < 0x200000) type_ahead(c);
@@ -1963,6 +2113,16 @@ static void on_key(FmEv *e) {
             do i = (i + d + n) % n; while (!menu[i].id || !menu[i].on);
             menu_hot = i;
         } else if (e->a == FK_ENTER && menu_hot >= 0) action(menu[menu_hot].id);
+        dirty = 1;
+        return;
+    }
+    if (flt_on && mode == M_BROWSE) {
+        int r;
+        if (e->a == FK_UP || e->a == FK_DOWN) { key_browse(e); return; }
+        r = edit_key(&flt, e);
+        if (r == 2) { flt_on = 0; flt.len = flt.pos = 0; flt.buf[0] = 0; }
+        if (r == 1) flt_on = 0;
+        load_dir();
         dirty = 1;
         return;
     }
@@ -2077,7 +2237,15 @@ static void on_down(FmEv *e) {
         return;
     }
     if (py >= be_h() - ST_H) return;
-    if (!grid && py < TB_H + HDR_H) {
+    if (tabs_h() && py >= TB_H && py < TB_H + tabs_h()) {
+        i = (px - cont_x() - 4) / tab_w();
+        if (px >= cont_x() && i >= 0 && i < ntabs) {
+            if (px - cont_x() - 4 - i * tab_w() > tab_w() - 26) { tab_go(i); tab_close(); }
+            else tab_go(i);
+        }
+        return;
+    }
+    if (!grid && py < TB_H + tabs_h() + HDR_H) {
         int k = head_hit(px);
         if (k >= 0) set_sort(k);
         return;
@@ -2101,6 +2269,7 @@ static void on_down(FmEv *e) {
         }
         click_idx = i;
         click_ms = t;
+        drag_i = i; drag_x = px; drag_y = py; drag_on = 0;
         return;
     }
     click_idx = -1;
@@ -2108,6 +2277,20 @@ static void on_down(FmEv *e) {
     rb_on = 1;
     rb_x0 = rb_x1 = px - cont_x();
     rb_y0 = rb_y1 = py - cont_y() + scroll;
+}
+
+static void drop_in(void) {
+    char b[4096];
+    int n = be_dnd_get(b, sizeof b - 1);
+    FILE *f;
+    if (n <= 0 || mode != M_BROWSE) return;
+    b[n] = 0;
+    f = fopen("/tmp/.fm-clip", "w");
+    if (!f) return;
+    fprintf(f, "copy\n%s\n", b);
+    fclose(f);
+    paste();
+    load_dir();
 }
 
 static void on_move(FmEv *e) {
@@ -2120,6 +2303,14 @@ static void on_move(FmEv *e) {
         scroll = (long)(my - cont_y()) * (total_h() - cont_h()) / cont_h();
         clamp_scroll();
         return;
+    }
+    if (drag_i >= 0 && !drag_on && (abs(mx - drag_x) > 8 || abs(my - drag_y) > 8)) {
+        char b[4096] = "", p[1024];
+        int i;
+        for (i = 0; i < n_ents; i++)
+            if (ents[i].sel && strlen(b) < 3000) { join(p, cwd, ents[i].name); if (b[0]) strcat(b, "\n"); strcat(b, p); }
+        if (b[0]) { be_dnd_set(b, strlen(b)); drag_on = 1; say("drop it on a window"); }
+        else drag_i = -1;
     }
     if (rb_on) {
         if (my < cont_y()) scroll -= 24;
@@ -2155,7 +2346,20 @@ static void on_wheel(int d) {
 static void tick(void) {
     uint32_t t = now_ms();
     if (job) { job_poll(); dirty = 1; }
-    static int had_msg;
+    static int had_msg, th_seen;
+    if (grid && mode == M_BROWSE && !modal) {
+        // kick the next visible image that has no thumb yet
+        int i, d = 0;
+        for (i = 0; i < n_ents && !th_busy; i++) {
+            int x, y, ww, hh;
+            if (ents[i].kind != K_IMG) continue;
+            irect(i, &x, &y, &ww, &hh);
+            if (y - scroll + hh < 0 || y - scroll > cont_h()) continue;
+            if (!th_get(i, 0)) th_get(i, 1);
+        }
+        for (i = 0; i < 64; i++) d += thumbs[i].state == 2;
+        if (d != th_seen) { th_seen = d; dirty = 1; }
+    }
     while (waitpid(-1, 0, WNOHANG) > 0) {}
     if (had_msg && t >= msg_until) { had_msg = 0; dirty = 1; }
     if (t < msg_until) had_msg = 1;
@@ -2196,7 +2400,8 @@ int main(int argc, char **argv) {
             case EV_RESIZE: clamp_scroll(); dirty = 1; break;
             case EV_KEY: on_key(&e); break;
             case EV_DOWN: on_down(&e); break;
-            case EV_UP: sb_drag = 0; rb_on = 0; dirty = 1; break;
+            case EV_UP: sb_drag = 0; rb_on = 0; drag_i = -1; drag_on = 0; dirty = 1; break;
+            case EV_DROP: drop_in(); break;
             case EV_MOVE: on_move(&e); break;
             case EV_WHEEL: on_wheel(e.a); break;
             }

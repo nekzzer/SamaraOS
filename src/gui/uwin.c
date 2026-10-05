@@ -16,6 +16,7 @@
 #include "drivers/keyboard.h"
 #include "drivers/mouse.h"
 #include "proc/proc.h"
+#include "apps/pterm.h"
 #include "boot/pit.h"
 #include "core/io.h"
 
@@ -254,10 +255,30 @@ static void u_click(window_t* w, int rx, int ry) {
     u->hover_x = x; u->hover_y = y;
 }
 
+static char dnd_buf[4096];
+static int dnd_n;
+static bool dnd_on;
+static void u_paint(window_t* w);
+
 static void u_release(window_t* w) {
     uwin_t* u = of(w);
     if (u->flags & SM_F_WL) return;
     u->pressed = false;
+    if (dnd_on) {
+        // fm dragged something out, whoever is under the pointer gets it
+        int mx, my;
+        uint8_t b;
+        mouse_get(&mx, &my, &b);
+        window_t* t = wm_window_at(mx, my);
+        dnd_on = false;
+        if (t && t != w) {
+            if (t->on_paint == u_paint && !(of(t)->flags & SM_F_WL)) {
+                int x, y;
+                u_map(of(t), t, mx, my, &x, &y);
+                push(of(t), SM_EV_DROP, x, y, 0);
+            } else if (pterm_drop(t, dnd_buf, dnd_n)) {}
+        }
+    }
     push(u, SM_EV_MOUSE_UP, u->hover_x, u->hover_y, 0);
 }
 
@@ -472,8 +493,61 @@ static int32_t op_event(uwin_t* u, uint64_t ev, int32_t timeout) {
     return 1;
 }
 
+static char clip_buf[65536];
+static volatile int clip_n;
+
+void clip_set(const char* s, int n) {
+    if (n > (int)sizeof(clip_buf)) n = sizeof(clip_buf);
+    clip_n = 0;
+    memcpy(clip_buf, s, n);
+    clip_n = n;
+}
+
+int clip_get(char* out, int cap) {
+    int n = clip_n;
+    if (n > cap) n = cap;
+    memcpy(out, clip_buf, n);
+    return n;
+}
+
 int32_t uwin_syscall(uint32_t op, uint64_t a, uint64_t b, uint64_t c) {
     if (op == SM_OP_OPEN) return op_open(a);
+    if (op == SM_OP_CLIP_GET) {
+        if (!uok(a, b)) return -EFAULT;
+        return clip_get((char*)a, (int)b);
+    }
+    if (op == SM_OP_CLIP_SET) {
+        if (!uok(a, b)) return -EFAULT;
+        clip_set((const char*)a, (int)b);
+        return 0;
+    }
+    if (op == SM_OP_DND_SET) {
+        if (b > sizeof(dnd_buf)) b = sizeof(dnd_buf);
+        if (!uok(a, b)) return -EFAULT;
+        memcpy(dnd_buf, (const void*)a, b);
+        dnd_n = (int)b;
+        dnd_on = b > 0;
+        return 0;
+    }
+    if (op == SM_OP_DND_GET) {
+        if (!uok(a, b)) return -EFAULT;
+        int n = dnd_n < (int)b ? dnd_n : (int)b;
+        memcpy((void*)a, dnd_buf, n);
+        return n;
+    }
+    if (op == SM_OP_NOTIFY) {
+        char s[96];
+        if (!ustr(a, s, sizeof(s))) return -EFAULT;
+        wm_notify(s);
+        return 0;
+    }
+    if (op == SM_OP_CTL) {
+        if (a == SM_CTL_RELOAD) wm_request(1);
+        else if (a == SM_CTL_SHOT) wm_request(2);
+        else if (a == SM_CTL_LOCK) wm_request(3);
+        else return -EINVAL;
+        return 0;
+    }
     if (op == SM_OP_FONT_H) return uif_height_any((int)a);
     if (op == SM_OP_SCREEN) return (gfx_w() << 16) | gfx_h();
     if (op == SM_OP_TEXT) {

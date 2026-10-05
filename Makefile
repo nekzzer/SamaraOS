@@ -212,7 +212,7 @@ DGEN_OBJ  := $(DGEN_SRC:.c=.o)
 # Userland: a static i686 busybox (musl) + its applet list, and the TCC +
 # musl sysroot tarball (userland/build-sysroot.sh), linked into the kernel
 # image and unpacked into the ramfs at boot (src/proc/userland.c).
-USERLAND_BINS := userland/busybox userland/busybox.applets userland/sysroot.tar userland/fm userland/samara/samara-fm.conf
+USERLAND_BINS := userland/busybox userland/busybox.applets userland/sysroot.tar userland/fm userland/dapps userland/samara/samara-fm.conf
 USERLAND_OBJS := $(addsuffix .bin.o,$(USERLAND_BINS))
 # fm is a static x86_64 musl binary, committed like busybox. `make fm` rebuilds it
 # from userland/samara/ against musl-devel from void: XBPS_ARCH=x86_64-musl xbps-install -S -r $(MUSL64) -R <void repo>/current/musl musl-devel
@@ -222,6 +222,10 @@ fm:
 	    -fno-stack-protector -fno-pie -no-pie -Iuserland/samara -o userland/fm \
 	    $(MUSL64)/usr/lib/crt1.o $(MUSL64)/usr/lib/crti.o userland/samara/fm.c userland/samara/fm_samara.c userland/samara/fm_img.c \
 	    -Wl,--start-group $(MUSL64)/usr/lib/libc.a $$(gcc -print-libgcc-file-name) -Wl,--end-group $(MUSL64)/usr/lib/crtn.o
+# edit, sysmon, pkg, settings, notify-send-lite: one binary (userland/samara/dapps.c), same recipe
+dapps:
+	userland/x64cc.sh -O2 -s -w -Iuserland/samara -o userland/dapps userland/samara/dapps.c userland/samara/d_edit.c \
+	    userland/samara/d_sysmon.c userland/samara/d_pkg.c userland/samara/d_settings.c userland/samara/fm_samara.c userland/samara/fm_img.c
 # terminal font atlas (tools/mktermfont.py), linked in like the userland blobs
 TERMFONT_OBJ  := src/gfx/termfont.bin.o
 
@@ -507,7 +511,7 @@ clean:
 	rm -f $(ALL_OBJ) $(KERNEL)
 	rm -rf build
 
-.PHONY: run-internet fm
+.PHONY: run-internet fm dapps
 .PHONY: run-uefi
 .PHONY: all run run-doom run-sata run-debug iso run-iso run-install run-hd clean build compile_commands.json
 

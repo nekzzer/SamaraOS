@@ -9,6 +9,7 @@
 #include "drivers/ata.h"
 #include "fs/fs.h"
 #include "core/string.h"
+#include "core/heap.h"
 #include "core/clock.h"
 #include "core/task.h"
 #include "core/io.h"
@@ -160,7 +161,7 @@ static bool etc_field(const char* file, const char* name, int k, char* out, int 
     return false;
 }
 
-static bool check_pw(const char* user, const char* pw) {
+bool check_pw(const char* user, const char* pw) {
     char h[128], out[64];
     if (!user[0] || !etc_field("/etc/shadow", user, 1, h, sizeof(h))) return false;
     if (!h[0]) return true;                           /* no password set */
@@ -321,6 +322,55 @@ void login_screen(void) {
     strcat(home, user);
     if (strcmp(user, "root") && !fs_resolve(fs_root(), home)) fs_create(fs_root(), home, FS_DIR);
     // kprintf("login %s\n", user);
+}
+
+// called by the wm (super+l / idle). draws a dimmed copy of the desktop, blocks till the password is right
+void lock_screen(void) {
+    char pw[64] = "";
+    fld_t f = { "Password", pw, sizeof(pw), true };
+    W = gfx_w();
+    H = gfx_h();
+    uint32_t* shot = kmalloc_big((size_t)W * H * 4);
+    gfx_reset_clip();
+    if (shot) {
+        gfx_save_rect(0, 0, W, H, shot);
+        for (int i = 0; i < W * H; i++) shot[i] = (shot[i] >> 2) & 0x3F3F3F;
+    }
+    bg = shot;
+    bg_rect(0, 0, W, H);
+    cw = ch = 0;
+    card(360, 170);
+    last_min = -1;
+    uint32_t t = clock_epoch();
+    char clk[8];
+    for (;;) {
+        int m = (int)(t / 60 % 1440);
+        clk[0] = '0' + m / 600; clk[1] = '0' + m / 60 % 10; clk[2] = ':';
+        clk[3] = '0' + m % 60 / 10; clk[4] = '0' + m % 10; clk[5] = 0;
+        bg_rect(W / 2 - 200, cy - 150, 400, 110);
+        uif_draw_center(W / 2 - 200, cy - 150, 400, 110, UIF_HUGE, clk, C_BAR_TEXT);
+        draw_field(cx + 30, cy + 24, cw - 60, &f, true);
+        gfx_present();
+        char k;
+        for (;;) {
+            if (kbd_has_key()) { k = kbd_trygetc(); break; }
+            uint32_t n = clock_epoch();
+            if (n / 60 != t / 60) { t = n; k = 0; break; }
+            task_yield();
+        }
+        if (!k) continue;
+        if (k == '\n') {
+            msg(cy + 110, "checking...", C_INK_DIM);
+            gfx_present();
+            if (check_pw(login_user[0] ? login_user : "root", pw)) break;
+            msg(cy + 110, "wrong password", C_DANGER);
+            pw[0] = 0;
+            continue;
+        }
+        if (edit(&f, k)) msg(cy + 110, "", C_INK);
+    }
+    bg = NULL;
+    if (shot) kfree(shot);
 }
 
 /* ---------------- installer ---------------- */

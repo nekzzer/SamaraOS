@@ -95,6 +95,8 @@ window_t* wm_window_at(int x, int y);
 void      wm_invalidate_wallpaper(void);
 uint32_t* wm_background(int W, int H);     /* W*H pixels, NULL if no memory */
 /* Type + run a shell command line in the desktop terminal (opens it). */
+void      wm_notify(const char* s);          /* "title\nbody" popup in the corner */
+void      wm_request(int what);              /* 1 reload conf, 2 screenshot, 3 lock (done by the wm task) */              /* /etc/samara-desktop.conf changed */
 bool      wm_terminal_feed(const char* line);
 
 /* Toggle maximized / fullscreen state (no-op for non-resizable windows). */

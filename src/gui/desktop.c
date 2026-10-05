@@ -6,6 +6,7 @@
 #include "drivers/mouse.h"
 #include "core/string.h"
 #include "gfx/gfx.h"
+#include "fs/fs.h"
 #include "drivers/mouse.h"
 #include "drivers/keyboard.h"
 #include "boot/pit.h"
@@ -63,8 +64,24 @@ void desktop_install_mbi(multiboot_info_t* mbi) { g_mbi = mbi; }
 static bool video_param(int* w, int* h) {
     extern const char* kernel_cmdline(void);
     const char* k = strstr(kernel_cmdline(), "video=");
-    if (!k) return false;
-    k += 6;
+    char cb[200];
+    int skip = 6;
+    if (!k) {
+        // settings app writes res=WxH here, picked up on next boot
+        fs_node_t* n = fs_resolve(fs_root(), "/etc/samara-desktop.conf");
+        if (!n) return false;
+        fs_need(n);
+        if (!n->data) return false;
+        size_t l = n->size < 190 ? n->size : 190;
+        memcpy(cb, "\n", 1);
+        memcpy(cb + 1, n->data, l);
+        cb[l + 1] = 0;
+        k = strstr(cb, "\nres=");
+        if (!k) return false;
+        k++;
+        skip = 4;
+    }
+    k += skip;
     int a = 0, b = 0;
     while (*k >= '0' && *k <= '9') a = a * 10 + (*k++ - '0');
     if (*k++ != 'x') return false;

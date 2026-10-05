@@ -4,6 +4,8 @@
 
 void login_load_etc(void);         /* /mnt/etc/{passwd,shadow,...} -> /etc */
 void login_screen(void);           /* blocks till someone logs in */
+void lock_screen(void);            /* wm: super+l, blocks till the password is typed */
+bool check_pw(const char* user, const char* pw);
 bool install_screen(void);         /* false = "try it" without installing */
 void install_progress(const char* msg, int pct);
 
