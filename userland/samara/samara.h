@@ -33,8 +33,10 @@
 
 enum {
     SM_OP_OPEN = 1, SM_OP_PRESENT, SM_OP_EVENT, SM_OP_CLOSE, SM_OP_TEXT,
-    SM_OP_KEYS, SM_OP_MOUSE, SM_OP_TITLE, SM_OP_FONT_H
+    SM_OP_KEYS, SM_OP_MOUSE, SM_OP_TITLE, SM_OP_FONT_H, SM_OP_SCREEN,
+    SM_OP_CLIP_GET, SM_OP_CLIP_SET, SM_OP_NOTIFY, SM_OP_CTL
 };
+enum { SM_CTL_RELOAD = 1, SM_CTL_SHOT, SM_CTL_LOCK };
 
 /* ---- events ---- */
 enum { SM_EV_NONE, SM_EV_KEY, SM_EV_MOUSE_DOWN, SM_EV_MOUSE_UP, SM_EV_MOUSE_MOVE, SM_EV_CLOSE,
@@ -247,6 +249,13 @@ static inline int sm_mouse(SmWin *w, int *x, int *y, int *buttons) {
     if (buttons) *buttons = m[2];
     return r;
 }
+
+/* shared clipboard (utf-8), works without a window */
+static inline int sm_clip_get(char *buf, int cap) { return (int)sm_call(SM_OP_CLIP_GET, (long)buf, cap, 0); }
+static inline void sm_clip_set(const char *s, int n) { sm_call(SM_OP_CLIP_SET, (long)s, n, 0); }
+static inline void sm_notify(const char *s) { sm_call(SM_OP_NOTIFY, (long)s, 0, 0); }
+static inline void sm_ctl(int what) { sm_call(SM_OP_CTL, what, 0, 0); }
+static inline int sm_screen(void) { return (int)sm_call(SM_OP_SCREEN, 0, 0, 0); }
 
 static inline int sm_font_h(int font) { return (int)sm_call(SM_OP_FONT_H, font, 0, 0); }
 

@@ -24,6 +24,8 @@
 #include "shell/shell.h"
 
 #include "gui/theme.h"
+#include "gui/login.h"
+extern uint32_t clock_epoch(void);   // apps/clock.h has the same guard as core/clock.h
 #include "gui/uwin.h"
 
 /* ========================================================================
@@ -553,6 +555,220 @@ void theme_set(int light) {
     for (int i = 0; i < T_N; i++) th_pal[i] = light ? th_light[i] : th_dark[i];
 }
 
+/* ---- notifications: wm_notify() from anywhere (syscall too), shown top right for a few secs ---- */
+
+#define NOTE_MAX 4
+#define NOTE_W   320
+#define NOTE_H   58
+typedef struct { char s[96]; uint32_t until; } note_t;
+static note_t notes[NOTE_MAX];
+static int n_notes;
+static char note_q[4][96];
+static volatile int nq_h, nq_t;
+
+void wm_notify(const char* s) {
+    int nx = (nq_t + 1) & 3;
+    if (nx == nq_h) return;
+    strncpy(note_q[nq_t], s, 95);
+    note_q[nq_t][95] = 0;
+    nq_t = nx;
+}
+
+static rect_t note_r(int i) { return R(gfx_w() - NOTE_W - 16, 16 + i * (NOTE_H + 8), NOTE_W, NOTE_H); }
+
+static void notes_tick(uint32_t now) {
+    bool ch = false;
+    while (nq_h != nq_t) {
+        if (n_notes == NOTE_MAX) { for (int i = 1; i < NOTE_MAX; i++) notes[i - 1] = notes[i]; n_notes--; }
+        strcpy(notes[n_notes].s, note_q[nq_h]);
+        notes[n_notes].until = now + 4000;
+        n_notes++;
+        nq_h = (nq_h + 1) & 3;
+        ch = true;
+    }
+    while (n_notes && (int32_t)(now - notes[0].until) >= 0) {
+        for (int i = 1; i < n_notes; i++) notes[i - 1] = notes[i];
+        n_notes--;
+        ch = true;
+    }
+    if (ch) damage(gfx_w() - NOTE_W - 40, 0, NOTE_W + 40, 16 + NOTE_MAX * (NOTE_H + 8) + 24);
+}
+
+static void draw_notes(rect_t region) {
+    for (int i = 0; i < n_notes; i++) {
+        rect_t r = note_r(i);
+        if (!r_overlap(r, region)) continue;
+        gfx_shadow(r.x0, r.y0, NOTE_W, NOTE_H, 0, 10, 150);
+        gfx_rect_fill(r.x0, r.y0, NOTE_W, NOTE_H, C_MENU_EDGE);
+        gfx_rect_fill(r.x0 + 1, r.y0 + 1, NOTE_W - 2, NOTE_H - 2, C_MENU);
+        gfx_rect_fill(r.x0 + 1, r.y0 + 1, 3, NOTE_H - 2, C_ACCENT);
+        char a[96];
+        strcpy(a, notes[i].s);
+        char* b = strchr(a, '\n');
+        if (b) *b++ = 0;
+        uif_draw(r.x0 + 14, r.y0 + (b ? 8 : 20), UIF_MED, a, C_INK);
+        if (b) uif_draw(r.x0 + 14, r.y0 + 32, UIF_SMALL, b, C_INK_DIM);
+    }
+}
+
+/* ---- /etc/samara-desktop.conf: theme=light|dark lock=<minutes> hotkey=alt|ctrl layout=ru|us ---- */
+
+static uint32_t lock_ms = 10 * 60000;
+
+static void conf_load(void) {
+    fs_node_t* n = fs_resolve(fs_root(), "/etc/samara-desktop.conf");
+    if (!n) return;
+    fs_need(n);
+    if (!n->data) return;
+    char b[256];
+    size_t len = n->size < 255 ? n->size : 255;
+    memcpy(b, n->data, len);
+    b[len] = 0;
+    for (char* p = b; *p;) {
+        char* e = strchr(p, '\n');
+        if (e) *e = 0;
+        if (!strncmp(p, "theme=", 6)) theme_set(!strcmp(p + 6, "light"));
+        else if (!strncmp(p, "lock=", 5)) lock_ms = (uint32_t)atoi(p + 5) * 60000;
+        else if (!strncmp(p, "hotkey=", 7)) kbd_set_hotkey(!strcmp(p + 7, "ctrl"));
+        else if (!strncmp(p, "layout=", 7)) kbd_set_ru(!strcmp(p + 7, "ru"));
+        if (!e) break;
+        p = e + 1;
+    }
+}
+
+static volatile int req_what;
+void wm_request(int what) { req_what = what; }
+
+/* ---- PrintScreen: stored-ish PNG (deflate with only distance-3 runs, flat ui compresses fine) ---- */
+
+static uint32_t crc_tab[256];
+static uint32_t crc_upd(uint32_t c, const uint8_t* p, size_t n) {
+    if (!crc_tab[1]) for (uint32_t i = 0; i < 256; i++) {
+        uint32_t v = i;
+        for (int k = 0; k < 8; k++) v = v & 1 ? 0xEDB88320u ^ (v >> 1) : v >> 1;
+        crc_tab[i] = v;
+    }
+    while (n--) c = crc_tab[(c ^ *p++) & 255] ^ (c >> 8);
+    return c;
+}
+
+static uint8_t* z_out;
+static size_t z_n;
+static uint32_t z_acc;
+static int z_bits;
+
+static void z_put(uint32_t v, int n) {
+    z_acc |= v << z_bits;
+    z_bits += n;
+    while (z_bits >= 8) { z_out[z_n++] = z_acc & 255; z_acc >>= 8; z_bits -= 8; }
+}
+
+static void z_huff(uint32_t code, int n) {         /* huffman codes go msb first */
+    uint32_t r = 0;
+    for (int i = 0; i < n; i++) r |= ((code >> i) & 1) << (n - 1 - i);
+    z_put(r, n);
+}
+
+static void z_lit(int v) {
+    if (v < 144) z_huff(0x30 + v, 8);
+    else if (v < 256) z_huff(0x190 + v - 144, 9);
+    else if (v < 280) z_huff(v - 256, 7);
+    else z_huff(0xC0 + v - 280, 8);
+}
+
+static void be32(uint8_t* p, uint32_t v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
+
+static void png_chunk(uint8_t* o, size_t* n, const char* t, const uint8_t* d, size_t len) {
+    be32(o + *n, len);
+    memcpy(o + *n + 4, t, 4);
+    if (len) memcpy(o + *n + 8, d, len);
+    be32(o + *n + 8 + len, crc_upd(0xFFFFFFFF, o + *n + 4, len + 4) ^ 0xFFFFFFFF);
+    *n += len + 12;
+}
+
+static void screenshot(void) {
+    static const uint16_t lb[] = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
+    static const uint8_t le[] = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
+    int W = gfx_w(), H = gfx_h();
+    uint32_t* px = kmalloc_big((size_t)W * H * 4);
+    size_t rn = (size_t)(W * 3 + 1) * H;
+    uint8_t* raw = kmalloc_big(rn);
+    size_t cap = rn + rn / 4 + 1024;
+    uint8_t* z = kmalloc_big(cap);
+    uint8_t* png = NULL;
+    if (!px || !raw || !z) goto out;
+    gfx_save_rect(0, 0, W, H, px);
+    uint8_t* d = raw;
+    for (int y = 0; y < H; y++) {
+        *d++ = 0;
+        for (int x = 0; x < W; x++) { uint32_t c = px[y * W + x]; *d++ = c >> 16; *d++ = c >> 8; *d++ = c; }
+    }
+    z_out = z; z_n = 0; z_acc = 0; z_bits = 0;
+    z_out[z_n++] = 0x78; z_out[z_n++] = 0x01;
+    z_put(1, 1); z_put(1, 2);
+    for (size_t i = 0; i < rn;) {
+        size_t l = 0;
+        if (i >= 3) while (l < 258 && i + l < rn && raw[i + l] == raw[i + l - 3]) l++;
+        if (l >= 3) {
+            int k = 28;
+            while (lb[k] > l) k--;
+            z_lit(257 + k);
+            if (le[k]) z_put(l - lb[k], le[k]);
+            z_huff(2, 5);
+            i += l;
+        } else z_lit(raw[i++]);
+    }
+    z_lit(256);
+    if (z_bits) z_put(0, 8 - z_bits);
+    uint32_t a = 1, b = 0;
+    for (size_t i = 0; i < rn; i++) { a = (a + raw[i]) % 65521; b = (b + a) % 65521; }
+    be32(z + z_n, (b << 16) | a);
+    z_n += 4;
+
+    png = kmalloc_big(z_n + 100);
+    if (!png) goto out;
+    size_t n = 0;
+    memcpy(png, "\x89PNG\r\n\x1a\n", 8); n = 8;
+    uint8_t ih[13];
+    be32(ih, W); be32(ih + 4, H);
+    ih[8] = 8; ih[9] = 2; ih[10] = ih[11] = ih[12] = 0;
+    png_chunk(png, &n, "IHDR", ih, 13);
+    png_chunk(png, &n, "IDAT", z, z_n);
+    png_chunk(png, &n, "IEND", NULL, 0);
+
+    uint32_t t = clock_epoch();
+    uint32_t days = t / 86400, sec = t % 86400;
+    int64_t zz = (int64_t)days + 719468, era = zz / 146097;
+    int doe = zz - era * 146097, yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
+    int dd = doy - (153 * mp + 2) / 5 + 1, mm = mp < 10 ? mp + 3 : mp - 9, yy = yoe + era * 400 + (mm <= 2);
+    char name[64] = "/root/Pictures/screenshot-";
+    char num[8];
+    int f[6] = { yy, mm, dd, sec / 3600, sec / 60 % 60, sec % 60 };
+    int ln = strlen(name);
+    for (int i = 0; i < 6; i++) {
+        if (i == 3) name[ln++] = '-';
+        if (i == 0) { name[ln++] = '0' + f[0] / 1000 % 10; name[ln++] = '0' + f[0] / 100 % 10; }
+        name[ln++] = '0' + f[i] / 10 % 10;
+        name[ln++] = '0' + f[i] % 10;
+    }
+    strcpy(name + ln, ".png");
+    (void)num;
+    if (!fs_resolve(fs_root(), "/root")) fs_create(fs_root(), "/root", FS_DIR);
+    if (!fs_resolve(fs_root(), "/root/Pictures")) fs_create(fs_root(), "/root/Pictures", FS_DIR);
+    fs_node_t* fn = fs_create(fs_root(), name, FS_FILE);
+    if (fn && fs_write(fn, (const char*)png, n) >= 0) {
+        char m[96] = "Screenshot saved\n";
+        strcat(m, name + 14);
+        wm_notify(m);
+    } else wm_notify("Screenshot failed");
+out:
+    if (px) kfree(px);
+    if (raw) kfree(raw);
+    if (z) kfree(z);
+    if (png) kfree(png);
+}
+
 /* ========================================================================
    Desktop background, rendered once into a cache: near-black gradient + a
    wordmark you only see if you look for it. Or the user's wallpaper.
@@ -564,13 +780,14 @@ static const uint8_t bayer4[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 
 /* ---- wallpaper: uncompressed 24/32-bpp BMP, cover-scaled, dimmed ~15% ---- */
 
 static const char* const wallpaper_paths[] = {
-    "/home/user/wallpaper.bmp", "/mnt/wallpaper.bmp", "/wallpaper.bmp",
+    "/root/.wallpaper.bmp", "/home/user/wallpaper.bmp", "/mnt/wallpaper.bmp", "/wallpaper.bmp",
 };
 
 static uint32_t rd32(const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
 static uint16_t rd16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 
 static bool load_wallpaper_file(const fs_node_t* n, uint32_t* dst, int W, int H) {
+    if (n && n->type == FS_FILE) fs_need((fs_node_t*)n);
     if (!n || n->type != FS_FILE || !n->data || n->size < 54) return false;
     const uint8_t* b = (const uint8_t*)n->data;
     if (b[0] != 'B' || b[1] != 'M') return false;
@@ -1450,6 +1667,7 @@ static void compose(rect_t region) {
 
     if (region.y1 > desk_h && !tb_hidden()) draw_taskbar();
     if (menu_open && r_overlap(menu_bounds(), region)) draw_menu();
+    if (n_notes) draw_notes(region);
 
     gfx_reset_clip();
     composing = false;
@@ -1972,6 +2190,7 @@ static void collect_damage(uint32_t now) {
         w->needs_repaint = false;
     }
 
+    notes_tick(now);
     if ((int32_t)(now - next_icon_scan) >= 0) {
         next_icon_scan = now + 1500;
         scan_icons();
@@ -2027,6 +2246,7 @@ void wm_init(void) {
     (void)mouse_wheel_take();
     want_spr = cur_spr = &spr_arrow;
 
+    conf_load();
     db_on = gfx_enable_double_buffer();
     if (db_on) gfx_target_back();
     gfx_reset_clip();
@@ -2055,6 +2275,7 @@ static uint64_t st_t0, st_in, st_tick, st_comp, st_pres, st_cur; static uint32_t
 void wm_run(void) {
     uint32_t t0 = pit_uptime_ms();
     uint32_t frame = 0;
+    uint32_t last_act = t0;
     bool prev_btn = false;
     bool fb_was_active = false;
     int prev_mx = -1, prev_my = -1;
@@ -2096,11 +2317,28 @@ void wm_run(void) {
             damage_all();
         }
 
+        int rq = req_what;
+        req_what = 0;
+        if (rq == 1) { conf_load(); bg_dirty = true; layout_changed = true; damage_all(); }
+        if (rq == 2) screenshot();
+        if (kbd_prtsc_take()) screenshot();
+        if (rq == 3 || kbd_lock_take() || (lock_ms && now - last_act > lock_ms)) {
+            lock_screen();
+            while (kbd_has_key()) (void)kbd_trygetc();
+            prev_btn = false; prev_mx = prev_my = -1;
+            cur_x = cur_y = -1;
+            damage_all();
+            last_act = t0 = pit_uptime_ms();
+            frame = 1;
+            continue;
+        }
+
         uint64_t T0 = tsc();
         int mx, my; uint8_t b;
         mouse_get(&mx, &my, &b);
         bool button = (b & 1) != 0;
         bool moved = (mx != prev_mx || my != prev_my);
+        if (moved || button || kbd_has_key()) last_act = now;
 
         if (button && !prev_btn)      on_press(mx, my);
         else if (!button && prev_btn) on_release(mx, my);

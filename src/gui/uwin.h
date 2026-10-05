@@ -19,6 +19,10 @@ enum {
     SM_OP_TITLE,         /* ecx = handle, edx = title                           */
     SM_OP_FONT_H,        /* ecx = font                       -> line height      */
     SM_OP_SCREEN,        /*                                  -> screen w<<16|h   */
+    SM_OP_CLIP_GET,      /* ecx = buf, edx = cap             -> bytes (utf-8, not NUL-terminated) */
+    SM_OP_CLIP_SET,      /* ecx = buf, edx = len                                  */
+    SM_OP_NOTIFY,        /* ecx = "title\nbody"              popup in the corner  */
+    SM_OP_CTL,           /* ecx = SM_CTL_*, edx = arg                             */
 };
 
 enum { SM_EV_NONE, SM_EV_KEY, SM_EV_MOUSE_DOWN, SM_EV_MOUSE_UP, SM_EV_MOUSE_MOVE, SM_EV_CLOSE,
@@ -31,6 +35,8 @@ enum { SM_EV_NONE, SM_EV_KEY, SM_EV_MOUSE_DOWN, SM_EV_MOUSE_UP, SM_EV_MOUSE_MOVE
    SM_EV_FOCUS a = 1/0 keyboard focus, SM_EV_PENTER / PMOVE a, b = x, y in the client (PMOVE goes on while a
    button is held, even outside), SM_EV_PLEAVE, SM_EV_PBTN a = BTN_LEFT/RIGHT/MIDDLE (0x110..), b = 1/0,
    SM_EV_WHEEL a = dz (> 0 down). The open size is clamped to the screen: a RESIZE event follows if it was. */
+enum { SM_CTL_RELOAD = 1, SM_CTL_SHOT, SM_CTL_LOCK };   /* conf changed / PrintScreen / Super+L */
+
 #define SM_F_WL     4
 #define SM_F_RAW    1     /* sm_text rasterizes into the buffer, no crisp overlay (lots of text) */
 #define SM_F_RESIZE 2     /* window follows its frame: scale 1, SM_EV_RESIZE; present with size in esi */
@@ -42,6 +48,8 @@ typedef struct {
 } sm_text_t;              /* buf == 0: measure only */
 
 /* Kernel side */
+void    clip_set(const char* s, int n);   /* the shared clipboard, utf-8 */
+int     clip_get(char* out, int cap);
 int32_t uwin_syscall(uint32_t op, uint64_t a, uint64_t b, uint64_t c);
 void    uwin_proc_exit(int pid);       /* from process teardown */
 void    uwin_wm_frame(void);           /* once per WM frame: create/close windows */

@@ -472,8 +472,47 @@ static int32_t op_event(uwin_t* u, uint64_t ev, int32_t timeout) {
     return 1;
 }
 
+static char clip_buf[65536];
+static volatile int clip_n;
+
+void clip_set(const char* s, int n) {
+    if (n > (int)sizeof(clip_buf)) n = sizeof(clip_buf);
+    clip_n = 0;
+    memcpy(clip_buf, s, n);
+    clip_n = n;
+}
+
+int clip_get(char* out, int cap) {
+    int n = clip_n;
+    if (n > cap) n = cap;
+    memcpy(out, clip_buf, n);
+    return n;
+}
+
 int32_t uwin_syscall(uint32_t op, uint64_t a, uint64_t b, uint64_t c) {
     if (op == SM_OP_OPEN) return op_open(a);
+    if (op == SM_OP_CLIP_GET) {
+        if (!uok(a, b)) return -EFAULT;
+        return clip_get((char*)a, (int)b);
+    }
+    if (op == SM_OP_CLIP_SET) {
+        if (!uok(a, b)) return -EFAULT;
+        clip_set((const char*)a, (int)b);
+        return 0;
+    }
+    if (op == SM_OP_NOTIFY) {
+        char s[96];
+        if (!ustr(a, s, sizeof(s))) return -EFAULT;
+        wm_notify(s);
+        return 0;
+    }
+    if (op == SM_OP_CTL) {
+        if (a == SM_CTL_RELOAD) wm_request(1);
+        else if (a == SM_CTL_SHOT) wm_request(2);
+        else if (a == SM_CTL_LOCK) wm_request(3);
+        else return -EINVAL;
+        return 0;
+    }
     if (op == SM_OP_FONT_H) return uif_height_any((int)a);
     if (op == SM_OP_SCREEN) return (gfx_w() << 16) | gfx_h();
     if (op == SM_OP_TEXT) {
