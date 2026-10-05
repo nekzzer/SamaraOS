@@ -11,7 +11,9 @@ PKGS="base-files musl busybox coreutils findutils grep sed gawk tar gzip xz bash
       ca-certificates openssl curl wget nano htop dropbear openssh iproute2 file less \
       ncurses-base ncurses procps-ng util-linux shadow iputils \
       wayland libxkbcommon xkeyboard-config foot xterm xorg-server-xwayland \
-      font-misc-misc dejavu-fonts-ttf fontconfig"
+      font-misc-misc dejavu-fonts-ttf fontconfig \
+      mesa-dri mesa-demos glmark2 xclock xeyes xcalc xev xclip xsel xdotool wl-clipboard wayland-utils \
+      xcursor-themes adwaita-icon-theme zenity gtk+3-demo"
 
 # everything inside a user namespace: files end up owned by root:root without sudo
 if [ -z "$IN_NS" ]; then
