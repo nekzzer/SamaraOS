@@ -474,6 +474,26 @@ void sock_input_tcp6(const uint8_t* src, const uint8_t* dst, const uint8_t* seg,
 
 /* ---------------- UDP ---------------- */
 
+/* nobody on that udp port: icmp port unreachable. the ip header is rebuilt, we only get the payload here */
+static void unreach4(const uint8_t* src, const uint8_t* dst, const uint8_t* d, int ulen) {
+    uint8_t m[8 + 20 + 8];
+    uint32_t x = 0;
+    if (src[12] == 0 || dst[12] >= 224 || (dst[12] == 255 && dst[15] == 255)) return;
+    memset(m, 0, sizeof(m));
+    m[0] = 3; m[1] = 3;
+    uint8_t* ih = m + 8;
+    ih[0] = 0x45; ih[2] = 0; ih[3] = (uint8_t)(20 + ulen); ih[8] = 64; ih[9] = 17;
+    memcpy(ih + 12, src + 12, 4); memcpy(ih + 16, dst + 12, 4);
+    x = sum16(0, ih, 20);
+    while (x >> 16) x = (x & 0xFFFF) + (x >> 16);
+    ih[10] = (uint8_t)(~x >> 8); ih[11] = (uint8_t)~x;
+    memcpy(m + 28, d, 8);
+    x = sum16(0, m, sizeof(m));
+    while (x >> 16) x = (x & 0xFFFF) + (x >> 16);
+    m[2] = (uint8_t)(~x >> 8); m[3] = (uint8_t)~x;
+    net_send_ip(un4(src), 1, m, sizeof(m));
+}
+
 static void udp_in(const uint8_t* src, const uint8_t* dst, const uint8_t* d, int len) {
     if (len < 8) return;
     const udph_t* h = (const udph_t*)d;
@@ -482,7 +502,7 @@ static void udp_in(const uint8_t* src, const uint8_t* dst, const uint8_t* d, int
     if (ulen < 8 || ulen > len) return;
     for (int i = 0; i < MAX_SOCKS; i++) {
         sock_t* s = &socks[i];
-        if (!s->used || s->type != 2 || s->proto == 58 || s->lport != dport) continue;
+        if (!s->used || s->type != 2 || s->proto == 58 || s->proto == 1 || s->lport != dport) continue;
         if (!dst_ok(s, dst) && !(is4(dst) && dst[12] == 127 && is4(s->lip))) continue;
         if (s->connected && (memcmp(s->rip, src, 16) || s->rport != sport)) continue;
         if (s->q_n >= UDP_QMAX) return;
@@ -495,6 +515,7 @@ static void udp_in(const uint8_t* src, const uint8_t* dst, const uint8_t* d, int
         s->q_n++;
         return;
     }
+    if (is4(src) && is4(dst)) unreach4(src, dst, d, ulen);
 }
 
 void sock_input_udp(uint32_t src, uint32_t dst, const uint8_t* d, int len) {
@@ -556,15 +577,14 @@ void sock_input_icmp(uint32_t src4, uint32_t dst4, const uint8_t* p, int ihl, in
 
 /* icmpv6 for raw sockets (and the ping kind of dgram ones) */
 void sock_input_icmp6(const uint8_t* src, const uint8_t* dst, const uint8_t* m, int len, int hl) {
-    if (m[0] == 1 && len >= 8 + 40 + 4 && m[8 + 6] == 6) {      /* dest unreach for our syn */
+    if (m[0] == 1 && len >= 8 + 40 + 4 && (m[8 + 6] == 6 || m[8 + 6] == 17)) {      /* dest unreach for our syn / udp */
         const uint8_t* in = m + 8;
         uint16_t sp = (in[40] << 8) | in[41], dp = (in[42] << 8) | in[43];
         for (int i = 0; i < MAX_SOCKS; i++) {
             sock_t* s = &socks[i];
-            if (s->used && s->type == 1 && s->state == S_SYN_SENT && s->lport == sp && s->rport == dp && !memcmp(s->rip, in + 24, 16)) {
-                s->err = ENETUNREACH;
-                s->state = S_CLOSED;
-            }
+            if (!s->used || s->lport != sp || s->rport != dp || memcmp(s->rip, in + 24, 16)) continue;
+            if (in[6] == 6 && s->type == 1 && s->state == S_SYN_SENT) { s->err = ENETUNREACH; s->state = S_CLOSED; }
+            else if (in[6] == 17 && s->type == 2 && s->connected && s->proto != 58) s->err = m[1] == 4 ? ECONNREFUSED : ENETUNREACH;
         }
         return;
     }
@@ -743,6 +763,7 @@ int sock_send(sock_t* s, const uint8_t* buf, uint32_t len, bool nonblock,
         const uint8_t* ip = to_ip ? to_ip : s->rip;
         uint16_t port = to_port ? *to_port : s->rport;
         uint8_t src[16];
+        if (s->err) { int e = s->err; s->err = 0; return -e; }
         if (!to_ip && !s->connected) return -EDESTADDRREQ;
         if (len > 1472) return -90;                    /* EMSGSIZE */
         if (is4(ip)) {
@@ -824,7 +845,8 @@ int sock_send(sock_t* s, const uint8_t* buf, uint32_t len, bool nonblock,
 int sock_recv(sock_t* s, uint8_t* buf, uint32_t len, bool nonblock, bool peek,
               uint8_t* from_ip, uint16_t* from_port) {
     if (s->type != 1) {
-        WAIT_FOR(s->q_head, nonblock);
+        WAIT_FOR(s->q_head || s->err, nonblock);
+        if (!s->q_head) { int e = s->err; s->err = 0; return -e; }
         dgram_t* g = s->q_head;
         uint32_t n = g->len < len ? g->len : len;
         memcpy(buf, g->data, n);
@@ -882,7 +904,7 @@ void sock_name(sock_t* s, bool peer, uint8_t* ip, uint16_t* port) {
 int sock_take_error(sock_t* s) { int e = s->err; s->err = 0; return e; }
 
 bool sock_readable(sock_t* s) {
-    if (s->type != 1) return s->q_head != NULL;
+    if (s->type != 1) return s->q_head != NULL || s->err;
     if (s->state == S_LISTEN) return s->aq_n > 0;
     return s->rx_count || s->fin_rcvd || s->err || s->state == S_CLOSED;
 }
