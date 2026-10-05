@@ -8,8 +8,10 @@
    "grabbed": the shell and window manager stop seeing them. Ctrl+Alt+Backspace
    drops the grab from the kernel side (escape hatch for a stuck program). */
 
+#define IEV_SYN 0
 #define IEV_KEY 1
 #define IEV_REL 2
+#define IEV_ABS 3
 #define IEV_REL_X 0
 #define IEV_REL_Y 1
 #define IEV_REL_WHEEL 8
@@ -20,6 +22,21 @@
 #define INPUT_ALL 0
 #define INPUT_KBD 1
 #define INPUT_MOUSE 2
+
+/* devices: one /dev/input/eventN each. ring index for open() is 3 + id */
+#define IN_DEVS 12
+typedef struct {
+    char name[48];
+    uint16_t bus, vid, pid, ver;
+    uint32_t ev, rel, abs;           /* EV_* types, REL_* and ABS_* (0..31) as bit masks */
+    uint8_t key[96];                 /* key and button bitmap */
+    int absmin[8], absmax[8];
+} input_dev_t;
+int  input_register(const input_dev_t* d);
+void input_unregister(int id);
+void input_report(int id, uint16_t type, uint16_t code, int32_t val);
+void input_repeat(uint16_t code);
+void input_init(void);
 
 void input_open(int d);
 void input_close(int d);

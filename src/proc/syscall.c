@@ -279,6 +279,7 @@ static void fill_stat_node(kstat64_t* st, fs_node_t* n) {
                       n->dev == FS_DEV_PTMX ? ((5u << 8) | 2) :
                       n->dev == FS_DEV_SNDC ? (116u << 8) : n->dev == FS_DEV_SNDP ? ((116u << 8) | 16) :
                       n->dev == FS_DEV_DRM ? (226u << 8) : n->dev == FS_DEV_DRMR ? ((226u << 8) | 128) :
+                      FS_DEV_IS_EVENT(n->dev) ? ((13u << 8) | (uint32_t)(64 + n->dev - FS_DEV_EVENT)) :
                       FS_DEV_IS_PTS(n->dev) ? ((136u << 8) | (uint32_t)(n->dev - FS_DEV_PTS)) :
                                               ((1u << 8) | n->dev);
     } else if (n->type == FS_DIR) {
@@ -313,7 +314,7 @@ static void fill_stat_file(kstat64_t* st, file_t* f) {
         st->st_mode = S_IFCHR | 0666;
         /* input: major 13, minor 64+n like /dev/input/eventN. evdev compares
            st_rdev and threw the mouse out as a duplicate of the keyboard */
-        st->st_rdev = f->type == F_SND ? (116u << 8) | (f->disk ? 16u : 0) : f->type == F_DRM ? (226u << 8) | (f->disk ? 128u : 0) : f->type == F_TTY ? (5u << 8) : f->type == F_INPUT ? (13u << 8) | (64u + (uint32_t)f->disk)
+        st->st_rdev = f->type == F_SND ? (116u << 8) | (f->disk ? 16u : 0) : f->type == F_DRM ? (226u << 8) | (f->disk ? 128u : 0) : f->type == F_TTY ? (5u << 8) : f->type == F_INPUT ? (13u << 8) | (f->disk >= 3 ? 61u + (uint32_t)f->disk : 96u + (uint32_t)f->disk)
                                                                        : (1u << 8) | 3;
     }
     st->st_atime = st->st_mtime = st->st_ctime = clock_epoch();

@@ -149,6 +149,24 @@ void mouse_feed(int dx, int dy, int dz, uint8_t newbtn) {
     if (fl & 0x200) __asm__ volatile ("sti" ::: "memory");
 }
 
+// tablets: x/y in 0..xmax / 0..ymax, scaled to the screen. grabbed = evdev has it already
+void mouse_feed_abs(int x, int y, int xmax, int ymax, int dz, uint8_t newbtn) {
+    uint64_t fl;
+    __asm__ volatile ("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+    btn = newbtn;
+    if (!input_grabbed()) {
+        wheel_acc += dz;
+        mx = xmax ? (int)((long)x * mxmax / xmax) : 0;
+        my = ymax ? (int)((long)y * mymax / ymax) : 0;
+        if (mx < 0) mx = 0;
+        if (mx > mxmax) mx = mxmax;
+        if (my < 0) my = 0;
+        if (my > mymax) my = mymax;
+        mouse_draw_cursor();
+    }
+    if (fl & 0x200) __asm__ volatile ("sti" ::: "memory");
+}
+
 static void mouse_isr(regs_t* f) {
     (void)f;
     if (!(inb(0x64) & 1)) { pic_send_eoi(12); return; }

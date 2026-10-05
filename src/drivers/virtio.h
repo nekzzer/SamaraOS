@@ -43,6 +43,9 @@ int  vm_queue(vm_t* v, vmq_t* q, int idx);
 void vm_ready(vm_t* v);
 void vmq_kick(vmq_t* q, int idx);
 
+int  vinput_up(void);
+void vinput_poll(void);
+
 #define VBLK_MAX 4
 int      vblk_init(void);                  /* number of disks: /dev/vda.. */
 bool     vblk_present(int i);

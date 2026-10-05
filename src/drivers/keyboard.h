@@ -17,6 +17,7 @@
 #define K_F1    0x90   /* F1..F10 = K_F1 .. K_F1+9 */
 
 void kbd_init(void);
+void kbd_feed_key(uint16_t lk, bool down);   /* linux key code, from usb/virtio */
 int  kbd_has_key(void);
 char kbd_getc(void);          /* blocking */
 char kbd_trygetc(void);       /* non-blocking, 0 if empty */

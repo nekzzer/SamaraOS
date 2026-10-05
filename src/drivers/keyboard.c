@@ -99,20 +99,14 @@ static int buf_pop(char* out) {
     return 1;
 }
 
-static void kbd_isr(regs_t* f) {
-    (void)f;
-    /* Only take the byte if it is keyboard data: with the AUX bit set it is
-       the mouse's (touchpads / BIOS USB emulation), and IRQ 12 reads it. */
-    uint8_t status = inb(0x64);
-    if (!(status & 0x01) || (status & 0x20)) { pic_send_eoi(1); return; }
-    uint8_t sc = inb(0x60);
+static void kbd_byte(uint8_t sc) {
 
-    if (sc == 0xE0) { ext = true; pic_send_eoi(1); return; }
+    if (sc == 0xE0) { ext = true; return; }
 
     bool released = sc & 0x80;
     sc &= 0x7F;
 
-    if (!ext && is_ignored(sc)) { pic_send_eoi(1); return; }
+    if (!ext && is_ignored(sc)) { return; }
 
     /* Held-key bitmap by Linux key code, for games (see gui/uwin.c). */
     {
@@ -138,14 +132,12 @@ static void kbd_isr(regs_t* f) {
             if (sc == 0x0E && !released && ctrl && alt) {
                 input_release_grab();
                 fbdev_force_release();
-                pic_send_eoi(1);
-                return;
+                        return;
             }
         }
         uint16_t code = input_linux_key(sc, ext);
         ext = false;
         if (code) { input_push(IEV_KEY, code, released ? 0 : 1); input_sync(INPUT_KBD); }
-        pic_send_eoi(1);
         return;
     }
 
@@ -169,7 +161,6 @@ static void kbd_isr(regs_t* f) {
                 case 0x35: buf_push('/'); break;           /* keypad '/' */
             }
         }
-        pic_send_eoi(1);
         return;
     }
 
@@ -177,29 +168,27 @@ static void kbd_isr(regs_t* f) {
         /* Alt+Shift (either order) toggles RU/EN, fired on the second key. */
         case 0x2A: case 0x36:
             if (!released && !shift && alt) { ru_layout = !ru_layout; ru_epoch++; }
-            shift = !released; pic_send_eoi(1); return;
-        case 0x1D: ctrl  = !released; pic_send_eoi(1); return;
+            shift = !released; return;
+        case 0x1D: ctrl  = !released; return;
         case 0x38:
             if (!released && !alt && shift) { ru_layout = !ru_layout; ru_epoch++; }
-            alt   = !released; pic_send_eoi(1); return;
-        case 0x3A: if (!released) caps = !caps; pic_send_eoi(1); return;
+            alt   = !released; return;
+        case 0x3A: if (!released) caps = !caps; return;
     }
 
-    if (released) { pic_send_eoi(1); return; }
+    if (released) { return; }
 
     if (sc >= 0x3B && sc <= 0x44) {
         buf_push((char)(K_F1 + (sc - 0x3B)));
-        pic_send_eoi(1);
         return;
     }
     /* F11: fullscreen toggle for the WM. Not a buffer code - everything
        above 0x80 is also CP866 Cyrillic - so it is counted on the side. */
     if (sc == 0x57) {
         f11_count++;
-        pic_send_eoi(1);
         return;
     }
-    if (sc == 0x58) { pic_send_eoi(1); return; }        /* F12: unused */
+    if (sc == 0x58) { return; }        /* F12: unused */
 
     /* base char */
     bool letter_case_up = shift ^ caps;
@@ -228,7 +217,45 @@ static void kbd_isr(regs_t* f) {
     }
 
     if (c) buf_push(c);
+}
+
+static void kbd_isr(regs_t* f) {
+    (void)f;
+    /* Only take the byte if it is keyboard data: with the AUX bit set it is
+       the mouse's (touchpads / BIOS USB emulation), and IRQ 12 reads it. */
+    uint8_t status = inb(0x64);
+    if ((status & 0x01) && !(status & 0x20)) kbd_byte(inb(0x60));
     pic_send_eoi(1);
+}
+
+// usb / virtio keyboards come in by linux key code, same path as the ps/2 bytes
+void kbd_feed_key(uint16_t lk, bool down) {
+    uint8_t sc = 0;
+    bool x = true;
+    switch (lk) {
+        case 103: sc = 0x48; break;
+        case 108: sc = 0x50; break;
+        case 105: sc = 0x4B; break;
+        case 106: sc = 0x4D; break;
+        case 102: sc = 0x47; break;
+        case 107: sc = 0x4F; break;
+        case 104: sc = 0x49; break;
+        case 109: sc = 0x51; break;
+        case 110: sc = 0x52; break;
+        case 111: sc = 0x53; break;
+        case 97: sc = 0x1D; break;
+        case 100: sc = 0x38; break;
+        case 96: sc = 0x1C; break;
+        case 98: sc = 0x35; break;
+        case 127: sc = 0x5D; break;
+        default: x = false; if (lk && lk < 0x59) sc = lk;
+    }
+    if (!sc) return;
+    uint64_t fl;
+    __asm__ volatile ("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+    if (x) kbd_byte(0xE0);
+    kbd_byte(down ? sc : sc | 0x80);
+    if (fl & 0x200) __asm__ volatile ("sti" ::: "memory");
 }
 
 void kbd_init(void) {

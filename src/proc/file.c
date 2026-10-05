@@ -50,6 +50,13 @@ static file_t* open_pty_slave(int i, int flags) {
 file_t* file_open_node(fs_node_t* n, int flags) {
     static const ftype_t dev_type[] = { 0, F_NULL, F_ZERO, F_TTY, F_RANDOM, F_FB, F_INPUT };
     if (n->dev == FS_DEV_SOCK) return NULL;                   /* sockets get connect(), not open() */
+    if (FS_DEV_IS_EVENT(n->dev)) {
+        file_t* f = file_new(F_INPUT, flags);
+        if (!f) return NULL;
+        f->disk = 3 + n->dev - FS_DEV_EVENT;
+        input_open(f->disk);
+        return f;
+    }
     if (n->dev == FS_DEV_EVKBD || n->dev == FS_DEV_EVMOUSE) {
         file_t* f = file_new(F_INPUT, flags);
         if (!f) return NULL;

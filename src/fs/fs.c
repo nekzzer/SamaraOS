@@ -41,7 +41,7 @@ void fs_init(void) {
     static const struct { const char* name; uint8_t dev; } devs[] = {
         { "null", FS_DEV_NULL }, { "zero", FS_DEV_ZERO }, { "tty", FS_DEV_TTY },
         { "console", FS_DEV_TTY }, { "random", FS_DEV_RANDOM }, { "urandom", FS_DEV_RANDOM },
-        { "fb0", FS_DEV_FB }, { "input", FS_DEV_INPUT }, { "ptmx", FS_DEV_PTMX },
+        { "fb0", FS_DEV_FB }, { "input-all", FS_DEV_INPUT }, { "ptmx", FS_DEV_PTMX },
         { "input-kbd", FS_DEV_EVKBD }, { "input-mouse", FS_DEV_EVMOUSE },
     };
     for (unsigned i = 0; i < sizeof(devs) / sizeof(devs[0]); i++) {
@@ -371,7 +371,7 @@ void fs_path(fs_node_t* n, char* out, size_t cap) {
 void fs_add_disk_nodes(void) {
     fs_node_t* dev = fs_resolve(root_, "/dev");
     if (!dev) return;
-    for (int i = 0; i < DISK_MAX; i++) {
+    for (int i = 0; i < DISK_ALL; i++) {
         if (!ata_drive_present(i) || find_child(dev, ata_drive_name(i))) continue;
         fs_node_t* d = node_new(ata_drive_name(i), FS_FILE, dev);
         if (!d) return;
