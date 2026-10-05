@@ -29,12 +29,14 @@ struct cpu {
     struct task* cur;
     struct task* idle;
     struct task* prev;     /* switched away from, on_cpu still set */
+    struct task* prev2;    /* finish() switched a second time on the way out */
     int      rr;
     uint32_t slice;
     uint64_t cr3;          /* what is loaded */
     volatile uint32_t tlb_req;
     volatile uint32_t unload;   /* leave the address space you have, it is going away */
     uint32_t t_user, t_sys, t_idle;
+    int dr_on;
 };
 extern struct cpu cpus[MAX_CPUS];
 extern int ncpu;                        /* started */

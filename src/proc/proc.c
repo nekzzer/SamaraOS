@@ -500,7 +500,8 @@ int proc_reap(int pid) {
 
 static void free_or_zombify(proc_t* p) {
     proc_t* parent = p->ppid ? proc_by_pid(p->ppid) : NULL;
-    if (!p->kernel_waited && (!parent || parent->state != P_ALIVE)) p->state = P_FREE;
+    proc_t* tr = p->tracer ? proc_by_pid(p->tracer) : NULL;
+    if (!p->kernel_waited && (!parent || parent->state != P_ALIVE) && !(tr && tr->state == P_ALIVE)) p->state = P_FREE;
     else p->state = P_ZOMBIE;
 }
 
@@ -525,7 +526,7 @@ void futex_forget(proc_t* p) {
     p->in_futex = false;
 }
 
-static void ready_task_of(proc_t* p) {
+void ready_task_of(proc_t* p) {
     __sync_synchronize();
     task_t* t = task_at(p->task);
     if (t && t->proc == p && t->state == T_BLOCKED) { t->wake_ms = 0; t->state = T_READY; }
@@ -567,7 +568,11 @@ static void thread_kill(proc_t* q) {
         t->cr3 = 0;
         t->state = T_DEAD;
     }
-    q->state = P_FREE;
+    proc_t* tr = q->tracer ? proc_by_pid(q->tracer) : NULL;
+    if (tr && tr->state == P_ALIVE && tr->sh != q->sh) {     // strace -f wants to wait4 the dead thread
+        q->state = P_ZOMBIE;
+        tr->sig_pending |= SIGBIT(17);
+    } else q->state = P_FREE;
 }
 
 /* Release everything of a process that is not running right now, or of the
@@ -580,10 +585,11 @@ static void teardown(proc_t* p, int status) {
     bool cur_in = cur && cur->sh == p->sh;
     for (int i = 0; i < MAX_PROCS; i++) {
         proc_t* q = &procs[i];
-        if (q != p && q->state != P_FREE && q->is_thread && q->tgid == p->pid) thread_kill(q);
+        if (q != p && q->state != P_FREE && q->is_thread && q->tgid == p->pid) { q->exit_status = status; thread_kill(q); }
     }
     p->zleader = false;
     futex_forget(p);
+    pt_release(p->pid);
     uwin_proc_exit(p->pid);
     for (int i = 0; i < MAX_FDS; i++) {
         if (p->sh->fds[i]) { flk_close(p->sh, p->sh->fds[i]); file_close(p->sh->fds[i]); p->sh->fds[i] = NULL; }
@@ -654,6 +660,7 @@ void proc_thread_exit(int status) {
         t->cr3 = 0;
         t->state = T_DEAD;
     } else {
+        p->exit_status = status;
         thread_kill(p);
     }
     for (;;) task_yield();
@@ -692,10 +699,23 @@ static int send_sig(proc_t* p, int sig, bool exact) {
     if (!p || p->state != P_ALIVE) return -ESRCH;
     if (sig == 0) return 0;
     if (sig < 0 || sig >= NSIG_MAX) return -EINVAL;
+    if (sig == 18) pt_cont_group(p);
     if (sig != 9) {
         uint64_t h = p->sh->sa[sig].handler;
-        if (h == 1) return 0;                               /* SIG_IGN */
         proc_t* d = p->is_thread || exact ? p : pick_thread(p, sig);
+        if (d->tracer || (sig == 19 && h == 0)) {            /* ptrace sees everything, SIGSTOP stops */
+            if (sig == 19 && !d->tracer) {
+                for (int i = 0; i < MAX_PROCS; i++) {
+                    proc_t* q = &procs[i];
+                    if (q->state == P_ALIVE && q->tgid == p->tgid && !q->zleader) { q->sig_pending |= SIGBIT(19); ready_task_of(q); }
+                }
+                return 0;
+            }
+            d->sig_pending |= SIGBIT(sig);
+            ready_task_of(d);
+            return 0;
+        }
+        if (h == 1) return 0;                               /* SIG_IGN */
         if (h > 1 || (d->sig_mask & SIGBIT(sig))) {         /* caught or blocked (signalfd): stays pending */
             d->sig_pending |= SIGBIT(sig);
             ready_task_of(d);                               /* sleeping in a wait queue or a nap: look at it now */
@@ -818,6 +838,7 @@ static int do_fork(regs_t* r, bool share) {
     }
     regs_t child = *r;
     child.rax = 0;
+    pt_child(parent, c, share ? 2 : 1);
     int e = start_task(c, &child);
     if (e < 0) {
         for (int i = 0; i < MAX_FDS; i++) { file_close(c->sh->fds[i]); c->sh->fds[i] = NULL; }
@@ -894,6 +915,7 @@ int proc_clone(regs_t* r) {
     regs_t child = *r;
     child.rax = 0;
     if (stk) child.rsp = stk;
+    pt_child(parent, c, 3);
     int e = start_task(c, &child);
     if (e < 0) { c->state = P_FREE; return e; }
     return c->pid;
@@ -1031,11 +1053,26 @@ int proc_wait(int pid, int* status, int options) {
         bool have = false;
         for (int i = 0; i < MAX_PROCS; i++) {
             proc_t* c = &procs[i];
-            if (c->state == P_FREE || c->ppid != me->tgid) continue;
+            if (c->state == P_FREE) continue;
+            bool mine = c->ppid == me->tgid && !c->is_thread;
+            if (!mine && c->tracer != me->tgid) continue;
             if (pid > 0 && c->pid != pid) continue;
             if (pid == 0 && c->pgid != me->pgid) continue;
             if (pid < -1 && c->pgid != -pid) continue;
             have = true;
+            int pst;
+            if (pt_wait_report(c, me, options, &pst)) {
+                if (status) *status = pst;
+                return c->pid;
+            }
+            if (c->state == P_ZOMBIE && !mine) {
+                if (status) *status = c->exit_status;
+                int cp = c->pid;
+                c->tracer = 0;
+                proc_t* par = c->ppid ? proc_by_pid(c->ppid) : NULL;
+                if (c->is_thread || !par || par->state != P_ALIVE) c->state = P_FREE;
+                return cp;
+            }
             if (c->state == P_ZOMBIE) {
                 if (status) *status = c->exit_status;
                 int cp = c->pid;
@@ -1050,6 +1087,8 @@ int proc_wait(int pid, int* status, int options) {
     }
 }
 
+void proc_cpu_timers(proc_t* p, bool user);
 void proc_account_tick(proc_t* p, bool user) {
     if (user) p->utime++; else p->stime++;
+    if (p->itv_at || p->itp_at) proc_cpu_timers(p, user);
 }

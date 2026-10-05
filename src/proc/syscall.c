@@ -394,12 +394,14 @@ static int do_open(int dirfd, const char* path, int flags, int mode) {
         n = fs_create(parent, name, FS_FILE);
         if (!n) return -EACCES;
         n->mode = (uint16_t)(mode & ~me()->sh->umask & 07777);
+        ino_node(n, 0x100);
     }
     if ((flags & O_DIRECTORY) && n->type != FS_DIR) return -ENOTDIR;
     if (n->type == FS_DIR && (flags & O_ACCMODE) != 0) return -EISDIR;
-    if ((flags & O_TRUNC) && n->type == FS_FILE && !n->dev && (flags & O_ACCMODE)) node_truncate(n, 0);
+    if ((flags & O_TRUNC) && n->type == FS_FILE && !n->dev && (flags & O_ACCMODE)) { uint32_t os = n->size; node_truncate(n, 0); if (os) ino_node(n, 2); }
     file_t* f = file_open_node(n, flags & ~(O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC));
     if (!f) return n->dev == FS_DEV_TTY ? -ENXIO : -ENOMEM;     // xterm dies on ENOMEM here
+    ino_node(n, 0x20);
     return install_fd(f, 0, (flags & O_CLOEXEC) != 0);
 }
 
@@ -525,6 +527,7 @@ static int do_getdents64(int fd, uint8_t* buf, uint64_t n) {
 
 static bool is_shm(fs_node_t* n);
 static void shm_drop(fs_node_t* n);
+static void shm_drop_ino(fs_node_t* n) { ino_gone(n, false); shm_drop(n); }
 
 static int do_unlink(int dirfd, const char* path, int flags) {
     UCHK(path, 1);
@@ -545,6 +548,8 @@ static int do_unlink(int dirfd, const char* path, int flags) {
     fs_node_t* parent = n->parent;
     if (!parent) return -EBUSY;
     if (is_shm(n) && !n->xl && !n->hl) shm_drop(n);       // mappings keep their own refs
+    ino_ev(parent, 0x200 | (n->type == FS_DIR ? 0x40000000 : 0), n->name, 0);
+    ino_gone(n, !n->xl && !n->hl);
     fs_drop_name(n);
     return 0;
 }
@@ -559,6 +564,7 @@ static int do_mkdir(int dirfd, const char* path, int mode) {
     fs_node_t* n = fs_create(parent, name, FS_DIR);
     if (!n) return -EEXIST;
     n->mode = (uint16_t)(mode & ~me()->sh->umask & 07777);
+    ino_node(n, 0x100);
     return 0;
 }
 
@@ -590,10 +596,15 @@ static int do_rename(int ofd, const char* from, int nfd, const char* to) {
         int r = do_unlink(nfd, to, dst->type == FS_DIR ? AT_REMOVEDIR : 0);
         if (r < 0) return r;
     }
+    static uint32_t cookie;
+    uint32_t ck = ++cookie, isd = src->type == FS_DIR ? 0x40000000 : 0;
+    ino_ev(src->parent, 0x40 | isd, src->name, ck);
     fs_detach(src);
     strncpy(src->name, name, FS_NAME_MAX - 1);
     src->name[FS_NAME_MAX - 1] = 0;
     fs_attach(parent, src);
+    ino_ev(parent, 0x80 | isd, src->name, ck);
+    ino_ev(src, 0x800, NULL, 0);
     return 0;
 }
 
@@ -618,7 +629,9 @@ static int do_link(int ofd, const char* from, int nfd, const char* to, int flags
     if (ow != fs_owner(par)) return -EXDEV;
     if (ow->mount_id && ow->mount_id < 8) return -EPERM;       /* fat */
     if (src->xl > 60000) return -EMLINK;
-    return fs_hlink(src, par, name) < 0 ? -ENOMEM : 0;
+    if (fs_hlink(src, par, name) < 0) return -ENOMEM;
+    ino_ev(par, 0x100, name, 0);
+    return 0;
 }
 
 static int do_access(int dirfd, const char* path) {
@@ -692,7 +705,7 @@ static int do_ioctl(int fd, uint32_t req, uint64_t arg) {
     if (req == 0x541B) {                                      /* FIONREAD */
         UCHK((void*)arg, 4);
         int n = 0;
-        if (f->type == F_PIPE_R || f->type == F_SPAIR) n = f->pipe->count;
+        if (f->type == F_PIPE_R || f->type == F_SPAIR || f->type == F_INOTIFY) n = f->pipe->count;
         else if (f->type == F_NODE && f->node->type == FS_FILE && f->off < f->node->size)
             n = (int)(f->node->size - f->off);
         else if (f->type == F_TTY) n = tty_readable() ? 1 : 0;
@@ -1793,6 +1806,7 @@ int file_wqs(file_t* f, wq_t** v) {
         case F_PIPE_R: case F_PIPE_W: v[0] = &f->pipe->wq; return 1;
         case F_SPAIR: v[0] = &f->pipe->wq; v[1] = &f->pipe2->wq; return 2;
         case F_EVENTFD: v[0] = &f->wq; return 1;
+        case F_INOTIFY: v[0] = &f->pipe->wq; return 1;
         case F_TTY: v[0] = &tty_wq; return 1;
         case F_PTM: case F_PTS: v[0] = pty_wq(f->pty); return v[0] ? 1 : 0;
         case F_ULISTEN: v[0] = &f->ux->wq; return 1;
@@ -2319,11 +2333,17 @@ static int64_t dispatch(regs_t* r) {
     int err;
     fs_node_t* n;
     switch (r->rax) {
-        case 60:  proc_thread_exit((int)((a & 0xFF) << 8));
-        case 231: proc_exit((int)((a & 0xFF) << 8));
-        case 57:  return proc_fork(r);
-        case 58:  return proc_vfork(r);
-        case 56:  return proc_clone(r);
+        case 60:  pt_exit_event(p, (int)((a & 0xFF) << 8)); proc_thread_exit((int)((a & 0xFF) << 8));
+        case 231: pt_exit_event(p, (int)((a & 0xFF) << 8)); proc_exit((int)((a & 0xFF) << 8));
+        case 57: case 58: case 56: {
+            int64_t ret = r->rax == 57 ? proc_fork(r) : r->rax == 58 ? proc_vfork(r) : proc_clone(r);
+            if (ret > 0 && p->tracer) {
+                int ev = r->rax == 57 ? 1 : r->rax == 58 ? 2 : (a & 0x10000) ? 3 : 1;
+                int fl = ev == 1 ? 2 : ev == 2 ? 4 : 8;
+                if (p->pt_opts & fl) { r->rax = (uint64_t)ret; pt_event(p, r, ev, (uint64_t)ret); }
+            }
+            return ret;
+        }
         case 0:   return do_read((int)a, (char*)b, c);
         case 1:   return do_write((int)a, (const char*)b, c);
         case 19:  return do_rwv((int)a, (iovec_t*)b, (int)c, false);
@@ -2384,7 +2404,9 @@ static int64_t dispatch(regs_t* r) {
             UCHK((void*)a, 1);
             if (b) UCHK((void*)b, 8);
             if (c) UCHK((void*)c, 8);
-            return proc_execve(r, (const char*)a, (char* const*)b, (char* const*)c);
+            int ret = proc_execve(r, (const char*)a, (char* const*)b, (char* const*)c);
+            if (ret >= 0 && p->tracer) pt_exec(p, r);
+            return ret;
         }
         case 80:
             UCHK((void*)a, 1);
@@ -2478,6 +2500,34 @@ static int64_t dispatch(regs_t* r) {
             *(int*)a = *(int*)b = *(int*)c = 0;
             return 0;
         case 115: return 0;                                          /* getgroups: none */
+        case 128: {                                                  /* rt_sigtimedwait(set, info, ts, sz) */
+            UCHK((void*)a, 8);
+            uint64_t set = *(uint64_t*)a;
+            uint32_t end = 0;
+            if (c) { UCHK((void*)c, 16); int64_t* ts = (int64_t*)c; end = pit_uptime_ms() + ts[0] * 1000 + (ts[1] + 999999) / 1000000; if (!end) end = 1; }
+            for (;;) {
+                uint64_t hit = p->sig_pending & set;
+                if (hit) {
+                    int sg = __builtin_ctzll(hit) + 1;
+                    p->sig_pending &= ~(1ull << (sg - 1));
+                    if (b) {
+                        UCHK((void*)b, 128);
+                        uint32_t* si = (uint32_t*)b;
+                        memset(si, 0, 128);
+                        si[0] = sg;
+                        if (sg == p->sq_sig) {
+                            si[2] = (uint32_t)-2; si[4] = p->sq_tid; si[5] = p->sq_over;
+                            *(uint64_t*)(si + 6) = p->sq_val;
+                            p->sq_sig = 0;
+                        }
+                    }
+                    return sg;
+                }
+                if (end && (int32_t)(pit_uptime_ms() - end) >= 0) return -11;
+                if (proc_interrupted()) return -EINTR;
+                task_sleep_ms(2);
+            }
+        }
         case 34:                                                     /* pause */
             while (!proc_interrupted()) task_sleep_ms(10);
             return -EINTR;
@@ -2526,25 +2576,8 @@ static int64_t dispatch(regs_t* r) {
             p->alarm_interval = 0;
             return left;
         }
-        case 38: case 36: {                                          /* setitimer / getitimer */
-            if ((int)a != 0) return -EINVAL;                         /* ITIMER_REAL only */
-            int64_t* oldv = (int64_t*)(r->rax == 38 ? c : b);
-            if (oldv) {
-                UCHK(oldv, 32);
-                uint32_t left = p->alarm_at ? p->alarm_at - pit_uptime_ms() : 0;
-                oldv[0] = p->alarm_interval / 1000; oldv[1] = p->alarm_interval % 1000 * 1000;
-                oldv[2] = left / 1000; oldv[3] = left % 1000 * 1000;
-            }
-            if (r->rax == 38 && b) {
-                UCHK((void*)b, 32);
-                int64_t* nv = (int64_t*)b;
-                uint32_t val = nv[2] * 1000 + nv[3] / 1000, iv = nv[0] * 1000 + nv[1] / 1000;
-                if ((nv[2] || nv[3]) && !val) val = 1;
-                p->alarm_at = val ? pit_uptime_ms() + val : 0;
-                p->alarm_interval = val ? iv : 0;
-            }
-            return 0;
-        }
+        case 38: case 36: case 222: case 223: case 224: case 225: case 226:
+            return sys_timer(r->rax, a, b, c, d);
         case 15:  return proc_sigreturn(r);
         case 14:  return do_sigprocmask((int)a, (const uint64_t*)b, (uint64_t*)c, d);
         case 127:                                                    /* rt_sigpending */
@@ -2728,6 +2761,26 @@ static int64_t dispatch(regs_t* r) {
         }
         case 324: case 334: case 435:
             return -ENOSYS;
+        case 253: case 294: {                                        /* inotify_init(1) */
+            file_t* f = ino_new(r->rax == 294 ? (int)a : 0);
+            if (!f) return -ENOMEM;
+            return install_fd(f, 0, r->rax == 294 && (a & 02000000));
+        }
+        case 254: {                                                  /* inotify_add_watch */
+            file_t* f = getf((int)a);
+            if (!f || f->type != F_INOTIFY) return -EBADF;
+            UCHK((void*)b, 1);
+            int err;
+            fs_node_t* n = lookup_ex(AT_FDCWD, (const char*)b, &err, !(c & 0x02000000));
+            if (!n) return err;
+            if ((c & 0x01000000) && n->type != FS_DIR) return -ENOTDIR;
+            return ino_add(f, n, (uint32_t)c);
+        }
+        case 255: {
+            file_t* f = getf((int)a);
+            if (!f || f->type != F_INOTIFY) return -EBADF;
+            return ino_rm(f, (int)b);
+        }
         case 284: case 290: {                                        /* eventfd(2) */
             int fl = r->rax == 290 ? (int)b : 0;
             file_t* f = file_new(F_EVENTFD, 2 | ((fl & 04000) ? O_NONBLOCK : 0) | ((fl & 1) ? 0x10000000 : 0));
@@ -2847,7 +2900,14 @@ static int64_t dispatch(regs_t* r) {
         case 48:  return sys_socket_call(13, a, b, 0, 0, 0, 0);       /* shutdown */
         case 40:  return do_copy((int)b, (uint64_t*)c, (int)a, NULL, d);
         case 326: return do_copy((int)a, (uint64_t*)b, (int)c, (uint64_t*)d, e);
-        case 101: case 103: return -EPERM;
+        case 101: return sys_ptrace(a, b, c, d);
+        case 135: {                                                   /* personality, gdb wants ADDR_NO_RANDOMIZE to stick */
+            static uint32_t pers;
+            uint32_t old = pers;
+            if ((uint32_t)a != 0xffffffffu) pers = (uint32_t)a;
+            return old;
+        }
+        case 103: return -EPERM;
         case 425: return uring_setup(a, (void*)b);
         case 426: return uring_enter((int)a, b, c, d, (const void*)e, f6);
         case 427: return uring_register((int)a, b, (void*)c, d);
@@ -2999,6 +3059,11 @@ static bool changes_fs(uint64_t nr, uint64_t a) {
 }
 
 void syscall_dispatch(regs_t* r) {
+    proc_t* tp = proc_current();
+    if (tp && tp->tracer) {
+        tp->pt_orig = r->rax;
+        if (tp->pt_sys) { pt_syscall_stop(tp, r, false); tp->pt_orig = r->rax; }
+    }
     uint64_t nr = r->rax;
     proc_check_alarm(proc_current(), false);
     bool mut = changes_fs(nr, r->rdi);
@@ -3063,6 +3128,10 @@ void syscall_dispatch(regs_t* r) {
     /* execve and sigreturn have already installed the registers to return with. */
     bool keep = (nr == 59 && ret >= 0) || (nr == 15 && ret == 0);
     if (!keep) r->rax = (uint64_t)ret;
+    if (tp && tp->tracer && tp->pt_sys && tp == proc_current()) {
+        pt_syscall_stop(tp, r, true);
+        if (!keep) ret = (int64_t)r->rax;
+    }
     proc_deliver_signal(r, keep ? -1 : (int)nr, keep ? 0 : (int32_t)ret);
 }
 
@@ -3073,7 +3142,7 @@ uint8_t nobkl_tab[512];
 int64_t syscall_nobkl(regs_t* r) {
     uint64_t nr = r->rax, a = r->rdi, b = r->rsi, c = r->rdx;
     proc_t* p = proc_current();
-    if (!p || g_strace || g_ftrace || p->alarm_at) return NB_SLOW;
+    if (!p || g_strace || g_ftrace || p->alarm_at || p->tracer) return NB_SLOW;
     int64_t ret;
     if (setjmp((void*)p->ujb)) {
         proc_current()->ujb_on = false;
@@ -3157,7 +3226,7 @@ int64_t syscall_nobkl(regs_t* r) {
 }
 
 void syscall_init(void) {
-    fs_free_hook = shm_drop;
+    fs_free_hook = shm_drop_ino;
     static const uint16_t nb[] = { 0, 1, 9, 10, 11, 39, 186, 102, 104, 107, 108, 96, 228, 229, 24, 35, 230, 202 };
     for (unsigned i = 0; i < sizeof(nb) / sizeof(nb[0]); i++) nobkl_tab[nb[i]] = 1;
 }

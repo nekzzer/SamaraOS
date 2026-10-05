@@ -29,6 +29,13 @@ typedef struct pshared {
         uint64_t mask;
     } sa[NSIG_MAX];
     uint64_t brk_start, brk;
+    struct ptimer {                /* timer_create, ms resolution, deadline in uptime ms */
+        bool     used, armed;
+        int      clk, signo, notify, tid;
+        uint64_t val;              /* sigev_value */
+        uint32_t at, iv;
+        int      over;
+    } tm[16];
     fs_node_t* cwd;
     int      umask;
 } pshared_t;
@@ -70,6 +77,19 @@ typedef struct proc {
     uint32_t utime, stime;         /* PIT ticks (1 ms) in ring 3 / ring 0 */
     char     cmdline[256];         /* argv, NUL-separated, as the user typed it */
     uint16_t cmdline_len;
+    uint32_t itv_at, itv_iv, itp_at, itp_iv;   /* ITIMER_VIRTUAL / PROF: cpu ms left, reload */
+    int      sq_sig, sq_tid, sq_over;          /* siginfo of the last timer signal */
+    uint64_t sq_val;
+    /* ptrace and job stop, see ptrace.c */
+    int      tracer;               /* tgid of the tracer, 0 = nobody */
+    int      pt_opts;
+    int      pt_state;             /* 0 running, 1 stopped, 2 told to go on (isr style stops only) */
+    int      pt_stopsig, pt_event, pt_inj, pt_kind;
+    uint64_t pt_msg, pt_orig;
+    regs_t*  pt_regs;
+    bool     pt_rep, pt_sys, pt_isr, pt_isr_stop, pt_intr, pt_seize, pt_job, pt_entry, pt_tf, pt_sival;
+    uint8_t  pt_si[128];
+    uint64_t dr[8];
 } proc_t;
 
 void    proc_init(void);
@@ -133,6 +153,22 @@ int     proc_sigsuspend(const uint64_t* mask);
 int     proc_sigaltstack(const uint64_t* ss, uint64_t* old, uint64_t rsp);
 void    proc_check_alarm(proc_t* p, bool from_irq);   /* fire SIGALRM when due */
 void    proc_account_tick(proc_t* p, bool user);
+void    proc_timers_tick(uint32_t now);
+int64_t sys_timer(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d);
+
+/* ptrace.c */
+int64_t sys_ptrace(uint64_t req, uint64_t pid, uint64_t addr, uint64_t data);
+int     pt_stop(proc_t* p, regs_t* r, int sig, int event, int kind);   /* 0 = stopped in an isr, caller leaves */
+void    pt_syscall_stop(proc_t* p, regs_t* r, bool exit);
+void    pt_event(proc_t* p, regs_t* r, int event, uint64_t msg);
+void    pt_exec(proc_t* p, regs_t* r);
+void    pt_exit_event(proc_t* p, int status);
+void    pt_child(proc_t* p, proc_t* c, int kind);                      /* fork/vfork/clone: auto attach */
+void    pt_release(int tgid);                                          /* tracer is gone */
+bool    pt_wait_report(proc_t* c, proc_t* me, int options, int* st);
+void    pt_cont_group(proc_t* p);                                      /* SIGCONT */
+void    ready_task_of(proc_t* p);
+void    pt_dbg_load(proc_t* p);
 
 /* procfs.c: rebuild /proc from live kernel state (called on /proc lookups). */
 void    procfs_refresh(void);

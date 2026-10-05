@@ -70,6 +70,7 @@ static void exc_default(regs_t* f) {
     com_str(" rip="); utoa(f->rip, b, 16); com_str(b);
     com_str("\r\n");
     vga_printf("\n[EXC %d] err=0x%lx rip=0x%lx -- halted\n", (int)f->vec, f->err, f->rip);
+    { extern void kpanic_dump(const char*, regs_t*); kpanic_dump("exception", f); }
     __asm__ volatile ("cli");
     for (;;) __asm__ volatile ("hlt");
 }
@@ -116,6 +117,10 @@ void isr_leave(regs_t* f) {
     if (c->prev) {
         __atomic_store_n(&c->prev->on_cpu, 0, __ATOMIC_RELEASE);
         c->prev = NULL;
+    }
+    if (c->prev2) {
+        __atomic_store_n(&c->prev2->on_cpu, 0, __ATOMIC_RELEASE);
+        c->prev2 = NULL;
     }
     if (c->bkl && ((f->cs & 3) || (c->idle && c->cur == c->idle) || c->cur->nobkl)) bkl_drop(c);
 }

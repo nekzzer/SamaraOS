@@ -83,6 +83,7 @@ static bool is_pid_name(const char* s) {
 
 static char state_of(proc_t* p) {
     if (p->state == P_ZOMBIE) return 'Z';
+    if (p->pt_state == 1) return 't';
     return p == proc_current() ? 'R' : 'S';
 }
 
@@ -133,19 +134,29 @@ static void fill_pid_dir(fs_node_t* d, proc_t* p, char* mem, uint32_t cap) {
     sb_puts(&b, p->name); sb_putc(&b, '\n');
     put(d, "comm", &b);
 
+    {   // gdb opens /proc/pid/exe to see if the tracee is 64 bit
+        proc_t* lp = proc_by_pid(p->tgid);
+        const char* x = lp && lp->exe[0] ? lp->exe : p->exe;
+        fs_node_t* ol = fs_child(d, "exe");
+        if (ol && (ol->type != FS_LINK || strcmp(ol->data, x))) { remove_tree(ol); ol = NULL; }
+        if (!ol && x[0]) fs_symlink(d, "exe", x);
+    }
+
     b = (sb_t){ mem, 0, cap };                                /* df and friends read /proc/self/mounts (void's /etc/mtab) */
     sb_puts(&b, "rootfs / ramfs rw 0 0\nproc /proc proc rw 0 0\n");
     b.len += (uint32_t)fatfs_mounts_text(b.buf + b.len, (int)(b.cap - b.len));
     put(d, "mounts", &b);
 
-    static const char* const long_state[] = { "R (running)", "S (sleeping)", "Z (zombie)" };
+    static const char* const long_state[] = { "R (running)", "S (sleeping)", "Z (zombie)", "t (tracing stop)" };
     b = (sb_t){ mem, 0, cap };
     sb_puts(&b, "Name:\t"); sb_puts(&b, p->name);
     sb_puts(&b, "\nUmask:\t0"); { char t[8]; utoa((uint32_t)p->sh->umask, t, 8); sb_puts(&b, t); }
-    sb_puts(&b, "\nState:\t"); sb_puts(&b, long_state[s == 'R' ? 0 : s == 'S' ? 1 : 2]);
+    sb_puts(&b, "\nState:\t"); sb_puts(&b, long_state[s == 'R' ? 0 : s == 'S' ? 1 : s == 'Z' ? 2 : 3]);
     sb_puts(&b, "\nTgid:\t"); sb_int(&b, p->tgid);
     sb_puts(&b, "\nPid:\t"); sb_int(&b, p->pid);
     sb_puts(&b, "\nPPid:\t"); sb_int(&b, p->ppid);
+    sb_puts(&b, "\nTracerPid:\t"); sb_int(&b, p->tracer);
+    sb_puts(&b, "\nPtDbg:\t"); sb_int(&b, p->pt_state); sb_putc(&b, ' '); sb_int(&b, p->pt_stopsig); sb_putc(&b, ' '); sb_int(&b, p->pt_rep); sb_putc(&b, ' '); sb_int(&b, p->pt_event);
     sb_puts(&b, "\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\n");
     int nfd = 0;
     for (int i = 0; i < MAX_FDS; i++) if (p->sh->fds[i]) nfd++;

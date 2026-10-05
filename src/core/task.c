@@ -189,6 +189,7 @@ static regs_t* switch_to(struct cpu* c, task_t* next, regs_t* saved) {
     cpu_ctxt++;
 
     if (prev->fpu) __asm__ volatile ("fxsave64 (%0)" : : "r"(prev->fpu) : "memory");
+    if (c->prev) c->prev2 = c->prev;
     c->prev = prev;                 // on_cpu goes away in isr_leave, when we are off its stack
     c->cur = next;
     c->in_idle = 0;
@@ -198,6 +199,8 @@ static regs_t* switch_to(struct cpu* c, task_t* next, regs_t* saved) {
     if (next->kstack_top) tss_set_rsp0(next->kstack_top);
     load_cr3(c, next->cr3 ? next->cr3 : kernel_cr3);
     if (next->proc) wrmsr_fs(proc_tls_base(next->proc));
+    if (next->proc && next->proc->dr[7]) { pt_dbg_load(next->proc); c->dr_on = 1; }
+    else if (c->dr_on) { __asm__ volatile ("mov %0, %%dr7" : : "r"(0ul)); c->dr_on = 0; }
     return (regs_t*)next->rsp;
 }
 
@@ -213,8 +216,17 @@ static regs_t* finish(struct cpu* c, regs_t* f) {
     }
     task_t* t = c->cur;
     if (t->proc) {
-        proc_check_alarm(t->proc, true);
-        if (proc_signal_deliverable(t->proc)) proc_deliver_signal(f, -1, 0);
+        proc_t* p = t->proc;
+        proc_check_alarm(p, true);
+        p->pt_isr = true;
+        if (proc_signal_deliverable(p)) proc_deliver_signal(f, -1, 0);
+        p->pt_isr = false;
+        if (p->pt_state == 1 && p->pt_isr_stop) {        /* ptrace-stop: park, the tracer wakes us */
+            t->wake_ms = pit_uptime_ms() + 100;
+            t->state = T_BLOCKED;
+            task_t* n = pick(c);
+            return finish(c, switch_to(c, n ? n : c->idle, f));
+        }
     }
     return f;
 }
@@ -243,6 +255,7 @@ static regs_t* schedule(regs_t* saved) {
                 if (tasks[i].state == T_BLOCKED && tasks[i].wake_ms &&
                     (int32_t)(now - tasks[i].wake_ms) >= 0) { tasks[i].wake_ms = 0; tasks[i].state = T_READY; woke++; }
             if (woke) kick_idle();
+            proc_timers_tick(now);
         }
     }
     {
