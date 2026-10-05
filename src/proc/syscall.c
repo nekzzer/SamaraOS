@@ -780,6 +780,7 @@ static int do_ioctl(int fd, uint32_t req, uint64_t arg) {
         file_t* sf = getf((int)pa[2]);
         if (!sf || sf->type != F_DRM) return -EBADF;
         return drm_prime_import(f->drm, sf->drm, &pa[0]);
+    }
     if (f->type == F_RTC) {
         switch (req) {
             case 0x80247009: UCHK((void*)arg, 36); clock_rtc_get((int*)arg); return 0;    /* RTC_RD_TIME */
