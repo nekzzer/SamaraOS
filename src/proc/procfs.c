@@ -130,6 +130,11 @@ static void fill_pid_dir(fs_node_t* d, proc_t* p, char* mem, uint32_t cap) {
     sb_puts(&b, p->name); sb_putc(&b, '\n');
     put(d, "comm", &b);
 
+    b = (sb_t){ mem, 0, cap };                                /* df and friends read /proc/self/mounts (void's /etc/mtab) */
+    sb_puts(&b, "rootfs / ramfs rw 0 0\nproc /proc proc rw 0 0\n");
+    b.len += (uint32_t)fatfs_mounts_text(b.buf + b.len, (int)(b.cap - b.len));
+    put(d, "mounts", &b);
+
     static const char* const long_state[] = { "R (running)", "S (sleeping)", "Z (zombie)" };
     b = (sb_t){ mem, 0, cap };
     sb_puts(&b, "Name:\t"); sb_puts(&b, p->name);
