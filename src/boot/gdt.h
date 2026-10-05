@@ -33,6 +33,7 @@ struct cpu {
     uint32_t slice;
     uint64_t cr3;          /* what is loaded */
     volatile uint32_t tlb_req;
+    volatile uint32_t unload;   /* leave the address space you have, it is going away */
     uint32_t t_user, t_sys, t_idle;
 };
 extern struct cpu cpus[MAX_CPUS];

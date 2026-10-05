@@ -5,6 +5,7 @@
 #include "boot/pic.h"
 #include "boot/apic.h"
 #include "core/smp.h"
+#include "core/io.h"
 #include "boot/gdt.h"
 #include "boot/paging.h"
 #include "core/io.h"
@@ -76,6 +77,8 @@ void cpu_wait(void) {
     c = this_cpu();
     c->in_idle = 0;
     if (!c->bkl) bkl_take(c);
+    /* killed from another cpu while we waited: never go on with it */
+    while (c->cur->state == T_DEAD) { task_yield(); c = this_cpu(); }
     irq_restore(fl);
 }
 
@@ -215,6 +218,8 @@ static regs_t* finish(struct cpu* c, regs_t* f) {
     return f;
 }
 
+regs_t* task_reap(regs_t* f) { return finish(this_cpu(), f); }
+
 /* lapic timer, every cpu */
 static regs_t* schedule(regs_t* saved) {
     struct cpu* c = this_cpu();
@@ -293,6 +298,7 @@ void task_yield(void) {
     /* Nobody else wanted the CPU: sleep until the next interrupt instead of
        spinning. A dead task must never fall through to here and return. */
     if (!task_current()->ysw) cpu_wait();
+    else if (this_cpu()->bkl) bkl_yield(this_cpu());
     irq_restore(f);
 }
 

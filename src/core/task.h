@@ -54,6 +54,7 @@ void  task_yield(void);
 void  task_sleep_ms(uint32_t ms);   /* kernel tasks: give up the CPU for a while */
 task_t* task_current(void);
 void  task_ready(task_t* t);        /* blocked -> ready, wakes a parked cpu */
+regs_t* task_reap(regs_t* f);        /* dead task in ring 3: send the cpu elsewhere */
 void  cpu_wait(void);               /* sti; hlt without holding the big lock */
 void  task_ap_start(int id);        /* an ap becomes its cpu's idle task */
 void  task_dump(void (*emit)(const char*));

@@ -7,9 +7,11 @@
    c->bkl says if this cpu has it. irqs must be off around take/drop */
 void bkl_take(struct cpu* c);
 void bkl_drop(struct cpu* c);
+void bkl_yield(struct cpu* c);
 
 void smp_init(void);                    /* wake the other cpus */
 void tlb_service(void);                 /* no lock needed, called from ipi and from lock spins */
+void tlb_unload(uint64_t pd);           /* before the page tables of pd are freed */
 void tlb_shootdown(void);               /* other cpus on our address space flush, waits */
 void kick_idle(void);                   /* poke a parked cpu so it looks for work */
 

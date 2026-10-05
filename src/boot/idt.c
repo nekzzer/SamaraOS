@@ -76,7 +76,12 @@ int last_vec;
 regs_t* isr_dispatch(regs_t* r) {
     int v = (int)r->vec;
     struct cpu* c = this_cpu();
-    if (v == VEC_TLB) { tlb_service(); lapic_eoi(); return r; }     // no lock, the sender holds it
+    if (v == VEC_TLB) {                    // no lock, the sender holds it
+        tlb_service();
+        lapic_eoi();
+        if ((r->cs & 3) && c->cur->state == T_DEAD) { bkl_take(c); r = task_reap(r); }
+        return r;
+    }
     if (v == VEC_SPUR) return r;
     if (!c->bkl) bkl_take(c);
     if (v != 14) last_vec = v;
@@ -84,6 +89,7 @@ regs_t* isr_dispatch(regs_t* r) {
     if (handlers[v]) handlers[v](r);
     else if (v >= 0x20 && v < 0x30) irq_default(v - 0x20);
     else if (v < 32) exc_default(r);
+    if ((r->cs & 3) && c->cur->state == T_DEAD) r = task_reap(r);     // killed on another cpu meanwhile
     return r;
 }
 

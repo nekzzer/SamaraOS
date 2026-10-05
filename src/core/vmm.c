@@ -260,6 +260,7 @@ static void free_tables(uint64_t tbl, int lvl) {
 }
 
 void vmm_destroy_space(uint64_t pd) {
+    if (ncpu > 1) tlb_unload(pd);
     uint64_t* d = (uint64_t*)P2V(pd);
     for (int i = 0; i < 256; i++)
         if (d[i] & PTE_P) { free_tables(d[i] & PTE_ADDR, 2); d[i] = 0; }

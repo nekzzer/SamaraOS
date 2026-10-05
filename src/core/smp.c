@@ -10,7 +10,7 @@
 #include "boot/fpu.h"
 #include "drivers/vga.h"
 
-static volatile uint32_t tk_next = 1, tk_serve = 0;   // boot cpu owns ticket 0
+volatile uint32_t tk_next = 1, tk_serve = 0;   // boot cpu owns ticket 0
 
 void tlb_service(void) {
     struct cpu* c = this_cpu();
@@ -19,6 +19,28 @@ void tlb_service(void) {
         uint64_t cr3;
         __asm__ volatile ("mov %%cr3, %0; mov %0, %%cr3" : "=r"(cr3) : : "memory");
     }
+    if (c->unload) {
+        c->cr3 = task_kernel_cr3();
+        __asm__ volatile ("mov %0, %%cr3" : : "r"(c->cr3) : "memory");
+        __atomic_store_n(&c->unload, 0, __ATOMIC_SEQ_CST);
+    }
+}
+
+/* about to free page tables: no other cpu may still have them in cr3, a miss
+   would walk freed memory. a task of that space still in ring 3 there is dead
+   already, the ipi path sends it to the reaper */
+void tlb_unload(uint64_t pd) {
+    struct cpu* me = this_cpu();
+    uint32_t mask = 0;
+    for (int i = 0; i < ncpu; i++) {
+        struct cpu* c = &cpus[i];
+        if (c == me || !c->online || c->cr3 != pd) continue;
+        __atomic_store_n(&c->unload, 1, __ATOMIC_SEQ_CST);
+        lapic_ipi(c->apic_id, VEC_TLB);
+        mask |= 1 << i;
+    }
+    for (int i = 0; i < ncpu; i++)
+        while ((mask & (1 << i)) && __atomic_load_n(&cpus[i].unload, __ATOMIC_ACQUIRE)) { tlb_service(); __asm__ volatile ("pause"); }
 }
 
 void bkl_take(struct cpu* c) {
@@ -33,6 +55,13 @@ void bkl_take(struct cpu* c) {
 void bkl_drop(struct cpu* c) {
     c->bkl = 0;
     __atomic_store_n(&tk_serve, tk_serve + 1, __ATOMIC_RELEASE);
+}
+
+/* we sit at a yield point: let a waiting cpu in, if any. ticket lock so it gets it */
+void bkl_yield(struct cpu* c) {
+    if (tk_next - tk_serve < 2) return;
+    bkl_drop(c);
+    bkl_take(c);
 }
 
 void tlb_shootdown(void) {
