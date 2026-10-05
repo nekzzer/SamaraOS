@@ -1740,6 +1740,7 @@ int file_wqs(file_t* f, wq_t** v) {
         case F_TTY: v[0] = &tty_wq; return 1;
         case F_PTM: case F_PTS: v[0] = pty_wq(f->pty); return v[0] ? 1 : 0;
         case F_ULISTEN: v[0] = &f->ux->wq; return 1;
+        case F_URING: v[0] = uring_wq(f->ur); return 1;
         case F_NODE: case F_NULL: case F_ZERO: case F_RANDOM: case F_DISK: case F_FB: case F_NETLINK: return 0;
         default: return -1;
     }
