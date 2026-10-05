@@ -124,7 +124,7 @@ static void fault_c(regs_t* r) {
         if (r->rflags & 0x200) __asm__ volatile ("sti");
         longjmp((void*)proc_current()->ujb, 1);
     }
-    if (vec == 14 && cr2 >= USER_BASE && cr2 < USER_TOP && proc_current())
+    if (vec == 14 && cr2 >= USER_BASE && cr2 < USER_TOP)      /* no proc: its space is gone, thread is on the way out */
         proc_fault_kill("bad user ptr", 11, r->rip, cr2);
     dump(vec == 14 ? "PF" : vec == 13 ? "GP" : vec == 6 ? "UD" : vec == 8 ? "DF" : "DE", err, r->rip, r->cs, cr2);
     kpanic_dump("kernel fault", r);
