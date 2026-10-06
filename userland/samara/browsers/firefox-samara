@@ -1,0 +1,46 @@
+#!/bin/sh
+# firefox on samara-wl, wayland native. FF_GL=1 for webrender on virgl, FF_X11=1 for xwayland.
+# installed as /usr/bin/firefox too (real binary is /usr/lib/firefox/firefox), so plain `firefox` works
+export HOME=${HOME:-/root}
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/0}
+export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}
+export DISPLAY=${DISPLAY:-:0}
+export MOZ_ENABLE_WAYLAND=1
+[ -n "$FF_X11" ] && export MOZ_ENABLE_WAYLAND=0
+export MOZ_DISABLE_CONTENT_SANDBOX=1 MOZ_DISABLE_GMP_SANDBOX=1 MOZ_DISABLE_RDD_SANDBOX=1 MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1
+export MOZ_CRASHREPORTER_DISABLE=1 MOZ_DBUS_REMOTE=0 NO_AT_BRIDGE=1
+[ -n "$FF_GL" ] && export MOZ_WEBRENDER=1 MOZ_ACCELERATED=1 || export MOZ_WEBRENDER=0 LIBGL_ALWAYS_SOFTWARE=1
+# own profile, prefs rewritten each start (old session restore tab was annoying)
+pd=/root/.ff-samara
+mkdir -p $pd
+cat > $pd/user.js <<EOP
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("datareporting.healthreport.uploadEnabled", false);
+user_pref("toolkit.telemetry.enabled", false);
+user_pref("app.update.auto", false);
+user_pref("app.update.enabled", false);
+user_pref("browser.tabs.warnOnClose", false);
+user_pref("dom.ipc.processCount", 2);
+user_pref("dom.ipc.processPrelaunch.enabled", false);
+user_pref("fission.autostart", false);
+user_pref("layers.gpu-process.enabled", false);
+user_pref("media.rdd-process.enabled", false);
+user_pref("media.utility-process.enabled", false);
+user_pref("network.process.enabled", false);
+user_pref("dom.ipc.forkserver.enable", false);
+user_pref("browser.tabs.unloadOnLowMemory", true);
+user_pref("image.mem.max_decoded_image_kb", 32768);
+user_pref("javascript.options.mem.gc_incremental_slice_ms", 10);
+user_pref("browser.startup.preXulSkeletonUI", false);
+user_pref("browser.cache.memory.capacity", 32768);
+user_pref("browser.sessionhistory.max_total_viewers", 0);
+user_pref("extensions.autoDisableScopes", 15);
+user_pref("browser.newtabpage.activity-stream.feeds.telemetry", false);
+user_pref("browser.newtabpage.activity-stream.telemetry", false);
+user_pref("browser.urlbar.suggest.quicksuggest.sponsored", false);
+EOP
+exec /usr/lib/firefox/firefox --no-remote --profile $pd "$@"

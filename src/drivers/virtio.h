@@ -29,6 +29,7 @@ void virtio_ready(uint16_t io);
 typedef struct {
     volatile uint8_t *common, *isr, *dev, *notify;
     uint32_t mult;
+    uint64_t shm, shm_len;               /* host visible region (shm cap id 1), phys */
 } vm_t;
 typedef struct {
     int n;

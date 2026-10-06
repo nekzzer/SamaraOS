@@ -29,7 +29,7 @@ XBPS_ARCH=x86_64-musl xbps-install -S -y -r $D -c $ROOT/build/xbps-cache -R $REP
 
 cd $D
 echo samara > etc/hostname
-printf 'nameserver 10.0.2.3\nnameserver 1.1.1.1\n' > etc/resolv.conf
+printf 'nameserver 10.0.2.3\n' > etc/resolv.conf
 printf '127.0.0.1\tlocalhost\n::1\tlocalhost\n10.0.2.15\tsamara\n10.0.2.2\thost gateway\n' > etc/hosts
 # root without a password (dropbear -B), only reachable through the qemu hostfwd
 printf 'root::19000:0:99999:7:::\n' > etc/shadow

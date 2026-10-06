@@ -4,6 +4,7 @@
    actual wm_open/wm_close in uwin_wm_frame() on its own task. Pixel copies
    in both directions only race visually (a torn frame), never structurally. */
 
+#include "core/lat.h"
 #include "gui/uwin.h"
 #include "gui/wm.h"
 #include "gfx/gfx.h"
@@ -462,7 +463,7 @@ static int32_t op_open(uint64_t a) {
     u->shown = false;
     u->cap = o.w * o.h;
     if (o.flags & SM_F_RESIZE) u->cap = gfx_w() * gfx_h();
-    u->pix = (uint32_t*)kmalloc((size_t)u->cap * 4);
+    u->pix = (uint32_t*)kmalloc_big((size_t)u->cap * 4);
     /* Wide enough for any scale a maximized window can reach. */
     u->row_cap = gfx_w() > o.w * o.scale ? gfx_w() : o.w * o.scale;
     u->row = (uint32_t*)kmalloc((size_t)u->row_cap * 4);
@@ -548,6 +549,7 @@ int32_t uwin_syscall(uint32_t op, uint64_t a, uint64_t b, uint64_t c) {
         else return -EINVAL;
         return 0;
     }
+    if (op == SM_OP_LAT) { if (a < 6) lat_add((int)a, (uint32_t)b); return 0; }
     if (op == SM_OP_FONT_H) return uif_height_any((int)a);
     if (op == SM_OP_SCREEN) return (gfx_w() << 16) | gfx_h();
     if (op == SM_OP_TEXT) {
@@ -575,6 +577,30 @@ int32_t uwin_syscall(uint32_t op, uint64_t a, uint64_t b, uint64_t c) {
     uwin_t* u = by_handle(a);
     if (!u) return -EBADF;
     switch (op) {
+    case SM_OP_PRESENT_RECT: {
+        if (!(u->flags & SM_F_WL)) return -EINVAL;
+        if (u->gone) return -EPIPE;
+        if (u->state != U_OPEN) return -EAGAIN;
+        if (!uok(c, 24)) return -EFAULT;
+        int32_t r[6];
+        memcpy(r, (const void*)c, sizeof(r));
+        if (r[0] != u->w || r[1] != u->h) return 0;
+        int x = r[2], y = r[3], w = r[4], h = r[5];
+        if (x < 0 || y < 0 || w <= 0 || h <= 0 || x >= u->w || y >= u->h || w > u->w - x || h > u->h - y) return -EINVAL;
+        if (!uok(b, (uint32_t)u->w * u->h * 4)) return -EFAULT;
+        for (int i = y; i < y + h; i++) {
+            size_t off = (size_t)i * u->w + x;
+            memcpy(u->pix + off, (const uint32_t*)b + off, (size_t)w * 4);
+        }
+        uwin_bytes += (uint64_t)w * h * 4;
+        if (u->win) {
+            int ox, oy, sc;
+            u_geom(u, u->win, &ox, &oy, &sc);
+            wm_damage(u->win, ox + x * sc, oy + y * sc, w * sc, h * sc);
+        }
+        lat_uw_present();
+        return 0;
+    }
     case SM_OP_PRESENT:
         if (u->gone) return -EPIPE;
         if (u->state != U_OPEN) return -EAGAIN;
@@ -595,6 +621,7 @@ int32_t uwin_syscall(uint32_t op, uint64_t a, uint64_t b, uint64_t c) {
         u->n_next = 0;
         u->buf = b;       /* text drawn into this buffer from now on becomes overlay */
         if (u->win) u->win->needs_repaint = true;
+        lat_uw_present();
         return 0;
     case SM_OP_EVENT:
         return op_event(u, b, (int32_t)c);

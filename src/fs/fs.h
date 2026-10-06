@@ -23,11 +23,14 @@ typedef struct fs_node {
     uint32_t mtime;
     uint8_t  mount_id;         /* nonzero on the root of a mounted volume */
     uint8_t  lazy_vol;
+    uint8_t  seals;            /* memfd F_ADD_SEALS, bookkeeping only */
     uint32_t lazy;             /* ext2 ino whose bytes aren't read yet: data NULL, size is right */
     struct fs_node* hl;        /* extra hard link name: the real node. everything else is empty */
     struct fs_node* hn;        /* real node: first extra name; extra name: the next one */
     uint16_t xl;               /* real node: how many extra names */
     struct pcn* pc;            /* page cache of mapped pages, see core/pcache.c */
+    uint8_t bnd;               /* some namespace has an alias on it (fs_bind) */
+    uint8_t mode_shadow;       /* private first-level copy of a bound dir, see fs_mp */
     volatile uint8_t nlk;      /* guards data/cap against the bkl-less readers, irqs off while held */
 } fs_node_t;
 
@@ -58,6 +61,16 @@ fs_node_t*  fs_root(void);
 fs_node_t*  fs_resolve(fs_node_t* cwd, const char* path);   /* NULL if missing; follows symlinks */
 fs_node_t*  fs_resolve_nf(fs_node_t* cwd, const char* path);  /* the last one is not followed */
 /* same, but a lazy file stays on disk: stat, access, readlink don't need the bytes */
+int         fs_bind(fs_node_t* src, fs_node_t* dst);
+int         fs_bind_ns(fs_node_t* src, fs_node_t* dst, int ns);
+void        fs_unbind(fs_node_t* dst, int ns);
+void        fs_bind_copy(int from, int to);
+fs_node_t*  fs_bind_drop(int ns, int* from);
+fs_node_t*  fs_new_file(const char* name);
+fs_node_t*  fs_new_dir(const char* name, fs_node_t* parent);
+fs_node_t*  fs_alias(fs_node_t* n);
+fs_node_t*  fs_dent(fs_node_t* cwd, const char* path, fs_node_t* d0, bool cp);
+fs_node_t*  fs_mp(fs_node_t* cwd, const char* path);
 fs_node_t*  fs_peek(fs_node_t* cwd, const char* path, bool follow);
 extern int (*fs_lazy_hook)(fs_node_t* n);
 void        fs_need(fs_node_t* n);            /* read a lazy file in */
@@ -83,6 +96,7 @@ void        fs_data_free(fs_node_t* n);       /* drop contents (owned ones are f
 void        fs_set_static(fs_node_t* n, const char* data, size_t len);
 int         fs_append(fs_node_t* file, const char* data, size_t len);
 void        fs_path(fs_node_t* node, char* out, size_t cap);
+int         fs_bt_info(int ns, char* out, int cap);
 void        fs_release(fs_node_t* node);          /* drop an open reference */
 fs_node_t*  fs_child(fs_node_t* dir, const char* name);
 void        fs_detach(fs_node_t* node);           /* unlink from parent, keep node */
@@ -90,6 +104,7 @@ void        fs_attach(fs_node_t* dir, fs_node_t* node);
 uint32_t    fs_now(void);
 /* Note a change at/under `n` so the owning mounted volume gets synced. */
 void        fs_touch(fs_node_t* n);
+void        fs_dirty(fs_node_t* n);
 void        pc_changed(fs_node_t* n);         /* page cache, core/pcache.c */
 void        pc_free(fs_node_t* n);
 extern void (*fs_dirty_hook)(int mount_id);

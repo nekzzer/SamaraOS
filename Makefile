@@ -20,7 +20,24 @@ SMP      ?= 4
 # Guest resolution, shown 1:1 (no blurry scaling): pick one that fits your
 # screen with the window frame. `make run VIDEO=1920x1080` for fullscreen.
 VIDEO    ?= 1600x900
+# GPU=virtio: virtio-vga (2d) instead of bochs, GPU=virgl: 3d, needs gl on the host
+GPU      ?= std
+ifneq ($(filter virgl venus,$(GPU)),)
+# gtk,gl=on is a black window on nvidia (x11), sdl works
+QDISPLAY ?= -display sdl,gl=on
+else
 QDISPLAY ?= -display gtk,zoom-to-fit=off
+endif
+# venus needs a virglrenderer built with the render server, void's one has none:
+# build/hv/vr is a private build (meson -Dvenus=true), picked up here if it exists
+HV = $(CURDIR)/build/hv/vr/b
+VENV = $(if $(and $(filter venus,$(GPU)),$(wildcard $(HV)/server/virgl_render_server)),env LD_LIBRARY_PATH=$(HV)/src RENDER_SERVER_EXEC_PATH=$(HV)/server/virgl_render_server)
+# GPU=venus: virgl + vulkan over virtio-gpu, blob needs the guest ram in shared memory
+VGA = $(if $(filter virtio,$(GPU)),-vga none -device virtio-vga,$(if $(filter virgl,$(GPU)),-vga none -device virtio-vga-gl,$(if $(filter venus,$(GPU)),-vga none -device virtio-vga-gl$(comma)venus=on$(comma)blob=on$(comma)hostmem=2G -object memory-backend-memfd$(comma)id=mem1$(comma)size=$(GCC_MEM)M -machine memory-backend=mem1,-vga std)))
+# hmp monitor for poking a hung guest: python3 tools/browser-test/mon.py info registers -a
+QMONITOR ?= -monitor unix:/tmp/samara-qmon,server,nowait
+# abs pointer, the relative usb-mouse lags and gets grabbed in sdl
+TABLET = $(if $(filter virtio virgl venus,$(GPU)),-device virtio-tablet-pci)
 
 # Wire the PC speaker (PIT channel 2) to a real audio backend. Without these
 # flags QEMU silently drops the speaker output even though the OS programs it.
@@ -33,7 +50,7 @@ KCFLAGS  := -m64 -mcmodel=kernel -ffreestanding -fno-stack-protector -fno-pic -f
             -nostdlib -mno-red-zone -fno-asynchronous-unwind-tables \
             -mgeneral-regs-only \
             -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -MMD -MP \
-            -std=gnu11 -Isrc $(if $(LOCKDEP),-DLOCKDEP)
+            -std=gnu11 -Isrc $(if $(LOCKDEP),-DLOCKDEP) $(if $(KDEBUG),-DKDEBUG)
 
 # DOOM compile flags. Permissive so id Software's 1993 K&R C compiles.
 # x87 FP allowed (a few % format strings use it); SSE/MMX off.
@@ -67,6 +84,7 @@ KERN_SRC := \
     src/boot/gdt.c \
     src/core/smp.c \
     src/core/prof.c \
+    src/core/lat.c \
     src/core/ksym.c \
     src/boot/idt.c \
     src/boot/paging.c \
@@ -95,6 +113,8 @@ KERN_SRC := \
     src/proc/syscall.c \
     src/proc/userland.c \
     src/proc/procfs.c \
+    src/proc/ns.c \
+    src/proc/seccomp.c \
     src/proc/signal.c \
     src/proc/pty.c \
     src/proc/uring.c \
@@ -266,6 +286,20 @@ src/apps/embed.o: src/apps/embed_list.h
 build:
 	@mkdir -p build
 
+# headless regression suite on a temp copy of the root image, see tools/test/run.sh. `make test KDEBUG=1` runs it with heap checks
+test: $(KERNEL)
+	@sh tools/test/run.sh
+
+# desktop frame time / input latency, see tools/wmlat.sh
+wmbench: $(KERNEL)
+	@sh tools/test/wmbench.sh
+
+# make KDEBUG=1: heap redzones/poison/periodic check (src/core/heap.c). stamp so heap.o follows the flag
+KD_STAMP := build/kdebug-$(if $(KDEBUG),1,0)
+src/core/heap.o: $(KD_STAMP)
+$(KD_STAMP): | build
+	@rm -f build/kdebug-*; touch $@
+
 # Kernel files: strict warnings
 $(KERN_OBJ): %.o: %.c | build
 	$(CC) $(KCFLAGS) -c $< -o $@
@@ -373,8 +407,8 @@ run: $(KERNEL) $(DISK_IMG) $(ROOTDISK) src-tar
 	@mkdir -p $(MUSIC_DIR)
 	@test -f $(GCC_TAR) || $(MAKE) --no-print-directory $(GCC_TAR) || echo "(no gcc module: toolchain/gcc-native missing)"
 	K=$$(python3 tools/pick-kernel.py $(DISK_IMG) $(KERNEL) $(SELF_KERNEL)) && \
-	$(QEMU) -kernel $$K $(ACCEL) -smp $(SMP) -m $(GCC_MEM) $(RUN_MODULES) -append "video=$(VIDEO) $(APPEND)" \
-	    -vga std $(QDISPLAY) -serial stdio $(AUDIO) $(USB) $(MUSIC_DRIVE) $(NET_DRIVE) $(DISK_DRIVE)
+	$(VENV) $(QEMU) -kernel $$K $(ACCEL) -smp $(SMP) -m $(GCC_MEM) $(RUN_MODULES) -append "video=$(VIDEO) $(APPEND)" \
+	    $(VGA) $(QDISPLAY) $(QMONITOR) -serial stdio $(AUDIO) $(USB) $(TABLET) $(MUSIC_DRIVE) $(NET_DRIVE) $(DISK_DRIVE)
 
 run-gcc: run
 
@@ -402,6 +436,9 @@ DISK_DRIVE += $(if $(VDISK),-drive file=$(VDISK)$(comma)format=raw$(comma)if=vir
 # you change in /usr /lib /etc /root survives a reboot. ROOTDISK= to go
 # without it, rm build/root.img to start clean.
 DISK_DRIVE += $(if $(ROOTDISK),-drive file=$(ROOTDISK)$(comma)format=raw$(comma)if=virtio)
+# void glibc rootfs + wine, label /glibc. chroot /glibc ... (see TODO)
+GLIBCDISK ?= build/glibc.img
+DISK_DRIVE += $(if $(and $(ROOTDISK),$(wildcard $(GLIBCDISK))),-drive file=$(GLIBCDISK)$(comma)format=raw$(comma)if=virtio)
 build/root-x64.img:
 	sh userland/build-x64root.sh $@
 build/root.img:
@@ -513,7 +550,7 @@ clean:
 
 .PHONY: run-internet fm dapps
 .PHONY: run-uefi
-.PHONY: all run run-doom run-sata run-debug iso run-iso run-install run-hd clean build compile_commands.json
+.PHONY: test wmbench all run run-doom run-sata run-debug iso run-iso run-install run-hd clean build compile_commands.json
 
 # header dependencies (gcc -MMD): editing a .h rebuilds who includes it
 -include $(KERN_OBJ:.o=.d)

@@ -8,6 +8,7 @@
 #include "core/heap.h"
 #include "core/string.h"
 #include "core/task.h"
+#include "core/wq.h"
 #include "core/vmm.h"
 #include "core/io.h"
 #include "boot/pit.h"
@@ -21,6 +22,7 @@ bool user_ok(const void* p, uint32_t len);       /* syscall.c */
 #define EACCES 13
 #define EFAULT 14
 #define EBUSY 16
+#define EEXIST 17
 #define EINVAL 22
 #define ENOTTY 25
 #define EOPNOTSUPP 95
@@ -75,6 +77,9 @@ typedef struct {
     uint32_t res, res_a;             /* virtio resource ids, res_a = argb twin for the cursor */
     uint32_t aw, ah;
     uint32_t root;                   /* gem that owns res (prime copies share it) */
+    uint64_t fence;                  /* last virgl fence that touches this bo */
+    uint32_t actx;                   /* ctx it's attached to already */
+    int host;                        /* venus blob: 1 = mapped in the shm bar (pg are bar pages), 2 = host only */
 } gem_t;
 
 typedef struct { dfd_t* owner; uint32_t id, gem, w, h, pitch, fmt; } fb_t;
@@ -82,8 +87,14 @@ typedef struct { dfd_t* owner; uint32_t id, gem, w, h, pitch, fmt; } fb_t;
 static int be;                        /* 0 none, 1 virtio-gpu, 2 bochs */
 static pci_dev_t pdev;
 static gem_t gems[MAXGEM];
+/* drm syncobjs, only for venus: a timeline value plus the fences that will bump it */
+static struct { dfd_t* o; uint64_t val; int np; struct { uint64_t pt, f; } pe[16]; } sobj[256];
+static uint32_t ioc_sz;
 static uint16_t resref[MAXGEM];
 static uint32_t ctx_next = 1;
+static bool direct;                   /* samara-wl scans a gpu bo out, console stays quiet */
+static uint32_t direct_res;
+static dfd_t* direct_fd;
 static fb_t fbs[32];
 static uint32_t next_fb = FB_FIRST;
 static dfd_t* master;
@@ -109,11 +120,13 @@ static struct {
 static struct { dfd_t* fd; uint64_t ud; uint32_t due; } vbl[8];
 
 static bool grabbed, grab_fb;
-static uint32_t last_flip_ms, last_push_ms;
+static uint32_t last_flip_ms, last_push_ms, last_tick_ms;
 
 /* console on virtio: ram framebuffer behind resource 1 */
 static uint8_t *con_fb, *con_raw;
 static int con_w, con_h;
+/* what the wm presented since the last push, dx1 == 0 = clean */
+static int dx0, dy0, dx1, dy1;
 
 /* bochs */
 static volatile uint8_t* lfb;
@@ -155,7 +168,11 @@ static gem_t* gem_get(dfd_t* d, uint32_t h) {
 static void gem_free(uint32_t h) {
     gem_t* g = &gems[h];
     if (be == 1) {
-        if (g->res && (g->root == 0 || --resref[g->root] == 0)) vg_unref(g->res);
+        if (g->fence) vg_wait(g->fence);       // host may still be reading the pages
+        if (g->res && (g->root == 0 || --resref[g->root] == 0)) {
+            if (g->host == 1) vg_blob_unmap(g->res);
+            vg_unref(g->res);
+        }
         if (g->res_a) vg_unref(g->res_a);
     }
     for (int i = 0; i < g->np; i++) pmm_unref(g->pg[i]);
@@ -185,7 +202,11 @@ static void push(gem_t* g, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     if (x >= mw || y >= mh) return;
     if (x + w > mw) w = mw - x;
     if (y + h > mh) h = mh - y;
-    if (be == 1) {
+    if (be == 1 && g->root) {
+        // virgl resource: glamor drew it on the host already, a 2d xfer would only
+        // copy stale guest pages over it. and don't wait for the flush, that was ~15ms per DIRTYFB
+        vg_flush_async(g->res, x, y, w, h);
+    } else if (be == 1) {
         vg_xfer(g->res, x, y, w, h, g->pitch);
         vg_flush(g->res, x, y, w, h);
     } else if (be == 2) {
@@ -212,6 +233,7 @@ static void release(void) {
         crtc.cur_gem = 0;
         if (con_fb) { vg_scanout(1, (uint32_t)con_w, (uint32_t)con_h); vg_flush(1, 0, 0, (uint32_t)con_w, (uint32_t)con_h); }
         else vg_scanout(0, 0, 0);
+        drm_console_dirty(0, 0, con_w, con_h);
     } else if (be == 2) {
         if (gfx_ready()) gfx_remode();
         else bga_w(4, 0);
@@ -312,21 +334,36 @@ static void tick(void) {
             gem_t* g = i >= 0 ? gem_of_fb(&fbs[i]) : NULL;
             if (g) push(g, 0, 0, crtc.mode.hdisplay, crtc.mode.vdisplay);
         }
-    } else if (be == 1 && con_fb && pit_uptime_ms() - last_push_ms > 30) {
-        // no dirty tracking in gfx, just push all of it. fine for qemu
-        vg_xfer(1, 0, 0, (uint32_t)con_w, (uint32_t)con_h, (uint32_t)con_w * 4);
-        vg_flush(1, 0, 0, (uint32_t)con_w, (uint32_t)con_h);
+    } else if (be == 1 && con_fb && !direct && (gfx_db() ? dx1 > 0 : pit_uptime_ms() - last_push_ms > 30)) {
+        // wm tells us what changed. plain console has no dirty tracking, push all of it
+        // (full push on virgl is ~27ms, doing that every 30ms killed the whole desktop)
+        int x = 0, y = 0, w = con_w, h = con_h;
+        if (gfx_db()) { x = dx0; y = dy0; w = dx1 - dx0; h = dy1 - dy0; dx0 = dy0 = dx1 = dy1 = 0; }
+        vg_xfer(1, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h, (uint32_t)con_w * 4);
+        // don't hold the drm lock until the host's next vsync
+        vg_flush_async(1, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h);
         last_push_ms = pit_uptime_ms();
     }
 }
 
+static wq_t fence_wq;
+
+void drm_fence_wake(void) { wq_wake(&fence_wq); }
+
 static void drm_task(void) {
+    WQ_W(w);
+    int pend = 0;
     for (;;) {
-        task_sleep_ms(16);
+        // mesa sits in poll() on the fence fd after every submit, 16ms per check was ~16 fps in glxgears
+        wq_wait(&fence_wq, &w, pend ? 1 : 16);    // new submissions must wake the idle worker
         uint32_t f = irq_save();
         bool got = !big;
         if (got) big = 1;
         irq_restore(f);
+        if (be == 1 && vg_virgl()) pend = drm_fences(vg_done());
+        if (pend && !got) continue;
+        if (pend && pit_uptime_ms() - last_tick_ms < 16) { if (got) unlock(); continue; }
+        last_tick_ms = pit_uptime_ms();
         if (!got) continue;
         tick();
         unlock();
@@ -358,14 +395,56 @@ uint8_t* drm_console_fb(int w, int h) {
 }
 
 void drm_console_flush(int x, int y, int w, int h) {
-    if (be != 1 || !con_fb || grabbed) return;
+    if (be != 1 || !con_fb || grabbed || direct) return;
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
     if (x + w > con_w) w = con_w - x;
     if (y + h > con_h) h = con_h - y;
     if (w <= 0 || h <= 0) return;
     vg_xfer(1, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h, (uint32_t)con_w * 4);
-    vg_flush(1, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h);
+    vg_flush_async(1, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h);
+}
+
+void drm_console_dirty(int x, int y, int w, int h) {
+    if (be != 1 || !con_fb) return;
+    if (!dx1) { dx0 = x; dy0 = y; dx1 = x + w; dy1 = y + h; return; }
+    if (x < dx0) dx0 = x;
+    if (y < dy0) dy0 = y;
+    if (x + w > dx1) dx1 = x + w;
+    if (y + h > dy1) dy1 = y + h;
+}
+
+int drm_direct(dfd_t* d, int w, int h) {
+    int r = -EINVAL;
+    lock();
+    gem_t* g = &gems[d->dma];
+    if (be != 1 || !d->dma || !g->res || grabbed) goto out;
+    if (!direct || direct_res != g->res) {
+        if (vg_scanout(g->res, (uint32_t)w, (uint32_t)h) < 0) goto out;
+        direct = true; direct_res = g->res; direct_fd = d;
+    }
+    vg_flush_async(g->res, 0, 0, (uint32_t)w, (uint32_t)h);
+    r = 0;
+out:
+    unlock();
+    return r;
+}
+
+static void direct_off(void) {
+    if (!direct) return;
+    direct = false;
+    direct_fd = NULL;
+    if (be == 1 && con_fb) {
+        vg_scanout(1, (uint32_t)con_w, (uint32_t)con_h);
+        vg_flush(1, 0, 0, (uint32_t)con_w, (uint32_t)con_h);
+        drm_console_dirty(0, 0, con_w, con_h);
+    }
+}
+
+void drm_direct_off(void) {
+    lock();
+    direct_off();
+    unlock();
 }
 
 bool drm_pref_size(int* w, int* h) {
@@ -392,6 +471,7 @@ dfd_t* drm_open(bool render) {
 
 void drm_close(dfd_t* d) {
     lock();
+    if (direct_fd == d) direct_off();
     for (int i = 0; i < 32; i++) if (fbs[i].owner == d) {
         if (fbs[i].id == crtc.fb && grabbed) crtc_off();
         memset(&fbs[i], 0, sizeof fbs[i]);
@@ -400,6 +480,7 @@ void drm_close(dfd_t* d) {
         if (crtc.cur_gem == h) { crtc.cur_gem = 0; if (be == 1) vg_cursor(0, 0, 0, 0, 0); }
         gem_free(h);
     }
+    for (int i = 0; i < 256; i++) if (sobj[i].o == d) sobj[i].o = NULL;
     if (d->ctx) vg_ctx_destroy(d->ctx);
     if (flip.fd == d) flip.pending = false;
     for (int i = 0; i < 8; i++) if (vbl[i].fd == d) vbl[i].fd = NULL;
@@ -424,7 +505,7 @@ int drm_mmap(dfd_t* d, uint64_t pd, uint64_t va, uint64_t len, uint64_t off, boo
     uint32_t h = off / GEM_SLOT, in = off % GEM_SLOT;
     if (d->dma) { h = d->dma; in = off; }
     gem_t* g = gem_get(d, h);
-    if (!g || in >= g->size) return -EINVAL;
+    if (!g || in >= g->size || g->host == 2) return -EINVAL;
     for (uint32_t k = 0; k < len / 4096 && in / 4096 + k < (uint32_t)g->np; k++)
         vmm_map_frame(pd, va + k * 4096, g->pg[in / 4096 + k], rw);
     return 0;
@@ -540,7 +621,7 @@ static int io_cap(s_cap* c) {
         case 0x10: c->val = 0; break;
         case 0x11: c->val = 0; break;
         case 0x12: c->val = 1; break;
-        case 0x13: c->val = 0; break;
+        case 0x13: case 0x14: c->val = vg_venus(); break;       /* syncobj, timeline */
         default: return -EINVAL;
     }
     return 0;
@@ -696,7 +777,7 @@ static int new_fb(dfd_t* d, uint32_t w, uint32_t h, uint32_t pitch, uint32_t fmt
 static int io_dumb(dfd_t* d, s_dumb* c) {
     if (c->bpp != 32 || c->w < 1 || c->h < 1 || c->w > 4096 || c->h > 4096) return -EINVAL;
     uint32_t h;
-    for (h = 1; h < MAXGEM; h++) if (!gems[h].pg) break;
+    for (h = 1; h < MAXGEM; h++) if (!gems[h].pg && !resref[h]) break;
     if (h == MAXGEM) return -ENOMEM;
     gem_t* g = &gems[h];
     memset(g, 0, sizeof *g);
@@ -706,7 +787,7 @@ static int io_dumb(dfd_t* d, s_dumb* c) {
     g->pg = kmalloc((size_t)g->np * sizeof(uintptr_t));
     if (!g->pg) return -ENOMEM;
     for (int i = 0; i < g->np; i++) {
-        uint32_t fr = pmm_alloc();
+        uint64_t fr = pmm_alloc();
         if (!fr) { g->np = i; gem_free(h); return -ENOMEM; }
         g->pg[i] = fr;
     }
@@ -966,21 +1047,96 @@ static int io_gemclose(dfd_t* d, uint32_t h) {
     return 0;
 }
 
-typedef struct { uint32_t flags, size; uint64_t cmd, bos; uint32_t nbo; int32_t fence_fd; } s_exec;
+typedef struct { uint32_t flags, size; uint64_t cmd, bos; uint32_t nbo; int32_t fence_fd; uint32_t ring, stride, nin, nout; uint64_t in, out; } s_exec;
+typedef struct { uint32_t mem, flags, bo, res; uint64_t size; uint32_t pad, cmd_size; uint64_t cmd, id; } s_bcreate;
+typedef struct { uint32_t h, flags; uint64_t pt; } s_xsync;
+
+static void sobj_upd(int i) {
+    int j = 0;
+    for (int k = 0; k < sobj[i].np; k++) {
+        if (vg_fence_done(sobj[i].pe[k].f)) { if (sobj[i].pe[k].pt > sobj[i].val) sobj[i].val = sobj[i].pe[k].pt; }
+        else sobj[i].pe[j++] = sobj[i].pe[k];
+    }
+    sobj[i].np = j;
+}
+
+static int sobj_get(dfd_t* d, uint32_t h) { return h && h <= 256 && sobj[h - 1].o == d ? (int)h - 1 : -1; }
+
+static int io_sobj(dfd_t* d, int nr, void* arg) {
+    uint32_t* a = arg;
+    uint64_t* q = arg;
+    if (nr == 0xbf) {
+        int i = 0;
+        while (i < 256 && sobj[i].o) i++;
+        if (i == 256) return -ENOMEM;
+        memset(&sobj[i], 0, sizeof sobj[i]);
+        sobj[i].o = d;
+        if (a[1] & 1) sobj[i].val = 1;
+        a[0] = (uint32_t)i + 1;
+        return 0;
+    }
+    if (nr == 0xc0) {
+        int i = sobj_get(d, a[0]);
+        if (i < 0) return -ENOENT;
+        sobj[i].o = NULL;
+        return 0;
+    }
+    /* the rest all start with a handle array: wait (0xc3, 0xca), reset/signal (0xc4, 0xc5), query, timeline signal */
+    uint32_t n = nr == 0xca ? a[6] : nr == 0xc3 || nr == 0xcb || nr == 0xcd ? a[4] : a[2];
+    if (!n || n > 64) return -EINVAL;
+    U(PTR(q[0]), n * 4);
+    uint32_t* hs = PTR(q[0]);
+    uint64_t* pts = NULL;
+    if (nr == 0xca || nr == 0xcb || nr == 0xcd) { U(PTR(q[1]), n * 8); pts = PTR(q[1]); }
+    for (uint32_t k = 0; k < n; k++) if (sobj_get(d, hs[k]) < 0) return -ENOENT;
+    if (nr == 0xc4) {
+        for (uint32_t k = 0; k < n; k++) { int i = sobj_get(d, hs[k]); sobj[i].val = 0; sobj[i].np = 0; }
+        return 0;
+    }
+    if (nr == 0xc5 || nr == 0xcd) {
+        for (uint32_t k = 0; k < n; k++) { int i = sobj_get(d, hs[k]); sobj[i].val = pts ? pts[k] : 1; }
+        return 0;
+    }
+    if (nr == 0xcb) {
+        for (uint32_t k = 0; k < n; k++) { int i = sobj_get(d, hs[k]); sobj_upd(i); pts[k] = sobj[i].val; }
+        return 0;
+    }
+    /* wait: timeout is an absolute monotonic time in ns */
+    int64_t to = nr == 0xca ? (int64_t)q[2] : (int64_t)q[1];
+    uint32_t fl = nr == 0xca ? a[7] : a[5];
+    uint64_t end = to >= 0x7fffffffffffffffll ? ~0ull : (uint64_t)to / 1000000;
+    for (;;) {
+        uint32_t nd = 0, first = 0;
+        for (uint32_t k = 0; k < n; k++) {
+            int i = sobj_get(d, hs[k]);
+            if (i < 0) return -ENOENT;                  // destroyed while we slept
+            sobj_upd(i);
+            if (sobj[i].val >= (pts ? pts[k] : 1)) { if (!nd) first = k; nd++; }
+        }
+        if (fl & 1 ? nd == n : nd) {
+            if (nr == 0xca) a[8] = first; else a[6] = first;
+            return 0;
+        }
+        if (pit_uptime_ms() >= end) return -62;
+        unlock();
+        vg_idle();
+        lock();
+    }
+}
 typedef struct { uint32_t target, fmt, bind, w, h, depth, array, last, ns, flags, bo, res, size, stride; } s_vcreate;
-typedef struct { uint32_t bo, pad; uint64_t off; uint32_t level, stride, lstride, box[6]; } s_vxfer;
+typedef struct { uint32_t bo, box[6], level, off, stride, lstride; } s_vxfer;
 
 static int ctx_get(dfd_t* d) {
     if (d->ctx) return 0;
     uint32_t c = ctx_next++;
-    if (vg_ctx_create(c) < 0) return -ENOMEM;
+    if (vg_ctx_create(c, 0) < 0) return -ENOMEM;
     d->ctx = c;
     return 0;
 }
 
-static int gem_alloc(dfd_t* d, uint32_t size, uint32_t* out) {
+static int gem_alloc(dfd_t* d, uint32_t size, uint32_t* out, bool nopg) {
     uint32_t h;
-    for (h = 1; h < MAXGEM; h++) if (!gems[h].pg) break;
+    for (h = 1; h < MAXGEM; h++) if (!gems[h].pg && !resref[h]) break;
     if (h == MAXGEM) return -ENOMEM;
     gem_t* g = &gems[h];
     memset(g, 0, sizeof *g);
@@ -988,8 +1144,9 @@ static int gem_alloc(dfd_t* d, uint32_t size, uint32_t* out) {
     g->np = (int)(g->size / 4096);
     g->pg = kmalloc((size_t)g->np * sizeof(uintptr_t));
     if (!g->pg) return -ENOMEM;
-    for (int i = 0; i < g->np; i++) {
-        uint32_t fr = pmm_alloc();
+    if (nopg) memset(g->pg, 0, (size_t)g->np * sizeof(uintptr_t));
+    for (int i = 0; i < g->np && !nopg; i++) {
+        uint64_t fr = pmm_alloc();
         if (!fr) { g->np = i; gem_free(h); return -ENOMEM; }
         g->pg[i] = fr;
     }
@@ -1001,7 +1158,7 @@ static int gem_alloc(dfd_t* d, uint32_t size, uint32_t* out) {
 static int io_vcreate(dfd_t* d, s_vcreate* c) {
     uint32_t h;
     if (!c->size) return -EINVAL;
-    int r = gem_alloc(d, c->size, &h);
+    int r = gem_alloc(d, c->size, &h, false);
     if (r < 0) return r;
     gem_t* g = &gems[h];
     g->res = 100 + h * 2;
@@ -1022,30 +1179,52 @@ static int io_vxfer(dfd_t* d, s_vxfer* t, bool to) {
     gem_t* g = gem_get(d, t->bo);
     if (!g || !g->res) return -ENOENT;
     if (ctx_get(d) < 0) return -ENOMEM;
-    vg_ctx_attach(d->ctx, g->res);
-    return vg_xfer3d(d->ctx, g->res, to, t->box, t->off, t->level, t->stride, t->lstride) < 0 ? -EINVAL : 0;
+    if (g->actx != d->ctx) { vg_ctx_attach(d->ctx, g->res); g->actx = d->ctx; }
+    int64_t f = vg_xfer3d(d->ctx, g->res, to, t->box, t->off, t->level, t->stride, t->lstride);
+    if (f < 0) return -EINVAL;
+    g->fence = f;
+    return 0;
 }
+
+static uint64_t last_exec;
+uint64_t drm_exec_fence(void) { return last_exec; }
+void drm_wait_fence(uint64_t f) { vg_wait(f); }
 
 static int io_exec(dfd_t* d, s_exec* e) {
     if (!e->size || e->size > (1u << 20)) return -EINVAL;
     U(PTR(e->cmd), e->size);
     if (ctx_get(d) < 0) return -ENOMEM;
+    uint32_t* bo = PTR(e->bos);
     if (e->nbo) {
         U(PTR(e->bos), e->nbo * 4);
-        uint32_t* bo = PTR(e->bos);
         for (uint32_t i = 0; i < e->nbo; i++) {
             gem_t* g = gem_get(d, bo[i]);
             if (!g || !g->res) return -ENOENT;
-            vg_ctx_attach(d->ctx, g->res);
+            // attach is a sync round trip to the host, once per bo is plenty (was every submit, every bo)
+            if (g->actx != d->ctx) { vg_ctx_attach(d->ctx, g->res); g->actx = d->ctx; }
         }
     }
     uint8_t* b = kmalloc(e->size);
     if (!b) return -ENOMEM;
     memcpy(b, PTR(e->cmd), e->size);
-    int r = vg_submit(d->ctx, b, e->size);
+    bool big_e = ioc_sz >= sizeof(s_exec);
+    int64_t r = vg_submit(d->ctx, b, e->size, big_e && (e->flags & 4) ? (int)e->ring : -1);
     kfree(b);
     e->fence_fd = -1;
-    return r < 0 ? -EINVAL : 0;
+    if (r < 0) return -EINVAL;
+    last_exec = r;
+    if (big_e && e->nout && e->stride >= 16 && e->nout <= 16 && user_ok(PTR(e->out), e->nout * e->stride)) {
+        for (uint32_t i = 0; i < e->nout; i++) {
+            s_xsync* x = (s_xsync*)((uint8_t*)PTR(e->out) + i * e->stride);
+            int k = sobj_get(d, x->h);
+            if (k < 0) continue;
+            if (sobj[k].np == 16) { vg_wait(sobj[k].pe[0].f); sobj_upd(k); }
+            sobj[k].pe[sobj[k].np].pt = x->pt ? x->pt : 1;
+            sobj[k].pe[sobj[k].np++].f = (uint64_t)r;
+        }
+    }
+    for (uint32_t i = 0; i < e->nbo; i++) { gem_t* g = gem_get(d, bo[i]); if (g) g->fence = r; }
+    return 0;
 }
 
 /* a = cap_set_id, cap_set_ver, addr (u64), size */
@@ -1069,19 +1248,83 @@ static int io_caps(uint32_t* a) {
     return 0;
 }
 
+static int host_off(uint64_t size, uint64_t* off) {
+    uint64_t o = 0;
+    for (uint32_t i = 0; i < MAXGEM; i++) {
+        if (i) {
+            if (gems[i].host != 1) continue;
+            o = gems[i].pg[0] - vg_shm() + gems[i].size;
+        }
+        if (o + size > vg_shm_len()) continue;
+        bool hit = false;
+        for (uint32_t j = 1; j < MAXGEM && !hit; j++) {
+            if (gems[j].host != 1) continue;
+            uint64_t b = gems[j].pg[0] - vg_shm();
+            if (o < b + gems[j].size && b < o + size) hit = true;
+        }
+        if (!hit) { *off = o; return 0; }
+    }
+    return -ENOMEM;
+}
+
+static int io_bcreate(dfd_t* d, s_bcreate* c) {
+    uint32_t h;
+    if (!c->size || c->mem < 1 || c->mem > 3 || c->cmd_size > (1u << 20)) return -EINVAL;
+    if (ctx_get(d) < 0) return -ENOMEM;
+    if (c->cmd_size) {
+        // venus sends its vkAllocateMemory along, host needs it before the blob
+        U(PTR(c->cmd), c->cmd_size);
+        uint8_t* b = kmalloc(c->cmd_size);
+        if (!b) return -ENOMEM;
+        memcpy(b, PTR(c->cmd), c->cmd_size);
+        int64_t f = vg_submit(d->ctx, b, c->cmd_size, -1);
+        kfree(b);
+        if (f < 0) return -EINVAL;
+        last_exec = f;
+    }
+    int r = gem_alloc(d, (uint32_t)c->size, &h, c->mem == 2);
+    if (r < 0) return r;
+    gem_t* g = &gems[h];
+    g->res = 100 + h * 2;
+    g->root = h; resref[h] = 1;
+    g->actx = d->ctx;
+    uint64_t off = 0;
+    bool map = c->mem == 2 && (c->flags & 1);
+    if (c->mem == 2) g->host = 2;
+    if (map && host_off(g->size, &off) < 0) { g->res = 0; gem_free(h); return -ENOMEM; }
+    if (vg_blob(d->ctx, g->res, c->mem, c->flags, c->id, g->size, c->mem == 2 ? NULL : g->pg, c->mem == 2 ? 0 : g->np) < 0) {
+        g->res = 0;
+        gem_free(h);
+        return -ENOMEM;
+    }
+    if (map) {
+        if (vg_blob_map(g->res, off) < 0) { gem_free(h); return -ENOMEM; }
+        for (int i = 0; i < g->np; i++) g->pg[i] = vg_shm() + off + (uint64_t)i * 4096;
+        g->host = 1;
+    }
+    c->bo = h; c->res = g->res;
+    return 0;
+}
+
 static int io_virtgpu(dfd_t* d, int n, void* arg) {
     uint32_t* a = arg;
     uint64_t* q = arg;
     switch (n) {
-    case 0:                                           /* map */
-        if (!gem_get(d, a[0])) return -ENOENT;
-        q[1] = (uint64_t)a[0] * GEM_SLOT;
+    case 0:                                           /* map: u64 offset first, then the handle */
+        if (!gem_get(d, a[2])) return -ENOENT;
+        q[0] = (uint64_t)a[2] * GEM_SLOT;
         return 0;
     case 1: return io_exec(d, arg);
     case 2: {                                         /* getparam */
         uint64_t v = 0;
         if (q[0] == 1 || q[0] == 2) v = 1;
-        else if (q[0] == 7) v = 6;
+        else if (q[0] == 3 || q[0] == 4 || q[0] == 6) v = vg_venus();
+        else if (q[0] == 7) {
+            uint32_t id, ver, sz;
+            for (uint32_t i = 0; i < (uint32_t)vg_ncaps(); i++)
+                if (!vg_capset_info(i, &id, &ver, &sz) && id < 32) v |= 1ull << id;
+            if (!v) v = 6;
+        }
         else return -EINVAL;
         U(PTR(q[1]), 8);
         *(uint64_t*)PTR(q[1]) = v;
@@ -1096,8 +1339,31 @@ static int io_virtgpu(dfd_t* d, int n, void* arg) {
     }
     case 5: return io_vxfer(d, arg, false);
     case 6: return io_vxfer(d, arg, true);
-    case 7: return gem_get(d, a[0]) ? 0 : -ENOENT;    /* wait, nothing is async here */
+    case 7: {                                         /* wait */
+        gem_t* g = gem_get(d, a[0]);
+        if (!g) return -ENOENT;
+        uint64_t f = g->fence;
+        if (!f || vg_done() >= f) return 0;
+        if (a[1] & 1) return -EBUSY;
+        unlock();                                     // others need drm while we wait
+        bool ok = vg_wait(f);
+        lock();
+        return ok ? 0 : -EBUSY;
+    }
     case 8: return io_caps(arg);
+    case 9: return io_bcreate(d, arg);
+    case 10: {                                        /* context init: u32 n, pad, u64 ptr to {param, value} */
+        if (d->ctx) return -EEXIST;
+        if (a[0] > 8) return -EINVAL;
+        U(PTR(q[1]), a[0] * 16);
+        uint64_t* pr = PTR(q[1]);
+        uint32_t init = 0;
+        for (uint32_t i = 0; i < a[0]; i++) if (pr[2 * i] == 1) init = (uint32_t)pr[2 * i + 1];
+        uint32_t c = ctx_next++;
+        if (vg_ctx_create(c, init) < 0) return -ENOMEM;
+        d->ctx = c;
+        return 0;
+    }
     }
     return -ENOTTY;
 }
@@ -1107,7 +1373,7 @@ static int io_virtgpu(dfd_t* d, int n, void* arg) {
 static uint32_t gem_dup(dfd_t* to, uint32_t src) {
     uint32_t h;
     gem_t* s = &gems[src];
-    for (h = 1; h < MAXGEM; h++) if (!gems[h].pg) break;
+    for (h = 1; h < MAXGEM; h++) if (!gems[h].pg && !resref[h]) break;
     if (h == MAXGEM) return 0;
     gem_t* g = &gems[h];
     *g = *s;
@@ -1116,6 +1382,7 @@ static uint32_t gem_dup(dfd_t* to, uint32_t src) {
     for (int i = 0; i < s->np; i++) { g->pg[i] = s->pg[i]; pmm_ref(s->pg[i]); }
     g->owner = to;
     g->res_a = 0;
+    g->actx = 0;
     if (g->res) resref[g->root]++;
     return h;
 }
@@ -1174,7 +1441,8 @@ int drm_ioctl(dfd_t* d, uint32_t req, void* arg) {
         else { d->master = false; master = NULL; release(); }
         break;
     case 0x3a: r = io_vblank(d, arg); break;
-    case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x46: case 0x47: case 0x48: case 0x49:
+    case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x46: case 0x47: case 0x48: case 0x49: case 0x4a: case 0x4b:
+        ioc_sz = sz;
         r = be == 1 && vg_virgl() ? io_virtgpu(d, nr - 0x41, arg) : -ENOTTY;
         break;
     case 0xa0: r = io_getres(d, arg); break;
@@ -1238,6 +1506,9 @@ int drm_ioctl(dfd_t* d, uint32_t req, void* arg) {
     case 0xba: r = io_objset(d, arg); break;
     case 0xbb: r = io_cursor(d, arg, true); break;
     case 0xbc: r = io_atomic(d, arg); break;
+    case 0xbf: case 0xc0: case 0xc3: case 0xc4: case 0xc5: case 0xca: case 0xcb: case 0xcd:
+        r = vg_venus() ? io_sobj(d, nr, arg) : -ENOTTY;
+        break;
     case 0xbd: r = io_mkblob(arg); break;
     case 0xbe: r = io_rmblob(a32[0]); break;
     default: r = -ENOTTY;

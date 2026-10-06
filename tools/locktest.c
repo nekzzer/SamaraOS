@@ -6,11 +6,13 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
 #include <linux/futex.h>
 
+static long fx(volatile int* a, int op, int v) { return syscall(SYS_futex, a, op, v, 0, 0, 0); }
 static int nt = 4, iters = 100000;
 
 static long now_ms(void) {
@@ -46,13 +48,41 @@ static void* t_pf(void* a) {
     return 0;
 }
 
+static volatile int mixf;
+static void* t_mix(void* a) {
+    unsigned s = (unsigned)(long)a * 2654435761u + 1;
+    void* keep[64] = {0};
+    for (int i = 0; i < iters; i++) {
+        s = s * 1103515245 + 12345;
+        int k = (s >> 16) & 63;
+        switch ((s >> 8) & 7) {
+        case 0: case 1:
+            free(keep[k]);
+            keep[k] = malloc(((s >> 4) & 0x3FFF) + 16);
+            if (keep[k]) memset(keep[k], 1, ((s >> 4) & 0x3FFF) + 16);
+            break;
+        case 2: case 3: {
+            volatile char* p = mmap(0, 65536, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            for (int j = 0; j < 16; j++) p[j * 4096] = 1;
+            munmap((void*)p, 65536);
+            break;
+        }
+        case 4: free(keep[k]); keep[k] = 0; break;
+        case 5: __atomic_fetch_add(&mixf, 1, __ATOMIC_SEQ_CST); fx(&mixf, FUTEX_WAKE_PRIVATE, 1); break;
+        case 6: fx(&mixf, FUTEX_WAIT_PRIVATE, mixf + 1); break;   // value differs, returns at once
+        default: { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); sched_yield(); }
+        }
+    }
+    for (int i = 0; i < 64; i++) free(keep[i]);
+    return 0;
+}
+
 struct pp { volatile int turn; int fd[4]; };
-static long fx(volatile int* a, int op, int v) { return syscall(SYS_futex, a, op, v, 0, 0, 0); }
 
 static void run(const char* name, void* (*fn)(void*), long ops_per_thread) {
     pthread_t th[16];
     long t0 = now_ms();
-    for (int i = 0; i < nt; i++) pthread_create(&th[i], 0, fn, 0);
+    for (int i = 0; i < nt; i++) pthread_create(&th[i], 0, fn, (void*)(long)i);
     for (int i = 0; i < nt; i++) pthread_join(th[i], 0);
     long dt = now_ms() - t0;
     printf("%-6s thr=%d  %5ld ms  %ld ops/s\n", name, nt, dt, dt ? ops_per_thread * nt * 1000 / dt : 0);
@@ -127,6 +157,7 @@ int main(int argc, char** argv) {
     if (!strcmp(w, "mm") || !strcmp(w, "all")) run("mm", t_mm, iters);
     if (!strcmp(w, "pf") || !strcmp(w, "all")) run("pf", t_pf, (iters / 4096 + 1) * 4096L);
     if (!strcmp(w, "clock") || !strcmp(w, "all")) run("clock", t_clock, iters * 5L);
+    if (!strcmp(w, "mix") || !strcmp(w, "all")) run("mix", t_mix, iters);
     if (!strcmp(w, "futex") || !strcmp(w, "all")) runp("futex", 0);
     if (!strcmp(w, "pipe") || !strcmp(w, "all")) runp("pipe", 1);
     if (!strcmp(w, "efd") || !strcmp(w, "all")) runp("efd", 2);

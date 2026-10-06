@@ -166,7 +166,9 @@ int rtl8139_send(const void* data, int len) {
 
 int rtl8139_recv(void* buf, int max) {
     if (!g_present) return 0;
-    if (inb(g_io + RTL_CR) & CR_BUFE) return 0;     /* nothing */
+    /* inb of CR is a vm exit and pump polls us every ms under the bkl: look at the
+       header in the ring instead, consumed ones are zeroed below */
+    if (!*(volatile uint32_t*)(g_rx_buf + g_rx_off)) return 0;
 
     /* status at sw offset; packet immediately after */
     uint32_t st = *(uint32_t*)(g_rx_buf + g_rx_off);
@@ -175,6 +177,7 @@ int rtl8139_recv(void* buf, int max) {
     if (!(rok & 1) || pkt_len < 4 || pkt_len > 1518) {
         /* RX error — reset the chip's RX (rare) */
         uint8_t cr = inb(g_io + RTL_CR);
+        *(uint32_t*)(g_rx_buf + g_rx_off) = 0;
         outb(g_io + RTL_CR, cr & ~CR_RE);
         outl(g_io + RTL_RCR, RCR_VAL);
         outb(g_io + RTL_CR, cr);
@@ -194,6 +197,7 @@ int rtl8139_recv(void* buf, int max) {
         memcpy((uint8_t*)buf + first, g_rx_buf, data_len - first);
     }
 
+    *(uint32_t*)(g_rx_buf + g_rx_off) = 0;
     /* advance sw read pointer; align to 4 */
     g_rx_off = (g_rx_off + pkt_len + 4 + 3) & ~3u;
     if (g_rx_off >= RX_RING) g_rx_off -= RX_RING;  /* wrap */

@@ -137,11 +137,12 @@ void pc_free(fs_node_t* n) {
 }
 
 // frames -> data, for pcn c. pcl held, returns true when something changed
-static bool sync_nl(pcn_t* c) {
+static bool sync_nl(pcn_t* c, uint64_t first, uint64_t end) {
     fs_node_t* n = c->n;
     bool ch = false;
     if (!n->data || !n->cap) return false;     // borrowed boot data: nobody writes it
-    for (uint32_t i = 0; i < c->cap; i++) {
+    if (end > c->cap) end = c->cap;
+    for (uint64_t i = first; i < end; i++) {
         uint64_t fr = c->fr[i] & ~1ul, off = (uint64_t)i * PAGE_SIZE;
         if (!fr || off >= n->size) continue;
         uint64_t k = n->size - off;
@@ -151,36 +152,31 @@ static bool sync_nl(pcn_t* c) {
     return ch;
 }
 
-void pc_sync(fs_node_t* n) {
+void pc_sync_range(fs_node_t* n, uint64_t off, uint64_t len) {
     n = real(n);
-    if (!n->pc || !n->pc->shared) return;
+    if (!n->pc || !n->pc->shared || !len || off >= n->size) return;
+    if (len > n->size - off) len = n->size - off;
     uint64_t f = spin_lock(&pcl);
-    bool ch = n->pc && sync_nl(n->pc);
+    bool ch = n->pc && sync_nl(n->pc, off / PAGE_SIZE, (off + len + PAGE_SIZE - 1) / PAGE_SIZE);
     spin_unlock(&pcl, f);
-    if (ch) { n->mtime = fs_now(); fs_touch(n); }
+    if (ch) { n->mtime = fs_now(); fs_dirty(n); }
 }
+
+void pc_sync(fs_node_t* n) { pc_sync_range(n, 0, real(n)->size); }
 
 void pc_sync_all(void) {
     if (!nshared) return;
-    for (;;) {
-        fs_node_t* hit = NULL;
-        uint64_t f = spin_lock(&pcl);
-        for (pcn_t* c = head; c; c = c->next) {
-            if (!c->shared) continue;
-            if (sync_nl(c)) hit = c->n;
-            // nobody maps it anymore: plain cache again
-            bool used = false;
-            for (uint32_t i = 0; i < c->cap && !used; i++)
-                if (c->fr[i] && pmm_refcnt(c->fr[i] & ~1ul) > 1) used = true;
-            if (!used) { c->shared = false; nshared--; }
-            if (hit) break;
-        }
-        spin_unlock(&pcl, f);
-        if (!hit) return;
-        hit->mtime = fs_now();
-        fs_touch(hit);          // refreshes the frames from data, they are equal now
-        // loop again for the nodes after it
+    uint64_t f = spin_lock(&pcl);
+    for (pcn_t* c = head; c; c = c->next) {
+        if (!c->shared) continue;
+        if (sync_nl(c, 0, c->cap)) { c->n->mtime = fs_now(); fs_dirty(c->n); }
+        // don't restart from the head for every dirty file
+        bool used = false;
+        for (uint32_t i = 0; i < c->cap && !used; i++)
+            if (c->fr[i] && pmm_refcnt(c->fr[i] & ~1ul) > 1) used = true;
+        if (!used) { c->shared = false; nshared--; }
     }
+    spin_unlock(&pcl, f);
 }
 
 uint64_t pc_reclaim(uint64_t want) {

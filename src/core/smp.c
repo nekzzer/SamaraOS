@@ -4,6 +4,7 @@
 #include "core/string.h"
 #include "core/vmm.h"
 #include "core/task.h"
+#include "proc/proc.h"
 #include "core/io.h"
 #include "boot/acpi.h"
 #include "boot/apic.h"
@@ -72,8 +73,20 @@ void bkl_take(struct cpu* c) {
     bkl_takes++;
     if (w0) bkl_wait += prof_tsc() - w0;
     c->bkl = 1;
+    if (prof_on) { c->bkl_t0 = prof_tsc(); c->bkl_ra = ra; }
     bkl_cpu = c->id;
     bkl_pc = ra;
+}
+
+int bkl_try(struct cpu* c) {
+    uint32_t t = __atomic_load_n(&tk_serve, __ATOMIC_ACQUIRE);
+    if (!__atomic_compare_exchange_n(&tk_next, &t, t + 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0;
+    bkl_takes++;
+    c->bkl = 1;
+    bkl_cpu = c->id;
+    bkl_pc = __builtin_return_address(0);
+    if (prof_on) { c->bkl_t0 = prof_tsc(); c->bkl_ra = bkl_pc; }
+    return 1;
 }
 
 uint64_t spin_lock(spin_t* l) {
@@ -114,6 +127,8 @@ void spin_unlock(spin_t* l, uint64_t f) {
 }
 
 void bkl_drop(struct cpu* c) {
+    if (prof_on && c->bkl_t0) { prof_hold(c->bkl_ra, c->sc, c->cur->proc ? c->cur->proc->name : c->cur->name, prof_tsc() - c->bkl_t0); c->bkl_t0 = 0; }
+    c->sc = -1;
     c->bkl = 0;
     __atomic_store_n(&tk_serve, tk_serve + 1, __ATOMIC_RELEASE);
 }

@@ -22,12 +22,16 @@ typedef struct pipe {
     char buf[PIPE_SZ];
     int  head, tail, count;
     int  readers, writers;
-    struct file* fds[8];    /* SCM_RIGHTS in flight (unix sockets) */
+    struct file* fds[32];    /* SCM_RIGHTS in flight (unix sockets) */
     int  nfds;
+    int  passcred, spid;     /* SO_PASSCRED on the reading end, tgid of whoever wrote last */
+    uint64_t fpos[32];      /* stream offset each fd was sent at: it arrives with that byte, not before (wine) */
+    uint64_t rtot, wtot;
     wq_t wq;
     int  wopens;            /* fifo: writer opens so far, a blocked reader open waits for it to move */
     uint32_t wgen;          /* bumped on every write, io_uring multishot poll looks at it */
     spin_t lk;              /* buf, head/tail/count, readers/writers */
+    int  gone;              /* socketpair: who frees it, both ends close at once */
 } pipe_t;
 
 typedef struct file {
@@ -36,6 +40,8 @@ typedef struct file {
     int        flags;       /* O_* status flags (access mode, O_APPEND, O_NONBLOCK) */
     uint64_t   off;
     fs_node_t* node;
+    fs_node_t* dent;        /* private mount ns: the name it was opened by (an alias), for mount on /proc/self/fd/N */
+    char*      fpath;       /* ... and the path it was opened by, readlink of the fd shows it (bwrap compares) */
     pipe_t*    pipe;
     pipe_t*    pipe2;       /* F_SPAIR: transmit direction */
     int        shut;        /* F_SPAIR: 1 = rx shut, 2 = tx shut */

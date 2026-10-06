@@ -18,6 +18,13 @@ uint32_t now_ms(void) {
     return ts.tv_sec * 1000u + ts.tv_nsec / 1000000;
 }
 
+uint64_t in_us;
+uint64_t now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000ull + ts.tv_nsec / 1000;
+}
+
 uint32_t next_serial(void) { return ++serial; }
 
 long sm(long op, long a, long b, long c) { return syscall(500, op, a, b, c); }
@@ -45,9 +52,11 @@ static void win_events(struct tl *t) {
             if (!t->xwin) xdg_top_configure(t, t->cw, t->ch);
             break;
         case EV_RAWKEY:
+            if (!in_us) in_us = now_us();
             if (kfocus == t) kbd_event(e.a, e.b, e.c);
             break;
         case EV_PENTER: case EV_PLEAVE: case EV_PMOVE: case EV_PBTN: case EV_WHEEL:
+            if (!in_us) in_us = now_us();
             ptr_event(t, &e);
             break;
         }
@@ -95,6 +104,8 @@ int main(int argc, char **argv) {
     setenv("XDG_RUNTIME_DIR", "/run/user/0", 1);
     unlink("/run/user/0/wayland-0");
     unlink("/run/user/0/wayland-0.lock");
+    setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/0/bus", 1);
+    if (!fork()) { execl("/bin/sh", "sh", "/etc/samara-session", (char *)NULL); _exit(1); }
 
     dpy = wl_display_create();
     if (wl_display_add_socket(dpy, "wayland-0")) { fprintf(stderr, "samara-wl: no socket\n"); return 1; }

@@ -149,6 +149,7 @@ static bool pipe_end(pipe_t* p, int dr, int dw) {
     return dead;
 }
 
+void ep_free(file_t* f);
 void file_ref(file_t* f) { if (f) __atomic_add_fetch(&f->refs, 1, __ATOMIC_ACQ_REL); }
 
 void file_close(file_t* f) {
@@ -165,12 +166,19 @@ void file_close(file_t* f) {
     if (f->type == F_USOCK || f->type == F_ULISTEN) ux_release(f);
     if (f->type == F_EVENTFD) wq_drain(&f->wq);
     if (f->type == F_RTC) clock_rtc_uie(0);
-    if (f->type == F_EPOLL && f->ep) kfree(f->ep);
+    if (f->type == F_EPOLL && f->ep) ep_free(f);
     if (f->type == F_URING && f->ur) uring_release(f->ur);
     if (f->type == F_SPAIR) {
         spair_shutdown(f, 2);
-        if (f->pipe->readers <= 0 && f->pipe->writers <= 0) { wq_drain(&f->pipe->wq); kfree(f->pipe); }
-        if (f->pipe2->readers <= 0 && f->pipe2->writers <= 0) { wq_drain(&f->pipe2->wq); kfree(f->pipe2); }
+        pipe_t* ps[2] = { f->pipe, f->pipe2 };
+        for (int i = 0; i < 2; i++) {
+            pipe_t* q = ps[i];
+            // peer may still be inside pipe_end on this one, wait for its unlock before freeing
+            uint64_t fl = spin_lock(&q->lk);
+            bool dead = q->readers <= 0 && q->writers <= 0;
+            spin_unlock(&q->lk, fl);
+            if (dead && !__atomic_exchange_n(&q->gone, 1, __ATOMIC_ACQ_REL)) { wq_drain(&q->wq); kfree(q); }
+        }
     } else if (f->pipe) {
         bool rw = (f->flags & O_ACCMODE) == O_RDWR;
         if (pipe_end(f->pipe, f->type == F_PIPE_R ? -1 : 0, f->type == F_PIPE_R ? (rw ? -1 : 0) : -1)) {
@@ -180,6 +188,7 @@ void file_close(file_t* f) {
         if (f->node) fs_release(f->node);
     }
     if (f->type != F_NODE) io_wake();     // hup for whoever polls the other end
+    if (f->fpath) kfree(f->fpath);
     kfree(f);
 }
 
@@ -306,8 +315,9 @@ int node_write_at(fs_node_t* n, uint32_t off, const char* buf, uint32_t len) {
    outside the node lock (a fault there could want the bkl). pos < 0: use f->off */
 int64_t node_nb_rw(file_t* f, char* ub, uint64_t n, int64_t pos, bool wr) {
     fs_node_t* nd = f->node;
-    if (nd->type != FS_FILE || nd->dev || nd->pc || nd->lazy || nd->hl || ino_any()) return NB_SLOW;
-    if (wr && (nd->cap == 0 || fs_syncing_now() || !strcmp(nd->name, "prof"))) return NB_SLOW;
+    if (nd->type != FS_FILE || nd->dev || nd->pc || nd->lazy || nd->hl || (wr && nd->seals) || ino_any()) return NB_SLOW;
+    if (wr && (nd->cap == 0 || fs_syncing_now() || !strcmp(nd->name, "prof") || !strcmp(nd->name, "heap") || !strcmp(nd->name, "lat")
+               || !strcmp(nd->name, "uid_map") || !strcmp(nd->name, "gid_map") || !strcmp(nd->name, "setgroups"))) return NB_SLOW;
     char tmp[2048];
     uint64_t off, k = 0;
     if (pos >= 0) off = pos;
@@ -318,6 +328,7 @@ int64_t node_nb_rw(file_t* f, char* ub, uint64_t n, int64_t pos, bool wr) {
         if (wr) {
             k = n;
             if (off + k > sz && fs_owner(nd)->parent) return NB_SLOW;    /* growing on a mount: quota, ext2 blocks */
+            if (off + k >= nd->cap) return NB_SLOW;                      /* needs a bigger buffer: not in 2k pieces */
         } else k = off >= sz ? 0 : (sz - off < n ? sz - off : n);
         if (off + k > 0xFFFFF000ull) return NB_SLOW;
         if (__atomic_compare_exchange_n(&f->off, &off, off + k, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) break;
@@ -328,18 +339,20 @@ int64_t node_nb_rw(file_t* f, char* ub, uint64_t n, int64_t pos, bool wr) {
             k = n;
             if (off + k > sz && fs_owner(nd)->parent) return NB_SLOW;
             if (off + k > 0xFFFFF000ull) return NB_SLOW;
+            if (off + k >= nd->cap) return NB_SLOW;
         } else k = off >= sz ? 0 : (sz - off < n ? sz - off : n);
     }
     uint64_t done = 0;
+    bool bail = false;
     while (done < k) {
         uint32_t c = k - done > sizeof(tmp) ? sizeof(tmp) : (uint32_t)(k - done);
         if (wr) memcpy(tmp, ub + done, c);
         uint64_t fl = irq_save();
         node_lock(nd);
-        if (!nd->data || nd->pc || nd->lazy) { node_unlock(nd); irq_restore(fl); return done ? (int64_t)done : NB_SLOW; }
+        if (!nd->data || nd->pc || nd->lazy) { node_unlock(nd); irq_restore(fl); bail = true; break; }
         uint64_t lim = nd->cap ? nd->cap - 1 : nd->size;
         if (wr) {
-            if (off + done + c > lim) { node_unlock(nd); irq_restore(fl); return done ? (int64_t)done : NB_SLOW; }
+            if (off + done + c > lim) { node_unlock(nd); irq_restore(fl); bail = true; break; }
             if (off + done > nd->size) memset(nd->data + nd->size, 0, off + done - nd->size);
             memcpy(nd->data + off + done, tmp, c);
             if (off + done + c > nd->size) { nd->size = off + done + c; nd->data[nd->size] = 0; }
@@ -353,6 +366,9 @@ int64_t node_nb_rw(file_t* f, char* ub, uint64_t n, int64_t pos, bool wr) {
         if (!wr) memcpy(ub + done, tmp, c);
         done += c;
     }
+    // short: f->off already moved by k. the slow path (or the caller's retry) starts from the old spot
+    if (pos < 0 && done < k) __atomic_fetch_sub(&f->off, k - done, __ATOMIC_ACQ_REL);
+    if (bail && !done) return NB_SLOW;
     if (wr && done) { nd->mtime = fs_now(); fs_touch(nd); }
     return done;
 }
@@ -462,6 +478,7 @@ bool file_readable(file_t* f) {
         case F_SOCKET: return sock_readable(f->sock);
         case F_ULISTEN: return ux_pending(f);
         case F_EVENTFD: return f->cnt > 0;
+        case F_NETLINK: return f->pipe->count > 0;
         case F_INOTIFY: return f->pipe->count > 0;
         case F_URING:  return uring_readable(f->ur);
         case F_TIMERFD: return f->t_next && (int32_t)(pit_uptime_ms() - f->t_next) >= 0;
@@ -509,6 +526,7 @@ static int pipe_read(file_t* f, pipe_t* p, char* buf, uint32_t n) {
         memcpy(tmp, p->buf + p->tail, k);
         p->tail = (p->tail + (int)k) % PIPE_SZ;
         p->count -= (int)k;
+        p->rtot += k;
         pipe_wake(p);
         spin_unlock(&p->lk, fl);
         memcpy(buf + got, tmp, k);               // user buffer, may fault
@@ -545,6 +563,7 @@ static int pipe_write(file_t* f, pipe_t* p, const char* buf, uint32_t n) {
         put += c;
         p->head = (p->head + (int)c) % PIPE_SZ;
         p->count += (int)c;
+        p->wtot += c;
         p->wgen++;
         pipe_wake(p);
         spin_unlock(&p->lk, fl);
@@ -695,7 +714,7 @@ int file_read(file_t* f, char* buf, uint32_t n) {
             if (nd->type == FS_DIR) return -EISDIR;
             int sr = shm_rw(nd, f->off, buf, n, false);
             if (sr >= 0) { f->off += sr; return sr; }
-            if (nd->pc) pc_sync(nd);
+            if (nd->pc) pc_sync_range(nd, f->off, n);
             if (f->off >= nd->size) return 0;
             uint32_t k = nd->size - f->off;
             if (k > n) k = n;
@@ -742,13 +761,14 @@ int file_write(file_t* f, const char* buf, uint32_t n) {
         case F_SPAIR:
             if (f->shut & 2) {
                 proc_t* me = proc_current();
-                if (me) proc_send_signal(me, 13);
+                if (me) { int tk = bkl_enter(); proc_send_signal(me, 13); bkl_leave(tk); }
                 return -EPIPE;
             }
             return pipe_write(f, f->pipe2, buf, n);
         case F_PIPE_W: return pipe_write(f, f->pipe, buf, n);
         case F_NODE: {
             if (f->flags & O_APPEND) f->off = f->node->size;
+            if ((f->node->seals & 24) && !f->node->parent && !strncmp(f->node->name, "memfd:", 6)) return -1;   // -1 from shm_rw means "not shm"
             int r = shm_rw(f->node, f->off, (char*)buf, n, true);
             if (r == -1) r = node_write_at(f->node, f->off, buf, n);
             if (r > 0) { f->off += (uint32_t)r; ino_node(f->node, 2); }

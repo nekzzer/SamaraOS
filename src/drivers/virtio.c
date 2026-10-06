@@ -291,7 +291,32 @@ int vnet_recv(int i, void* buf, int max) {
 #define VM_ISR    3
 #define VM_DEVCFG 4
 
-int vm_probe(const pci_dev_t* d, vm_t* v) {
+/* seabios drops the small bars above 512G when hostmem eats the top of the hole, and the cpu only has 39 bits.
+   move them down ourselves */
+static void bar_fix(pci_dev_t* d) {
+    static uint64_t nxt = 0x4000000000ull;
+    for (int i = 0; i < 5; i++) {
+        uint32_t lo = d->bar[i];
+        if ((lo & 7) != 4 || (uint64_t)d->bar[i + 1] < 0x80) continue;      // 64 bit mem, bit 39 is bit 7 of the high dword
+        uint16_t cmd = pci_cfg_read16(d->bus, d->dev, d->fn, 0x04);
+        pci_cfg_write16(d->bus, d->dev, d->fn, 0x04, cmd & ~7);
+        pci_cfg_write32(d->bus, d->dev, d->fn, 0x10 + i * 4, 0xffffffff);
+        uint32_t sz = ~(pci_cfg_read32(d->bus, d->dev, d->fn, 0x10 + i * 4) & ~0xfu) + 1;
+        nxt = (nxt + sz - 1) & ~(uint64_t)(sz - 1);
+        pci_cfg_write32(d->bus, d->dev, d->fn, 0x10 + i * 4, (uint32_t)nxt | (lo & 0xf));
+        pci_cfg_write32(d->bus, d->dev, d->fn, 0x14 + i * 4, (uint32_t)(nxt >> 32));
+        d->bar[i] = (uint32_t)nxt | (lo & 0xf);
+        d->bar[i + 1] = (uint32_t)(nxt >> 32);
+        nxt += sz;
+        pci_cfg_write16(d->bus, d->dev, d->fn, 0x04, cmd);
+        i++;
+    }
+}
+
+int vm_probe(const pci_dev_t* d0, vm_t* v) {
+    pci_dev_t dd = *d0;
+    const pci_dev_t* d = &dd;
+    bar_fix(&dd);
     memset(v, 0, sizeof(*v));
     uint16_t st = pci_cfg_read16(d->bus, d->dev, d->fn, 0x06);
     if (!(st & 0x10)) return -1;                      /* no cap list */
@@ -305,6 +330,13 @@ int vm_probe(const pci_dev_t* d, vm_t* v) {
             uint8_t bar = pci_cfg_read8(d->bus, d->dev, d->fn, c + 4);
             uint32_t off = pci_cfg_read32(d->bus, d->dev, d->fn, c + 8);
             uint32_t len = pci_cfg_read32(d->bus, d->dev, d->fn, c + 12);
+            if (type == 8 && pci_cfg_read8(d->bus, d->dev, d->fn, c + 5) == 1 && bar < 5) {
+                // not mapped here, user mmap goes straight to the pages
+                uint64_t base = d->bar[bar] & ~0xFu;
+                if ((d->bar[bar] & 6) == 4) base |= (uint64_t)d->bar[bar + 1] << 32;
+                v->shm = base + off + ((uint64_t)pci_cfg_read32(d->bus, d->dev, d->fn, c + 16) << 32);
+                v->shm_len = len | ((uint64_t)pci_cfg_read32(d->bus, d->dev, d->fn, c + 20) << 32);
+            }
             if (type >= 1 && type <= 4 && bar < 6 && !(d->bar[bar] & 1)) {
                 uint64_t base = d->bar[bar] & ~0xFu;
                 if ((d->bar[bar] & 6) == 4 && bar < 5) base |= (uint64_t)d->bar[bar + 1] << 32;

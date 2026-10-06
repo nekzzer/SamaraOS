@@ -1,0 +1,10 @@
+#!/bin/sh
+# run something from the void glibc rootfs on /glibc (build/glibc.img)
+# glibc-run bash, glibc-run glxgears ...
+[ -d /glibc/usr ] || { echo "no /glibc, attach build/glibc.img"; exit 1; }
+for d in proc dev sys tmp run; do
+    grep -q " /glibc/$d " /proc/mounts 2>/dev/null || mount --bind /$d /glibc/$d 2>/dev/null
+done
+[ -s /glibc/etc/resolv.conf ] || echo nameserver 10.0.2.3 > /glibc/etc/resolv.conf
+exec chroot /glibc /usr/bin/env HOME=/root PATH=/usr/bin:/usr/sbin DISPLAY=${DISPLAY:-:0} \
+    WAYLAND_DISPLAY=$WAYLAND_DISPLAY XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR LANG=C.UTF-8 MESA_VK_WSI_DEBUG=sw "$@"

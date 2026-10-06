@@ -99,9 +99,14 @@ regs_t* isr_dispatch(regs_t* r) {
         if ((r->cs & 3) && c->cur->state == T_DEAD) { bkl_take(c); r = task_reap(r); }
         return r;
     }
+    if (sched_h[v]) {              // tick, yield, kick: the scheduler has its own lock
+        last_vec = v;
+        r = sched_h[v](r);
+        if (!c->bkl && !(r->cs & 3) && c->cur != c->idle && !c->cur->nobkl) bkl_take(c);   // back into kernel code
+        return r;
+    }
     if (!c->bkl) bkl_take(c);
     if (v != 14) last_vec = v;
-    if (sched_h[v]) return sched_h[v](r);
     if (handlers[v]) handlers[v](r);
     else if (v >= 0x20 && v < 0x30) irq_default(v - 0x20);
     else if (v < 32) exc_default(r);

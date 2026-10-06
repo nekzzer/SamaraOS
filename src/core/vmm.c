@@ -15,6 +15,8 @@ static spin_t pl;
 /* page tables of one address space, hashed by pd. never nested */
 static spin_t mml[16];
 #define MML(pd) (&mml[((pd) >> 12) & 15])
+/* where the last search ended, per space (hashed like mml, same lock). freeing below it pulls it back */
+static struct { uint64_t pd, lo, cache; } fc[16];
 
 void pmm_init(uint64_t top) {
     max_pfn = top >> 12;
@@ -102,6 +104,7 @@ void vmm_flush(void) {
 }
 
 static uint64_t* pte_slot(uint64_t pd, uint64_t va, bool create);
+static uint64_t hole_at(uint64_t pd, uint64_t va);
 #define SLOT(e) (((e) & PTE_ADDR) >> 12)
 
 /* every change of a live leaf pte goes through here. other cpus may hold the old pte
@@ -132,6 +135,7 @@ static void sd_end(void) {
 /* not present before: nobody can have it cached */
 static void pte_put(uint64_t* p, uint64_t va, uint64_t v) {
     uint64_t old = *p;
+    if (old == v) return;
     *p = v;
     if (old & PTE_P) tlb_inval(va);
     else __asm__ volatile ("invlpg (%0)" : : "r"(va) : "memory");
@@ -185,6 +189,15 @@ static uint64_t* pte_slot(uint64_t pd, uint64_t va, bool create) {
     for (int lvl = 3; lvl > 0; lvl--) {
         uint64_t* e = &t[IDX(va, lvl)];
         if (!(*e & PTE_P)) {
+            if (lvl == 1 && (*e & PTE_LAZY)) {         /* whole 2M reserved PROT_NONE, make the real table now */
+                uint64_t n = pmm_alloc();
+                if (!n) return NULL;
+                uint64_t* pt = (uint64_t*)P2V(n);
+                for (int i = 0; i < 512; i++) pt[i] = PTE_LAZY;
+                *e = n | PTE_P | PTE_RW | PTE_US;
+                t = pt;
+                continue;
+            }
             if (!create) return NULL;
             uint64_t n = pmm_alloc();
             if (!n) return NULL;
@@ -197,10 +210,39 @@ static uint64_t* pte_slot(uint64_t pd, uint64_t va, bool create) {
 
 static bool uaddr(uint64_t a) { return a >= USER_BASE && a < USER_TOP; }
 
+/* the pde for va (the 2M slot), tables above it made when `create` */
+static uint64_t* pde_slot(uint64_t pd, uint64_t va, bool create) {
+    uint64_t* t = (uint64_t*)P2V(pd);
+    for (int lvl = 3; lvl > 1; lvl--) {
+        uint64_t* e = &t[IDX(va, lvl)];
+        if (!(*e & PTE_P)) {
+            if (!create) return NULL;
+            uint64_t n = pmm_alloc();
+            if (!n) return NULL;
+            *e = n | PTE_P | PTE_RW | PTE_US;
+        }
+        t = (uint64_t*)P2V(*e & PTE_ADDR);
+    }
+    return &t[IDX(va, 1)];
+}
+
+/* chromium reserves 64G of PROT_NONE for partition_alloc in every process, a pte per page
+   was 128M of tables each and seconds under the bkl. an untouched 2M slot is one marker now */
+static bool pde_res(uint64_t pd, uint64_t va) {
+    uint64_t* e = pde_slot(pd, va, false);
+    return e && !(*e & PTE_P) && (*e & PTE_LAZY);
+}
+
 uint64_t vmm_pte(uint64_t pd, uint64_t va) {
     if (!uaddr(va)) return 0;
     uint64_t* p = pte_slot(pd, va, false);
     return p ? *p : 0;
+}
+
+// non present pte going away: swap slot or lazy shm page ref
+static void pte_rel(uint64_t e) {
+    if (e & PTE_SWAP) swap_put(SLOT(e));
+    else if (e & PTE_SHL) shm_lz_put(e);
 }
 
 static int vmm_alloc_range_nl(uint64_t pd, uint64_t va, uint64_t len, bool writable) {
@@ -218,10 +260,19 @@ static int vmm_alloc_range_nl(uint64_t pd, uint64_t va, uint64_t len, bool writa
         if (*p & PTE_SWAP) { if (writable) *p |= PTE_RW; continue; }
         uint64_t fr = pmm_alloc();
         if (!fr) { ret = -1; break; }
+        if (*p & PTE_SHL) shm_lz_put(*p);
         pte_put(p, a, fr | PTE_P | PTE_US | (writable ? PTE_RW : 0));
     }
     sd_end();
     return ret;
+}
+
+// brk grow: 1 if something is mapped there already, -1 when frames ran out
+int vmm_alloc_free(uint64_t pd, uint64_t va, uint64_t len, bool writable) {
+    uint64_t f = MMLOCK(pd);
+    int r = vmm_range_unmapped(pd, va, len) ? vmm_alloc_range_nl(pd, va, len, writable) : 1;
+    spin_unlock(MML(pd), f);
+    return r;
 }
 
 int vmm_alloc_range(uint64_t pd, uint64_t va, uint64_t len, bool writable) {
@@ -235,6 +286,9 @@ static void vmm_set_writable_nl(uint64_t pd, uint64_t va, uint64_t len, bool wri
     uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     SD_DEFER++;
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
+        uint64_t h = hole_at(pd, a);
+        if (h) { a = (a & ~(h - 1)) + h - PAGE_SIZE; continue; }
+        if (!writable && !(a & 0x1FFFFF) && a + 0x200000 <= end && pde_res(pd, a)) { a += 0x200000 - PAGE_SIZE; continue; }
         uint64_t* p = pte_slot(pd, a, false);
         if (!p || !(*p & PTE_USED)) continue;
         if (!writable) pte_put(p, a, *p & ~(PTE_RW | PTE_COW));
@@ -255,7 +309,7 @@ static int vmm_map_frame_nl(uint64_t pd, uint64_t va, uint64_t fr, bool rw) {
     if (!p) return -1;
     pmm_ref(fr);
     if (*p & PTE_P) pmm_unref(*p & PTE_ADDR);
-    else if (*p & PTE_SWAP) swap_put(SLOT(*p));
+    else pte_rel(*p);
     pte_put(p, va, fr | PTE_P | PTE_US | (rw ? PTE_RW : 0) | PTE_SHARED);   /* every caller maps something shared */
     return 0;
 }
@@ -274,7 +328,7 @@ int vmm_map_cache(uint64_t pd, uint64_t va, uint64_t fr, bool w, bool shared) {
     if (p) {
         pmm_ref(fr);
         if (*p & PTE_P) pmm_unref(*p & PTE_ADDR);
-        else if (*p & PTE_SWAP) swap_put(SLOT(*p));
+        else pte_rel(*p);
         uint64_t fl = shared ? PTE_SHARED | (w ? PTE_RW : 0) : (w ? PTE_COW : 0);
         pte_put(p, va, fr | PTE_P | PTE_US | fl);
         r = 0;
@@ -292,13 +346,36 @@ static int vmm_lazy_range_nl(uint64_t pd, uint64_t va, uint64_t len, bool rw, bo
     SD_DEFER++;
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
         if (!uaddr(a)) { ret = -1; break; }
+        if (!rw && !user && !(a & 0x1FFFFF) && a + 0x200000 <= end) {
+            uint64_t* pde = pde_slot(pd, a, true);
+            if (pde && (!*pde || *pde == PTE_LAZY)) { *pde = PTE_LAZY; a += 0x200000 - PAGE_SIZE; continue; }
+        }
         uint64_t* p = pte_slot(pd, a, true);
         if (!p) { ret = -1; break; }
         if (*p & PTE_P) pmm_unref(*p & PTE_ADDR);
-        else if (*p & PTE_SWAP) swap_put(SLOT(*p));
+        else pte_rel(*p);
         pte_put(p, a, PTE_LAZY | (rw ? PTE_RW : 0) | (user ? PTE_US : 0));
     }
     sd_end();
+    return ret;
+}
+
+int vmm_lazy_shm(uint64_t pd, uint64_t va, uint64_t len, bool rw, bool user, int slot, uint64_t first) {
+    uint64_t f = MMLOCK(pd);
+    int ret = 0;
+    SD_DEFER++;
+    for (uint64_t k = 0; k < len / PAGE_SIZE; k++) {
+        uint64_t a = va + k * PAGE_SIZE;
+        uint64_t* p = pte_slot(pd, a, true);
+        if (!p) { ret = -1; break; }
+        if (*p & PTE_P) pmm_unref(*p & PTE_ADDR);
+        else pte_rel(*p);
+        uint64_t e = PTE_LAZY | PTE_SHL | (rw ? PTE_RW : 0) | (user ? PTE_US : 0) | ((uint64_t)slot << 40) | ((first + k) << 12);
+        shm_lz_dup(e);
+        pte_put(p, a, e);
+    }
+    sd_end();
+    spin_unlock(MML(pd), f);
     return ret;
 }
 
@@ -309,25 +386,30 @@ int vmm_lazy_range(uint64_t pd, uint64_t va, uint64_t len, bool rw, bool user) {
     return r;
 }
 
-static bool vmm_fault_in_nl(uint64_t pd, uint64_t va) {
-    uint64_t* p = pte_slot(pd, va & ~(PAGE_SIZE - 1), false);
-    if (!p) return false;
-    uint64_t old = *p;
-    if (old & PTE_P) return true;                  /* other thread was faster */
-    if (!(old & PTE_LAZY)) return false;
-    uint64_t fr = pmm_alloc();                     /* zeroed */
-    if (!fr) return false;
-    /* two threads on one fresh page: the loser must not overwrite what the winner already wrote */
-    if (!__sync_bool_compare_and_swap(p, old, fr | PTE_P | (old & (PTE_RW | PTE_US)))) { pmm_unref(fr); return true; }
-    return true;
-}
-
 bool vmm_fault_in(uint64_t pd, uint64_t va) {
+    va &= ~(PAGE_SIZE - 1);
+    uint64_t fr = pmm_alloc();                     // zeroing a page under mml was most of the hold time
     uint64_t f = MMLOCK(pd);
-    uint64_t* p = pte_slot(pd, va & ~(PAGE_SIZE - 1), false);
-    bool sw = p && (*p & (PTE_P | PTE_SWAP)) == PTE_SWAP;
-    bool r = sw ? false : vmm_fault_in_nl(pd, va);
+    uint64_t* p = pte_slot(pd, va, false);
+    uint64_t old = p ? *p : 0;
+    bool r = false, sw = (old & (PTE_P | PTE_SWAP)) == PTE_SWAP;
+    if (p && (old & PTE_P)) r = true;              /* other thread was faster */
+    else if (p && (old & PTE_SHL) && fr) {
+        // lazy shm page: the frame comes from the segment, ours is only a spare
+        uint64_t t = shm_lz_frame(old, fr);
+        pmm_ref(t);
+        if (__sync_bool_compare_and_swap(p, old, t | PTE_P | PTE_US | PTE_SHARED | (old & PTE_RW))) shm_lz_put(old);
+        else pmm_unref(t);
+        if (t == fr) fr = 0;
+        r = true;
+    }
+    else if (p && (old & PTE_LAZY) && fr) {
+        /* two threads on one fresh page: the loser must not overwrite what the winner already wrote */
+        if (__sync_bool_compare_and_swap(p, old, fr | PTE_P | (old & (PTE_RW | PTE_US)))) fr = 0;
+        r = true;
+    }
     spin_unlock(MML(pd), f);
+    if (fr) pmm_unref(fr);
     return sw ? vmm_swap_in(pd, va) : r;
 }
 
@@ -364,6 +446,9 @@ static void vmm_set_user_nl(uint64_t pd, uint64_t va, uint64_t len, bool user) {
     uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     SD_DEFER++;
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
+        uint64_t h = hole_at(pd, a);
+        if (h) { a = (a & ~(h - 1)) + h - PAGE_SIZE; continue; }
+        if (!user && !(a & 0x1FFFFF) && a + 0x200000 <= end && pde_res(pd, a)) { a += 0x200000 - PAGE_SIZE; continue; }
         uint64_t* p = pte_slot(pd, a, false);
         if (!p || !(*p & PTE_USED)) continue;
         pte_put(p, a, user ? *p | PTE_US : *p & ~PTE_US);
@@ -377,29 +462,87 @@ void vmm_set_user(uint64_t pd, uint64_t va, uint64_t len, bool user) {
     spin_unlock(MML(pd), f);
 }
 
-static void vmm_free_range_nl(uint64_t pd, uint64_t va, uint64_t len) {
+/* defer: frames wait in dfr until the other cpus have flushed, the caller does that after
+   dropping the lock (a shootdown under mml stalled every fault of the process behind an ipi round trip) */
+static uint64_t dfr[MAX_CPUS][256];
+static int ndf[MAX_CPUS];
+
+static void dfr_flush(void) {
+    int c = this_cpu()->id;
+    if (SD_NEED) { SD_NEED = 0; tlb_shootdown_pd(SD_PD); }
+    for (int i = 0; i < ndf[c]; i++) pmm_unref(dfr[c][i]);
+    ndf[c] = 0;
+}
+
+static void vmm_free_range_nl(uint64_t pd, uint64_t va, uint64_t len, bool defer) {
     uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    int me = this_cpu()->id;
+    if (fc[(pd >> 12) & 15].pd == pd && va < fc[(pd >> 12) & 15].cache) fc[(pd >> 12) & 15].cache = va & ~(PAGE_SIZE - 1);
     SD_DEFER++;
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
         if (!uaddr(a)) continue;
+        uint64_t h = hole_at(pd, a);
+        if (h) { a = (a & ~(h - 1)) + h - PAGE_SIZE; continue; }
+        if (!(a & 0x1FFFFF) && a + 0x200000 <= end && pde_res(pd, a)) { *pde_slot(pd, a, false) = 0; a += 0x200000 - PAGE_SIZE; continue; }
         uint64_t* p = pte_slot(pd, a, false);
         if (!p || !(*p & PTE_USED)) continue;
-        if (*p & PTE_P) pmm_unref(*p & PTE_ADDR);
-        else if (*p & PTE_SWAP) swap_put(SLOT(*p));
+        if ((*p & PTE_P) && defer && ncpu > 1) {
+            if (ndf[me] == 256) dfr_flush();
+            dfr[me][ndf[me]++] = *p & PTE_ADDR;
+        }
+        else if (*p & PTE_P) pmm_unref(*p & PTE_ADDR);
+        else pte_rel(*p);
         pte_put(p, a, 0);
     }
-    sd_end();
+    if (defer) SD_DEFER--;
+    else sd_end();
 }
 
 void vmm_free_range(uint64_t pd, uint64_t va, uint64_t len) {
+    uint64_t fi = irq_save();           // stays off until the frames are gone, per cpu state in there
     uint64_t f = MMLOCK(pd);
-    vmm_free_range_nl(pd, va, len);
+    vmm_free_range_nl(pd, va, len, true);
     spin_unlock(MML(pd), f);
+    dfr_flush();
+    irq_restore(fi);
+}
+
+// madvise(DONTNEED): private writable pages go back to lazy zero. partitionalloc in chromium
+// takes decommitted memory for zeroed and skips the memset, no-op here gave it garbage
+void vmm_discard(uint64_t pd, uint64_t va, uint64_t len) {
+    uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    int me;
+    uint64_t fi = irq_save();
+    uint64_t f = MMLOCK(pd);
+    me = this_cpu()->id;
+    SD_DEFER++;
+    for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
+        if (!uaddr(a)) continue;
+        uint64_t h = hole_at(pd, a);
+        if (h) { a = (a & ~(h - 1)) + h - PAGE_SIZE; continue; }
+        if (!(a & 0x1FFFFF) && a + 0x200000 <= end && pde_res(pd, a)) { a += 0x200000 - PAGE_SIZE; continue; }
+        uint64_t* p = pte_slot(pd, a, false);
+        if (!p || (*p & (PTE_P | PTE_RW | PTE_SHARED)) != (PTE_P | PTE_RW)) continue;
+        uint64_t e = *p;
+        if (ncpu > 1) {
+            if (ndf[me] == 256) dfr_flush();
+            dfr[me][ndf[me]++] = e & PTE_ADDR;
+        }
+        else pmm_unref(e & PTE_ADDR);
+        pte_put(p, a, PTE_LAZY | PTE_RW | (e & PTE_US));
+    }
+    SD_DEFER--;
+    spin_unlock(MML(pd), f);
+    dfr_flush();
+    irq_restore(fi);
 }
 
 bool vmm_range_unmapped(uint64_t pd, uint64_t va, uint64_t len) {
     uint64_t end = (va + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     for (uint64_t a = va & ~(PAGE_SIZE - 1); a < end; a += PAGE_SIZE) {
+        uint64_t h = hole_at(pd, a);
+        if (h) { a = (a & ~(h - 1)) + h - PAGE_SIZE; continue; }
+        if (pde_res(pd, a)) return false;
         uint64_t* p = pte_slot(pd, a, false);
         if (p && (*p & PTE_USED)) return false;
     }
@@ -412,42 +555,87 @@ static uint64_t hole_at(uint64_t pd, uint64_t va) {
     uint64_t* t = (uint64_t*)P2V(pd);
     for (int lvl = 3; lvl > 0; lvl--) {
         uint64_t e = t[IDX(va, lvl)];
-        if (!(e & PTE_P)) return 1ul << (12 + 9 * lvl);
+        if (!(e & PTE_P)) return lvl == 1 && (e & PTE_LAZY) ? 0 : 1ul << (12 + 9 * lvl);
         t = (uint64_t*)P2V(e & PTE_ADDR);
     }
     return 0;
 }
 
-uint64_t vmm_find_free(uint64_t pd, uint64_t from, uint64_t limit, uint64_t len) {
-    len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    uint64_t run = 0, start = from;
-    for (uint64_t a = from; a < limit; a += PAGE_SIZE) {
-        uint64_t h = hole_at(pd, a);
-        if (h) {
-            /* whole empty table: take it in one step */
-            uint64_t nx = (a & ~(h - 1)) + h;
-            if (run == 0) start = a;
-            run += nx - a;
+// first run of len free bytes in [from, limit), 0 if none. walks the pd pages directly
+static uint64_t scan_free(uint64_t pd, uint64_t from, uint64_t limit, uint64_t len) {
+    uint64_t run = 0, start = from, a = from;
+    uint64_t* t3 = (uint64_t*)P2V(pd);
+    while (a < limit) {
+        uint64_t e3 = t3[IDX(a, 3)];
+        if (!(e3 & PTE_P)) {
+            uint64_t nx = (a | 0x7FFFFFFFFF) + 1;
+            if (!run) start = a;
+            run += nx - a; a = nx;
             if (run >= len) return start;
-            a = nx - PAGE_SIZE;
             continue;
         }
-        uint64_t* p = pte_slot(pd, a, false);
-        if (p && (*p & PTE_USED)) { run = 0; continue; }
-        if (run == 0) start = a;
-        run += PAGE_SIZE;
-        if (run >= len) return start;
+        uint64_t* t2 = (uint64_t*)P2V(e3 & PTE_ADDR);
+        uint64_t e2 = t2[IDX(a, 2)];
+        if (!(e2 & PTE_P)) {
+            uint64_t nx = (a | 0x3FFFFFFF) + 1;
+            if (!run) start = a;
+            run += nx - a; a = nx;
+            if (run >= len) return start;
+            continue;
+        }
+        uint64_t* t1 = (uint64_t*)P2V(e2 & PTE_ADDR);
+        // a whole pd page: walk its 512 slots straight
+        uint64_t gb = (a | 0x3FFFFFFF) + 1;
+        for (int i = IDX(a, 1); i < 512 && a < limit; i++) {
+            uint64_t e = t1[i];
+            if (!(e & PTE_P)) {
+                if (e & PTE_LAZY) { run = 0; a = (a | 0x1FFFFF) + 1; continue; }
+                if (!run) start = a;
+                run += ((a | 0x1FFFFF) + 1) - a;
+                a = (a | 0x1FFFFF) + 1;
+                if (run >= len) return start;
+                continue;
+            }
+            uint64_t* pt = (uint64_t*)P2V(e & PTE_ADDR);
+            for (int j = IDX(a, 0); j < 512 && a < limit; j++, a += PAGE_SIZE) {
+                if (pt[j] & PTE_USED) { run = 0; continue; }
+                if (!run) start = a;
+                run += PAGE_SIZE;
+                if (run >= len) return start;
+            }
+        }
+        a = gb;
     }
     return 0;
+}
+
+// caller holds the mm lock
+static uint64_t find_free_nl(uint64_t pd, uint64_t from, uint64_t limit, uint64_t len) {
+    len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    int h = (pd >> 12) & 15;
+    if (fc[h].pd != pd || fc[h].lo != from) { fc[h].pd = pd; fc[h].lo = from; fc[h].cache = from; }
+    uint64_t c = fc[h].cache;
+    uint64_t r = 0;
+    if (c > from && c < limit) r = scan_free(pd, c, limit, len);
+    if (!r) r = scan_free(pd, from, limit, len);
+    if (r) fc[h].cache = r + len;
+    return r;
+}
+
+uint64_t vmm_find_free(uint64_t pd, uint64_t from, uint64_t limit, uint64_t len) {
+    uint64_t f = MMLOCK(pd);
+    uint64_t r = find_free_nl(pd, from, limit, len);
+    spin_unlock(MML(pd), f);
+    return r;
 }
 
 /* anon mmap for the threads that mmap at once: find the hole and claim it under one lock */
 uint64_t vmm_map_anon(uint64_t pd, uint64_t addr, bool fixed, uint64_t lo, uint64_t hi, uint64_t len, bool rw, bool user) {
     uint64_t f = MMLOCK(pd);
-    if (fixed) vmm_free_range_nl(pd, addr, len);
+    if (fixed) vmm_free_range_nl(pd, addr, len, false);
     else if (!(addr && !(addr & 0xFFF) && addr >= lo && addr + len <= hi && vmm_range_unmapped(pd, addr, len)))
-        addr = vmm_find_free(pd, lo, hi, len);
-    if (addr && vmm_lazy_range_nl(pd, addr, len, rw, user) < 0) { vmm_free_range_nl(pd, addr, len); addr = 0; }
+        addr = find_free_nl(pd, lo, hi, len);
+    if (addr && vmm_lazy_range_nl(pd, addr, len, rw, user) < 0) { vmm_free_range_nl(pd, addr, len, false); addr = 0; }
     spin_unlock(MML(pd), f);
     return addr;
 }
@@ -457,8 +645,8 @@ uint64_t vmm_map_anon(uint64_t pd, uint64_t addr, bool fixed, uint64_t lo, uint6
 uint64_t vmm_reserve(uint64_t pd, uint64_t addr, uint64_t lo, uint64_t hi, uint64_t len) {
     uint64_t f = MMLOCK(pd);
     if (!(addr && !(addr & 0xFFF) && addr >= lo && addr + len <= hi && vmm_range_unmapped(pd, addr, len)))
-        addr = vmm_find_free(pd, lo, hi, len);
-    if (addr && vmm_lazy_range_nl(pd, addr, len, false, false) < 0) { vmm_free_range_nl(pd, addr, len); addr = 0; }
+        addr = find_free_nl(pd, lo, hi, len);
+    if (addr && vmm_lazy_range_nl(pd, addr, len, false, false) < 0) { vmm_free_range_nl(pd, addr, len, false); addr = 0; }
     spin_unlock(MML(pd), f);
     return addr;
 }
@@ -467,7 +655,7 @@ static void free_tables(uint64_t tbl, int lvl) {
     uint64_t* t = (uint64_t*)P2V(tbl);
     for (int i = 0; i < 512; i++) {
         if (!(t[i] & PTE_P)) {
-            if (lvl == 0 && (t[i] & PTE_SWAP)) swap_put(SLOT(t[i]));
+            if (lvl == 0) pte_rel(t[i]);
             continue;
         }
         if (lvl == 0) pmm_unref(t[i] & PTE_ADDR);
@@ -478,6 +666,9 @@ static void free_tables(uint64_t tbl, int lvl) {
 
 void vmm_destroy_space(uint64_t pd) {
     if (ncpu > 1) tlb_unload(pd);
+    uint64_t f = MMLOCK(pd);
+    if (fc[(pd >> 12) & 15].pd == pd) fc[(pd >> 12) & 15].pd = 0;
+    spin_unlock(MML(pd), f);
     uint64_t* d = (uint64_t*)P2V(pd);
     for (int i = 0; i < 256; i++)
         if (d[i] & PTE_P) { free_tables(d[i] & PTE_ADDR, 2); d[i] = 0; }
@@ -490,7 +681,7 @@ static bool clone_level(uint64_t src, uint64_t dst, int lvl, uint64_t base) {
     for (int i = 0; i < 512; i++) {
         uint64_t e = s[i];
         if (lvl > 0) {
-            if (!(e & PTE_P)) continue;
+            if (!(e & PTE_P)) { if (lvl == 1 && (e & PTE_LAZY)) d[i] = e; continue; }
             uint64_t n = pmm_alloc();
             if (!n) return false;
             d[i] = n | (e & 0xFFF);
@@ -498,7 +689,7 @@ static bool clone_level(uint64_t src, uint64_t dst, int lvl, uint64_t base) {
             continue;
         }
         if (!(e & PTE_P)) {
-            if (e & PTE_LAZY) d[i] = e;            /* untouched: stays lazy */
+            if (e & PTE_LAZY) { if (e & PTE_SHL) shm_lz_dup(e); d[i] = e; }   /* untouched: stays lazy */
             else if (e & PTE_SWAP) { swap_dup(SLOT(e)); d[i] = e; }
             continue;
         }
@@ -573,6 +764,25 @@ static uint64_t count_level(uint64_t tbl, int lvl) {
     return n;
 }
 
+// like count_level but lazy and swapped pages count too (rlimit AS)
+static uint64_t count_virt(uint64_t tbl, int lvl) {
+    uint64_t* t = (uint64_t*)P2V(tbl);
+    uint64_t n = 0;
+    for (int i = 0; i < 512; i++) {
+        if (!lvl) { if (t[i] & PTE_USED) n++; continue; }
+        if (t[i] & PTE_P) n += count_virt(t[i] & PTE_ADDR, lvl - 1);
+    }
+    return n;
+}
+
+uint64_t vmm_count_virt(uint64_t pd) {
+    uint64_t* d = (uint64_t*)P2V(pd);
+    uint64_t n = 0;
+    for (int i = 0; i < 256; i++)
+        if (d[i] & PTE_P) n += count_virt(d[i] & PTE_ADDR, 2);
+    return n;
+}
+
 uint64_t vmm_count_pages(uint64_t pd) {
     uint64_t* d = (uint64_t*)P2V(pd);
     uint64_t n = 0;
@@ -583,11 +793,27 @@ uint64_t vmm_count_pages(uint64_t pd) {
 
 /* below 4G the direct map already covers it. above: hang a 1G slot of 2M
    uncached pages into the direct map (pools of 4, bars up there are rare) */
-extern uint64_t boot_pdpt_a[];
+extern uint64_t boot_pdpt_a[], boot_pml4[];
 void* mmio_map(uint64_t pa, size_t len) {
     static uint64_t pd[4][512] __attribute__((aligned(4096)));
     static int used;
     if (pa + len <= 0x100000000ull) return P2V(pa);
+    if (pa >= 1ull << 39) {
+        // venus hostmem puts the bar at 512G+, its own pml4 slot (dmap + pa lands there)
+        static uint64_t hp[512] __attribute__((aligned(4096))), hd[4][512] __attribute__((aligned(4096)));
+        static int hu, hs;
+        uint64_t sl = pa >> 39;
+        if (sl > 200 || sl != ((pa + len - 1) >> 39) || (hs && hs != (int)sl)) return NULL;
+        if (!hs) { hs = (int)sl; boot_pml4[256 + sl] = V2P(hp) | 3; }
+        for (uint64_t g = (pa >> 30) & 511; g <= (((pa + len - 1) >> 30) & 511); g++) {
+            if (hp[g] & PTE_P) continue;
+            if (hu == 4) return NULL;
+            for (int i = 0; i < 512; i++) hd[hu][i] = ((sl << 39) | (g << 30)) | ((uint64_t)i << 21) | 0x9b;
+            hp[g] = V2P(hd[hu++]) | 3;
+        }
+        vmm_flush();
+        return P2V(pa);
+    }
     for (uint64_t g = pa >> 30; g <= (pa + len - 1) >> 30; g++) {
         if (g >= 512) return NULL;
         if (boot_pdpt_a[g] & PTE_P) continue;

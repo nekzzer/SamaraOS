@@ -8,7 +8,7 @@
    ramfs, talking to the kernel through the Linux int 0x80 ABI so that
    unmodified static binaries (busybox + musl) run as-is. */
 
-#define MAX_PROCS   48
+#define MAX_PROCS   448             /* java alone has ~40 threads, 48 ran out under minecraft */
 #define MAX_FDS     1024            /* Linux default RLIMIT_NOFILE: ld keeps every input open */
 #define NSIG_MAX    65
 #define KSTACK_SZ   16384
@@ -37,7 +37,9 @@ typedef struct pshared {
         int      over;
     } tm[16];
     fs_node_t* cwd;
+    fs_node_t* root;               /* chroot, NULL = real root */
     int      umask;
+    uint64_t rl[16][2];            /* rlimits: cur, max */
 } pshared_t;
 
 typedef struct proc {
@@ -52,6 +54,7 @@ typedef struct proc {
     int      task;                 /* task slot running this process */
     uint64_t pd;                   /* top level page table (physical) */
     uint64_t tls_base;             /* fs base */
+    uint64_t gs_base;              /* user gs, wine keeps the TEB there */
     uint64_t clear_child_tid;
     pshared_t* sh;
     pshared_t  shd;                /* leader's own, threads use sh of the leader */
@@ -91,6 +94,20 @@ typedef struct proc {
     uint8_t  pt_si[128];
     uint64_t dr[8];
     int      nice, policy, rtprio;     /* setpriority, sched_setscheduler */
+    /* namespaces (indexes into ns.c tables, 0 = the initial one), see ns.c */
+    uint8_t  mntns, utsns, ipcns, userns, netns, pidns, kidns;   /* kidns: pid ns for children after unshare */
+    int      vpid[4];                  /* pid at every pid ns level, [0] is the real pid */
+    uint64_t nsfl;                     /* CLONE_NEW* for the child being forked */
+    /* seccomp */
+    bool     nnp;
+    bool     fsp;           // clone(CLONE_FS) child: chroot/chdir also hit the parent (no shared fs struct here)
+    bool     capx;          // capset was called, cap[] is real (e, p, i)
+    uint64_t cap[3];
+    uint8_t  sc_mode;                  /* 0 off, 1 strict, 2 filter */
+    struct sfilt* sf;                  /* newest filter, older ones hang off ->prev */
+    bool     sys_sig;                  /* SIGSYS from seccomp is being delivered */
+    int      sys_nr, sys_err;
+    uint64_t sys_ip;
 } proc_t;
 
 void    proc_init(void);
@@ -112,6 +129,7 @@ proc_t* proc_current(void);           /* NULL on kernel tasks */
 proc_t* proc_by_pid(int pid);
 int     proc_pid(proc_t* p);
 uint64_t proc_tls_base(proc_t* p);
+uint64_t proc_gs_base(proc_t* p);
 bool    proc_interrupted(void);       /* current process has a fatal signal pending */
 void    proc_signal_group(int pgid, int sig);
 int     proc_send_signal(proc_t* p, int sig);
@@ -141,6 +159,36 @@ int     proc_wait(int pid, int* status, int options);
 
 void    syscall_init(void);
 
+/* ns.c */
+int     ns_unshare(uint64_t fl);
+int     ns_join(int type, int idx);
+int     ns_idx(proc_t* p, int type);
+int     ns_level(proc_t* p);
+const char* ns_type_name(int t);
+int     ns_gpid(proc_t* v, int g);
+int     ns_lpid(proc_t* v, int vp);
+void    ns_fork(proc_t* p, proc_t* c);          /* child gets the namespaces of p (+ new ones from p->nsfl) */
+void    ns_exit(proc_t* p);
+int     ns_pid_view(proc_t* v, proc_t* q);      /* pid of q as seen from v, 0 = invisible */
+proc_t* ns_pid_find(proc_t* v, int vp);
+int     ns_uid(proc_t* p, int g);
+int     ns_uname(proc_t* p, char* host, char* dom);
+int     ns_sethost(proc_t* p, const char* s, int n, bool dom);
+int     ns_idmap(proc_t* t, int what, const char* s, int n);   /* what: 0 uid_map, 1 gid_map, 2 setgroups */
+int     ns_idmap_text(proc_t* t, int what, char* out, int cap);
+uint32_t ns_ino(proc_t* p, int type);
+int     ns_pivot(const char* nw, const char* old);
+bool    ns_loopback_only(void);
+
+/* seccomp.c */
+struct sfilt;
+int     sc_prctl(uint64_t op, uint64_t a, uint64_t b);
+int     sc_seccomp(uint64_t op, uint64_t fl, uint64_t uargs);
+int     sc_check(regs_t* r);                    /* 0 run it, 1 answered, 2 SIGSYS, 3 kill */
+void    sc_trap(regs_t* r);
+struct sfilt* sc_dup(struct sfilt* f);
+void    sc_put(struct sfilt* f);
+
 /* signal.c */
 #define SIGBIT(s) (1ull << ((s) - 1))
 bool    proc_signal_deliverable(proc_t* p);
@@ -155,6 +203,7 @@ int     proc_sigaltstack(const uint64_t* ss, uint64_t* old, uint64_t rsp);
 void    proc_check_alarm(proc_t* p, bool from_irq);   /* fire SIGALRM when due */
 void    proc_account_tick(proc_t* p, bool user);
 void    proc_timers_tick(uint32_t now);
+void    proc_timer_hint(uint32_t at);
 uint32_t proc_next_timer(uint32_t now);
 int64_t sys_timer(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d);
 

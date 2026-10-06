@@ -2,7 +2,7 @@
 #define SAMARA_TASK_H
 #include "core/types.h"
 
-#define MAX_TASKS  64
+#define MAX_TASKS  512
 #define TASK_STACK_SZ 8192
 
 #define NB_SLOW (-0x7fffffff00000000ll)   /* nobkl handler: take the lock and do it the long way */
@@ -66,6 +66,7 @@ void  task_sleep_ms(uint32_t ms);   /* kernel tasks: give up the CPU for a while
 void  task_wait_io(uint32_t ms);    /* sleep until io_wake() or ms passed */
 void  io_wake(void);                /* something readable/writable/closed happened, poll again */
 task_t* task_current(void);
+void  task_kill(task_t* t);         /* proc = NULL, cr3 = 0, dead, safe against a pick on another cpu */
 void  task_ready(task_t* t);        /* blocked -> ready, wakes a parked cpu */
 regs_t* task_reap(regs_t* f);        /* dead task in ring 3: send the cpu elsewhere */
 void  cpu_wait_to(uint32_t ms);     /* same, but an irq or ms later wakes us, no 1 kHz tick needed */
@@ -94,5 +95,6 @@ static inline void irq_restore(uint64_t f) {
 }
 
 void wrmsr_fs(uint64_t v);
+void wrmsr_ugs(uint64_t v);
 
 #endif

@@ -15,11 +15,13 @@ static void pool_unref(struct pool *p) {
 }
 
 static void buf_destroy_req(struct wl_client *c, struct wl_resource *r) { wl_resource_destroy(r); }
-static const struct wl_buffer_interface buf_impl = { buf_destroy_req };
+const struct wl_buffer_interface buf_impl = { buf_destroy_req };
 
-static void buf_free(struct wl_resource *r) {
+void buf_free(struct wl_resource *r) {
     struct buf *b = wl_resource_get_user_data(r);
-    pool_unref(b->pool);
+    if (b->hold) b->hold->cur = NULL;
+    if (b->pool) pool_unref(b->pool);
+    else gpu_buf_free(b);
     free(b);
 }
 
@@ -103,6 +105,7 @@ void surf_rect(struct surf *s, int *x, int *y) {
 }
 
 static void blit(struct tl *t, struct surf *s, int ax, int ay, int x0, int y0, int x1, int y1) {
+    if (gpu) { gpu_quad(s, ax, ay); return; }
     if (ax > x0) x0 = ax;
     if (ay > y0) y0 = ay;
     if (ax + s->w < x1) x1 = ax + s->w;
@@ -139,13 +142,35 @@ void compose(struct tl *t, int x0, int y0, int x1, int y1) {
     if (x1 > t->cw) x1 = t->cw;
     if (y1 > t->ch) y1 = t->ch;
     if (x1 <= x0 || y1 <= y0) return;
+    if (t->dx1 <= t->dx0) { t->dx0 = x0; t->dy0 = y0; t->dx1 = x1; t->dy1 = y1; }
+    else {
+        if (x0 < t->dx0) t->dx0 = x0;
+        if (y0 < t->dy0) t->dy0 = y0;
+        if (x1 > t->dx1) t->dx1 = x1;
+        if (y1 > t->dy1) t->dy1 = y1;
+    }
+    if (gpu) {
+        gpu_begin(t, x0, y0, x1, y1);
+        draw(t, t->s, 0, 0, x0, y0, x1, y1);
+        gpu_end(t, x0, y0, x1, y1);
+        return;
+    }
     for (int y = y0; y < y1; y++) memset(t->pix + y * t->cw + x0, 0, (x1 - x0) * 4);
     draw(t, t->s, 0, 0, x0, y0, x1, y1);
 }
 
 void present(struct tl *t) {
+    if (t->scan) { t->dx0 = t->dy0 = t->dx1 = t->dy1 = 0; return; }
     if (t->h < 0 || !t->pix) return;
-    sm(OP_PRESENT, t->h, (long)t->pix, (long)t->cw << 16 | t->ch);
+    static uint64_t last;
+    uint64_t n = now_us();
+    if (last && n - last < 250000) sm(OP_LAT, 4, n - last, 0);
+    last = n;
+    if (in_us) { sm(OP_LAT, 5, n - in_us, 0); in_us = 0; }
+    int32_t r[6] = { t->cw, t->ch, t->dx0, t->dy0, t->dx1 - t->dx0, t->dy1 - t->dy0 };
+    if (r[4] <= 0 || r[5] <= 0 || sm(OP_PRESENT_RECT, t->h, (long)t->pix, (long)r) < 0)
+        sm(OP_PRESENT, t->h, (long)t->pix, (long)t->cw << 16 | t->ch);
+    t->dx0 = t->dy0 = t->dx1 = t->dy1 = 0;
 }
 
 struct surf *pick(struct tl *t, int x, int y, int *lx, int *ly);
@@ -254,7 +279,8 @@ static void s_commit(struct wl_client *c, struct wl_resource *r) {
     struct surf *s = wl_resource_get_user_data(r);
     if (s->attached) {
         struct buf *b = s->pend;
-        if (b) {
+        if (b && gpu) gpu_commit(s, b);
+        else if (b) {
             int k = s->k;
             bool resized = !s->pix || s->w != b->w * k || s->h != b->h * k;
             if (resized) {
@@ -279,6 +305,7 @@ static void s_commit(struct wl_client *c, struct wl_resource *r) {
         } else if (s->has_buf) {
             struct tl *rt = rootof(s);
             s->has_buf = false;
+            if (gpu) gpu_surf_free(s);
             if (s->role == R_TOP || s->role == R_X) {
                 if (s->root) { tl_destroy(s->root); s->root = NULL; }
             } else if (rt && rt->pix) {
@@ -333,6 +360,7 @@ static void surf_free(struct wl_resource *r) {
     wl_list_for_each_safe(f, fn, &s->pframes, link) wl_resource_destroy(f->res);
     wl_list_remove(&s->glink);
     xwm_surf_gone(s);
+    gpu_surf_free(s);
     free(s->pix);
     free(s);
 }
@@ -414,6 +442,7 @@ void tl_open(struct tl *t) {
     t->h = h;
     t->cw = o.w; t->ch = o.h;
     t->pix = calloc((size_t)t->cw * t->ch, 4);
+    if (gpu) gpu_tl_alloc(t);
     compose(t, 0, 0, t->cw, t->ch);
     present(t);
     if (!t->xwin && (o.w != ww || o.h != hh)) xdg_top_configure(t, o.w, o.h);
@@ -422,8 +451,10 @@ void tl_open(struct tl *t) {
 void tl_resized(struct tl *t, int cw, int ch) {
     if (cw == t->cw && ch == t->ch) return;
     free(t->pix);
+    t->dx0 = t->dy0 = t->dx1 = t->dy1 = 0;
     t->cw = cw; t->ch = ch;
     t->pix = calloc((size_t)cw * ch, 4);
+    if (gpu) gpu_tl_alloc(t);
     if (t->xwin) xwm_resize(t, cw, ch);
     else xdg_top_configure(t, cw, ch);
     compose(t, 0, 0, cw, ch);
@@ -438,6 +469,7 @@ void tl_destroy(struct tl *t) {
     ptr_gone(t->s);
     wl_list_remove(&t->link);
     if (t->s) t->s->root = NULL;
+    if (gpu) gpu_tl_free(t);
     free(t->pix);
     free(t);
 }
@@ -461,4 +493,5 @@ void comp_init(void) {
     wl_global_create(dpy, &wl_subcompositor_interface, 1, NULL, subc_bind);
     wl_global_create(dpy, &wl_shm_interface, 1, NULL, shm_bind);
     wl_global_create(dpy, &wl_output_interface, 3, NULL, out_bind);
+    gpu_init();
 }

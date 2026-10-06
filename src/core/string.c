@@ -37,6 +37,14 @@ void* memmove(void* dst, const void* src, size_t n) {
 int memcmp(const void* a, const void* b, size_t n) {
     const uint8_t* x = (const uint8_t*)a;
     const uint8_t* y = (const uint8_t*)b;
+    /* mmap writeback compares whole pages, usually identical. */
+    while (n >= 8) {
+        uint64_t u, v;
+        __builtin_memcpy(&u, x, 8);
+        __builtin_memcpy(&v, y, 8);
+        if (u != v) break;
+        x += 8; y += 8; n -= 8;
+    }
     while (n--) { if (*x != *y) return *x - *y; x++; y++; }
     return 0;
 }

@@ -16,6 +16,7 @@ extern void pit_tick_inc(void);
 extern uint32_t pit_uptime_ms(void);
 extern void pit_check_stack_guard(uint64_t cur_rsp);
 
+static spin_t slk;       /* pick .. claim in switch_to, plus kills of other threads (task_kill) */
 static task_t tasks[MAX_TASKS];
 static task_t idle_t[MAX_CPUS];
 static int    n_tasks = 0;          /* high-water mark of used slots */
@@ -29,6 +30,9 @@ uint32_t      cpu_ctxt;
 static uint8_t fpu_clean_raw[512 + 16];
 void wrmsr_fs(uint64_t v) {
     __asm__ volatile ("wrmsr" : : "c"(0xC0000100), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)));
+}
+void wrmsr_ugs(uint64_t v) {
+    __asm__ volatile ("wrmsr" : : "c"(0xC0000102), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)));
 }
 static uint8_t* fpu_clean;
 static uint8_t fpu_idle_raw[512 + 16];
@@ -58,6 +62,15 @@ void task_exit(void) {
     cli();
     task_current()->state = T_DEAD;
     for (;;) task_yield();
+}
+
+// other thread's task goes away, under the sched lock so a pick can't land on it half way
+void task_kill(task_t* t) {
+    uint64_t f = spin_lock(&slk);
+    t->proc = NULL;
+    t->cr3 = 0;
+    t->state = T_DEAD;
+    spin_unlock(&slk, f);
 }
 
 void task_ready(task_t* t) {
@@ -130,7 +143,7 @@ void cpu_wait(void) {
         timer_periodic(c);
     }
     c->in_idle = 0;
-    if (!c->bkl) bkl_take(c);
+    if (!c->bkl && c->cur != c->idle && !c->cur->nobkl) bkl_take(c);
     /* killed from another cpu while we waited: never go on with it */
     while (c->cur->state == T_DEAD) { task_yield(); c = this_cpu(); }
     irq_restore(fl);
@@ -183,7 +196,7 @@ static int finish_spawn(int id, const char* name, uint8_t* stack, uint64_t rsp,
     t->kstack_top = kstack_top;
     t->proc = p;
     t->ticks = 0;
-    t->state = T_READY;
+    __atomic_store_n(&t->state, T_READY, __ATOMIC_RELEASE);
     kick_idle();
     return id;
 }
@@ -253,10 +266,13 @@ static uint64_t vmin;
 static task_t* pick(struct cpu* c) {
     task_t* best = NULL;
     int bi = 0;
-    for (int i = 1; i <= n_tasks; i++) {
-        int idx = (c->rr + i) % n_tasks;
+    c->slf = spin_lock(&slk);        // switch_to lets go, every pick ends in one
+    c->sl = 1;
+    int nt = n_tasks;
+    for (int i = 1; i <= nt; i++) {
+        int idx = (c->rr + i) % nt;
         task_t* t = &tasks[idx];
-        if (t->state != T_READY || t->on_cpu) continue;
+        if (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) != T_READY || __atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE)) continue;
         if (!best || better(t, best)) { best = t; bi = idx; }
     }
     if (best) {
@@ -271,7 +287,10 @@ static task_t* pick(struct cpu* c) {
 static regs_t* switch_to(struct cpu* c, task_t* next, regs_t* saved) {
     task_t* prev = c->cur;
     prev->rsp = (uint64_t)saved;
-    if (next == prev) return saved;
+    if (next == prev) {
+        if (c->sl) { c->sl = 0; spin_unlock(&slk, c->slf); }
+        return saved;
+    }
     cpu_ctxt++;
 
     if (prev->fpu) __asm__ volatile ("fxsave64 (%0)" : : "r"(prev->fpu) : "memory");
@@ -285,8 +304,10 @@ static regs_t* switch_to(struct cpu* c, task_t* next, regs_t* saved) {
     if (next->fpu) __asm__ volatile ("fxrstor64 (%0)" : : "r"(next->fpu) : "memory");
     if (next->kstack_top) tss_set_rsp0(next->kstack_top);
     load_cr3(c, next->cr3 ? next->cr3 : kernel_cr3);
-    if (next->proc) wrmsr_fs(proc_tls_base(next->proc));
-    if (next->proc && next->proc->dr[7]) { pt_dbg_load(next->proc); c->dr_on = 1; }
+    if (c->sl) { c->sl = 0; spin_unlock(&slk, c->slf); }     // task_kill relies on cr3 being loaded by now
+    struct proc* np = next->proc;         // task_kill can null it under us once slk is gone
+    if (np) { wrmsr_fs(proc_tls_base(np)); wrmsr_ugs(proc_gs_base(np)); }
+    if (np && np->dr[7]) { pt_dbg_load(np); c->dr_on = 1; }
     else if (c->dr_on) { __asm__ volatile ("mov %0, %%dr7" : : "r"(0ul)); c->dr_on = 0; }
     return (regs_t*)next->rsp;
 }
@@ -302,8 +323,12 @@ static regs_t* finish(struct cpu* c, regs_t* f) {
         if ((f->cs & 3) != 3) return f;
     }
     task_t* t = c->cur;
-    if (t->proc) {
-        proc_t* p = t->proc;
+    proc_t* p = t->proc;
+    if (p && (p->alarm_at || p->pt_state || proc_signal_deliverable(p))) {
+        if (!c->bkl) {
+            bkl_take(c);
+            if (t->state == T_DEAD || t->proc != p) return finish(c, f);   // killed while we waited
+        }
         proc_check_alarm(p, true);
         p->pt_isr = true;
         if (proc_signal_deliverable(p)) proc_deliver_signal(f, -1, 0);
@@ -342,7 +367,7 @@ static regs_t* schedule(regs_t* saved) {
     {
         static uint32_t wake_done;
         uint32_t now = pit_uptime_ms();
-        if (now != wake_done) {
+        if (now != wake_done && (c->bkl || bkl_try(c))) {     // busy lock: whoever holds it ticks too
             wake_done = now;
             int woke = 0;
             for (int i = 0; i < n_tasks; i++)
@@ -357,10 +382,15 @@ static regs_t* schedule(regs_t* saved) {
         if (c->in_idle || cur == c->idle) c->t_idle++;
         else if (user) c->t_user++;
         else c->t_sys++;
-        if (cur->proc && !c->in_idle) proc_account_tick(cur->proc, user);
+        proc_t* cp = cur->proc;
+        if (cp && !c->in_idle) {
+            if ((cp->itv_at || cp->itp_at) && !c->bkl) { bkl_take(c); cp = cur->proc; }
+            if (cp) proc_account_tick(cp, user);
+        }
         if (prof_on) {
             if (ncpu < 2) prof_sample(saved->rip, user, c->in_idle || cur == c->idle, cur->proc ? cur->proc->name : "?");
             else for (int i = 0; i < ncpu; i++) if (i != c->id) lapic_ipi_raw(cpus[i].apic_id, 0x4400);
+            if (!user && !c->in_idle && cur != c->idle) { extern void prof_nmi(struct regs*); prof_nmi(saved); }    // we hold the lock here, sample ourselves too
         }
     }
 
@@ -388,6 +418,9 @@ static regs_t* schedule(regs_t* saved) {
 static regs_t* schedule_yield(regs_t* saved) {
     struct cpu* c = this_cpu();
     task_t* cur = c->cur;
+    // two shells in wait4 yielding to each other never let irqs in, the tlb ipi
+    // sat there forever and java's munmap on another cpu waited for it (mc froze the box)
+    tlb_service();
     if (!started) { cur->ysw = 0; return saved; }
     task_t* next = pick(c);
     if (!next) next = (cur->state == T_READY || cur == c->idle) ? cur : c->idle;
@@ -447,8 +480,8 @@ void task_sleep_ms(uint32_t ms) {
     task_t* t = task_current();
     if (t->id != 0) {                        /* the kernel/UI task never blocks */
         t->wake_ms = pit_uptime_ms() + (ms ? ms : 1);
-        t->state = T_BLOCKED;
-        while (t->state == T_BLOCKED) task_yield();   /* woken by the tick */
+        if (__sync_bool_compare_and_swap(&t->state, T_READY, T_BLOCKED))
+            while (t->state == T_BLOCKED) task_yield();   /* woken by the tick */
     } else {
         task_yield();
     }
@@ -463,8 +496,8 @@ void task_wait_io(uint32_t ms) {
     if (t->id != 0) {
         t->io_wait = 1;
         t->wake_ms = pit_uptime_ms() + (ms ? ms : 1);
-        t->state = T_BLOCKED;
-        while (t->state == T_BLOCKED) task_yield();
+        if (__sync_bool_compare_and_swap(&t->state, T_READY, T_BLOCKED))
+            while (t->state == T_BLOCKED) task_yield();
         t->io_wait = 0;
     } else {
         task_yield();
@@ -557,6 +590,15 @@ extern uint8_t nobkl_tab[512];
 void syscall_enter(regs_t* r) {
     struct cpu* c = this_cpu();
     uint64_t nr = r->rax;
+    if (c->cur->proc && c->cur->proc->sc_mode) {
+        int v = sc_check(r);
+        if (v == 1) return;
+        if (v) {
+            if (!c->bkl) bkl_take(c);
+            if (v == 2) sc_trap(r); else proc_exit(31);
+            return;
+        }
+    }
     if (nr < 512 && nobkl_tab[nr] && c->cur->state != T_DEAD) {
         task_t* t = c->cur;
         t->nobkl = 1;
@@ -573,6 +615,7 @@ void syscall_enter(regs_t* r) {
         r->rax = nr;
     }
     c = this_cpu();
+    c->sc = (int)nr;
     if (!c->bkl) bkl_take(c);
     /* killed from another cpu while it was in ring 3: it never does anything again */
     while (c->cur->state == T_DEAD) { task_yield(); c = this_cpu(); }

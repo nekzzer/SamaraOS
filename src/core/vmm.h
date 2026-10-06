@@ -34,6 +34,7 @@ static inline bool dma_ok(const void* v) {
 #define PTE_US 0x004ul
 #define PTE_SHARED 0x200ul         /* avl bit: MAP_SHARED / shmat page, fork shares it */
 #define PTE_LAZY   0x400ul         /* avl bit, P=0: anon mmap page that gets a frame on first touch */
+#define PTE_SHL    (1ul << 62)     /* with LAZY, P=0: shm/memfd page, slot in bits 40-47, page in 12-39 */
 #define PTE_SWAP   0x100ul         /* P=0: page is in swap, slot in the address bits, RW/US kept */
 #define PTE_COW    0x800ul         /* avl bit, P=1, RW=0: writable page whose frame is shared after fork, copied on the write fault */
 #define PTE_A  0x020ul
@@ -59,7 +60,9 @@ uint64_t vmm_clone_space(uint64_t pd);                 /* fork: copy RW, share R
 /* Map fresh zeroed pages over [va, va+len). Already-mapped pages are kept
    (and made writable if `writable`). Returns 0 or -1 on OOM. */
 int      vmm_alloc_range(uint64_t pd, uint64_t va, uint64_t len, bool writable);
+int      vmm_alloc_free(uint64_t pd, uint64_t va, uint64_t len, bool writable);
 void     vmm_free_range(uint64_t pd, uint64_t va, uint64_t len);
+void     vmm_discard(uint64_t pd, uint64_t va, uint64_t len);
 bool     vmm_range_unmapped(uint64_t pd, uint64_t va, uint64_t len);
 uint64_t vmm_map_anon(uint64_t pd, uint64_t addr, bool fixed, uint64_t lo, uint64_t hi, uint64_t len, bool rw, bool user);
 uint64_t vmm_find_free(uint64_t pd, uint64_t from, uint64_t limit, uint64_t len);
@@ -71,6 +74,10 @@ int      vmm_map_frame(uint64_t pd, uint64_t va, uint64_t fr, bool rw);    /* ta
 /* page cache frame into a user page, takes a ref. w: private writable (cow) or, with `shared`, plain rw */
 int      vmm_map_cache(uint64_t pd, uint64_t va, uint64_t fr, bool w, bool shared);
 /* anon memory without frames yet: they come on first touch (vmm_fault_in) */
+int      vmm_lazy_shm(uint64_t pd, uint64_t va, uint64_t len, bool rw, bool user, int slot, uint64_t first);
+void     shm_lz_put(uint64_t e);
+void     shm_lz_dup(uint64_t e);
+uint64_t shm_lz_frame(uint64_t e, uint64_t spare);
 int      vmm_lazy_range(uint64_t pd, uint64_t va, uint64_t len, bool rw, bool user);
 bool     vmm_fault_in(uint64_t pd, uint64_t va);   /* a lazy page gets its frame, a swapped one comes back; false = not lazy / oom */
 bool     vmm_swap_in(uint64_t pd, uint64_t va);    /* may sleep on the disk, no locks held */
@@ -86,6 +93,7 @@ int      vmm_swap_commit(swb_t* b, int n);                                    /*
 /* Copy into / zero another space through the direct map (no CR3 switch). */
 int      vmm_copy_to(uint64_t pd, uint64_t va, const void* src, uint64_t len);
 
+uint64_t vmm_count_virt(uint64_t pd);                   /* same + lazy and swapped */
 uint64_t vmm_count_pages(uint64_t pd);                  /* mapped user pages */
 
 /* device memory (pci bars), anywhere in the physical space */

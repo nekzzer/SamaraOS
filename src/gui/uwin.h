@@ -23,6 +23,9 @@ enum {
     SM_OP_CLIP_SET,      /* ecx = buf, edx = len                                  */
     SM_OP_NOTIFY,        /* ecx = "title\nbody"              popup in the corner  */
     SM_OP_CTL, SM_OP_DND_SET, SM_OP_DND_GET,           /* ecx = SM_CTL_*, edx = arg                             */
+    SM_OP_LAT,           /* ecx = LAT_* metric, edx = us: samara-wl reports its own timings   */
+    SM_OP_SCANOUT,       /* ecx = drm prime fd or -1, edx = w<<16|h: show that gpu bo as the screen, no copies */
+    SM_OP_PRESENT_RECT,  /* handle, pixels, int[6] {width, height, x, y, w, h}; SM_F_WL only */
 };
 
 enum { SM_EV_NONE, SM_EV_KEY, SM_EV_MOUSE_DOWN, SM_EV_MOUSE_UP, SM_EV_MOUSE_MOVE, SM_EV_CLOSE,

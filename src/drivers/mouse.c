@@ -1,3 +1,4 @@
+#include "core/lat.h"
 #include "drivers/input.h"
 #include "drivers/mouse.h"
 #include "core/io.h"
@@ -122,6 +123,7 @@ void mouse_draw_cursor(void) {
 /* dy: up is positive (ps/2 way). dz: > 0 = wheel towards the user. Called from
    the irq12 handler and from the usb poll task. */
 void mouse_feed(int dx, int dy, int dz, uint8_t newbtn) {
+    lat_input();
     uint64_t fl;
     __asm__ volatile ("pushf; pop %0; cli" : "=r"(fl) :: "memory");
     if (input_grabbed()) {
@@ -151,6 +153,7 @@ void mouse_feed(int dx, int dy, int dz, uint8_t newbtn) {
 
 // tablets: x/y in 0..xmax / 0..ymax, scaled to the screen. grabbed = evdev has it already
 void mouse_feed_abs(int x, int y, int xmax, int ymax, int dz, uint8_t newbtn) {
+    lat_input();
     uint64_t fl;
     __asm__ volatile ("pushf; pop %0; cli" : "=r"(fl) :: "memory");
     btn = newbtn;

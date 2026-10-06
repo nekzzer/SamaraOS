@@ -10,7 +10,7 @@
 #define IN_ISDIR 0x40000000
 #define IN_IGNORED 0x8000
 #define IN_ONESHOT 0x80000000
-#define MAXW 256
+#define MAXW 8192
 #define O_NONBLOCK 04000
 #define EAGAIN 11
 #define EINTR 4
@@ -42,7 +42,11 @@ static void put(file_t* f, int wd, uint32_t mask, uint32_t cookie, const char* n
         rd(p, (int)(f->cnt - 1), old, tot);
         if (!memcmp(old, ev, tot) && ((int)(f->cnt - 1) - p->tail + PIPE_SZ) % PIPE_SZ < p->count) { spin_unlock(&p->lk, fl); return; }
     }
-    if (p->count + tot > PIPE_SZ) { spin_unlock(&p->lk, fl); return; }
+    if (p->count + tot > PIPE_SZ - (mask == 0x4000 ? 0 : 16)) {
+        spin_unlock(&p->lk, fl);
+        if (mask != 0x4000) put(f, -1, 0x4000, 0, NULL);       // IN_Q_OVERFLOW
+        return;
+    }
     f->cnt = p->head + 1;
     for (int i = 0; i < tot; i++) p->buf[(p->head + i) % PIPE_SZ] = ev[i];
     p->head = (p->head + tot) % PIPE_SZ;

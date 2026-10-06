@@ -1,3 +1,4 @@
+#include "core/lat.h"
 #include "core/pcache.h"
 #include "core/swap.h"
 #include "boot/gdt.h"
@@ -49,6 +50,11 @@ static void sb_frac(sb_t* b, uint32_t hundredths) {       /* "12.34" */
 /* ---------------- node helpers ---------------- */
 
 static fs_node_t* proc_root;
+static proc_t* vw;                 /* who is looking: pids are shown the way its pid ns numbers them */
+
+static int vid(int g) { return vw && vw->pidns ? ns_gpid(vw, g) : g; }
+static int vpid_of(proc_t* q) { return vw && vw->pidns ? ns_pid_view(vw, q) : q->pid; }
+static proc_t* find(int vp) { return vw ? ns_pid_find(vw, vp) : proc_by_pid(vp); }
 
 static fs_node_t* ensure(fs_node_t* dir, const char* name, fs_type_t type, uint16_t mode) {
     fs_node_t* n = fs_child(dir, name);
@@ -109,12 +115,12 @@ static void fill_pid_dir(fs_node_t* d, proc_t* p, char* mem, uint32_t cap) {
 
     /* stat: the 52 fields procps parsers expect, in order. */
     b = (sb_t){ mem, 0, cap };
-    sb_int(&b, p->pid); sb_puts(&b, " ("); sb_puts(&b, p->name); sb_puts(&b, ") ");
+    sb_int(&b, vpid_of(p)); sb_puts(&b, " ("); sb_puts(&b, p->name); sb_puts(&b, ") ");
     sb_putc(&b, s); sb_putc(&b, ' ');
-    sb_int(&b, p->ppid); sb_putc(&b, ' ');
-    sb_int(&b, p->pgid); sb_putc(&b, ' ');
-    sb_int(&b, p->sid); sb_puts(&b, " 1025 ");                 /* tty_nr: tty1 */
-    sb_int(&b, p->pgid); sb_puts(&b, " 4194560 0 0 0 0 ");     /* tpgid flags minflt.. */
+    sb_int(&b, vid(p->ppid)); sb_putc(&b, ' ');
+    sb_int(&b, vid(p->pgid)); sb_putc(&b, ' ');
+    sb_int(&b, vid(p->sid)); sb_puts(&b, " 1025 ");                 /* tty_nr: tty1 */
+    sb_int(&b, vid(p->pgid)); sb_puts(&b, " 4194560 0 0 0 0 ");     /* tpgid flags minflt.. */
     sb_num(&b, ut); sb_putc(&b, ' '); sb_num(&b, st);
     sb_puts(&b, " 0 0 20 0 "); sb_int(&b, nthreads(p)); sb_puts(&b, " 0 ");   /* cutime cstime prio nice threads itreal */
     sb_num(&b, start); sb_putc(&b, ' ');
@@ -145,21 +151,70 @@ static void fill_pid_dir(fs_node_t* d, proc_t* p, char* mem, uint32_t cap) {
         if (!ol && x[0]) fs_symlink(d, "exe", x);
     }
 
+    if (!fs_child(d, "root")) fs_symlink(d, "root", "/");      // pipewire's flatpak check opens it
+
     b = (sb_t){ mem, 0, cap };                                /* df and friends read /proc/self/mounts (void's /etc/mtab) */
     b.len += (uint32_t)mnt_text(b.buf + b.len, (int)(b.cap - b.len));
     put(d, "mounts", &b);
+
+    b = (sb_t){ mem, 0, cap };
+    if (p->mntns) b.len += (uint32_t)fs_bt_info(p->mntns, b.buf + b.len, (int)(b.cap - b.len));
+    else {
+        char* t = (char*)kmalloc(2048);
+        int id = 20;
+        if (t) {
+            mnt_text(t, 2048);
+            for (char* ln = t; *ln; ) {
+                char* e = ln; while (*e && *e != '\n') e++;
+                char* sp[4] = { ln };
+                int k = 1;
+                for (char* c = ln; c < e && k < 4; c++) if (*c == ' ') { *c = 0; sp[k++] = c + 1; }
+                if (k == 4) {
+                    char* o = sp[3]; while (*o && *o != ' ') o++;
+                    *o = 0;
+                    char ti[12]; utoa(id, ti, 10);
+                    sb_puts(&b, ti); sb_puts(&b, " 1 0:"); sb_puts(&b, ti); sb_puts(&b, " / ");
+                    sb_puts(&b, sp[1]); sb_putc(&b, ' '); sb_puts(&b, sp[3]); sb_puts(&b, " - ");
+                    sb_puts(&b, sp[2]); sb_putc(&b, ' '); sb_puts(&b, sp[0]); sb_putc(&b, ' '); sb_puts(&b, sp[3]);
+                    sb_putc(&b, '\n');
+                    id++;
+                }
+                ln = *e ? e + 1 : e;
+            }
+            kfree(t);
+        }
+    }
+    put(d, "mountinfo", &b);
 
     static const char* const long_state[] = { "R (running)", "S (sleeping)", "Z (zombie)", "t (tracing stop)" };
     b = (sb_t){ mem, 0, cap };
     sb_puts(&b, "Name:\t"); sb_puts(&b, p->name);
     sb_puts(&b, "\nUmask:\t0"); { char t[8]; utoa((uint32_t)p->sh->umask, t, 8); sb_puts(&b, t); }
     sb_puts(&b, "\nState:\t"); sb_puts(&b, long_state[s == 'R' ? 0 : s == 'S' ? 1 : s == 'Z' ? 2 : 3]);
-    sb_puts(&b, "\nTgid:\t"); sb_int(&b, p->tgid);
-    sb_puts(&b, "\nPid:\t"); sb_int(&b, p->pid);
-    sb_puts(&b, "\nPPid:\t"); sb_int(&b, p->ppid);
-    sb_puts(&b, "\nTracerPid:\t"); sb_int(&b, p->tracer);
+    sb_puts(&b, "\nTgid:\t"); sb_int(&b, vid(p->tgid));
+    sb_puts(&b, "\nPid:\t"); sb_int(&b, vpid_of(p));
+    sb_puts(&b, "\nPPid:\t"); sb_int(&b, vid(p->ppid));
+    sb_puts(&b, "\nTracerPid:\t"); sb_int(&b, vid(p->tracer));
     sb_puts(&b, "\nPtDbg:\t"); sb_int(&b, p->pt_state); sb_putc(&b, ' '); sb_int(&b, p->pt_stopsig); sb_putc(&b, ' '); sb_int(&b, p->pt_rep); sb_putc(&b, ' '); sb_int(&b, p->pt_event);
-    sb_puts(&b, "\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\n");
+    sb_puts(&b, "\nUid:\t"); for (int k = 0; k < 4; k++) { sb_int(&b, ns_uid(p, 0)); sb_putc(&b, k < 3 ? '\t' : '\n'); }
+    sb_puts(&b, "Gid:\t"); for (int k = 0; k < 4; k++) { sb_int(&b, ns_uid(p, 1)); sb_putc(&b, k < 3 ? '\t' : '\n'); }
+    sb_puts(&b, "FDSize:\t64\nGroups:\t\n");
+    // crashpad wants these or it says 'format error: missing fields'
+    sb_puts(&b, "NStgid:\t"); sb_int(&b, vid(p->tgid));
+    sb_puts(&b, "\nNSpid:\t");
+    {   // outermost level the viewer can see down to the process' own
+        int top = vw && vw->pidns ? ns_level(vw) : 0, mine = ns_level(p);
+        for (int k = top; k <= mine; k++) { sb_int(&b, k == mine ? p->vpid[k] : p->vpid[k]); sb_putc(&b, k < mine ? '\t' : ' '); }
+        b.len--;
+    }
+    sb_puts(&b, "\nNSpgid:\t"); sb_int(&b, vid(p->pgid));
+    sb_puts(&b, "\nNSsid:\t"); sb_int(&b, vid(p->sid));
+    sb_puts(&b, "\nSigQ:\t0/7823\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\n"
+             "SigBlk:\t0000000000000000\nSigIgn:\t0000000000000000\nSigCgt:\t0000000000000000\n"
+             "CapInh:\t0000000000000000\nCapPrm:\t000001ffffffffff\nCapEff:\t000001ffffffffff\n"
+             "CapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\nNoNewPrivs:\t");
+    sb_int(&b, p->nnp); sb_puts(&b, "\nSeccomp:\t"); sb_int(&b, p->sc_mode);
+    sb_puts(&b, "\nCpus_allowed:\tf\nCpus_allowed_list:\t0-3\n");
     int nfd = 0;
     for (int i = 0; i < MAX_FDS; i++) if (p->sh->fds[i]) nfd++;
     sb_puts(&b, "VmSize:\t"); sb_pad(&b, vsz_kb, 8); sb_puts(&b, " kB\n");
@@ -198,6 +253,35 @@ static void fill_pid_dir(fs_node_t* d, proc_t* p, char* mem, uint32_t cap) {
     put(d, "maps", &b);
     { fs_node_t* m = ensure(d, "mem", FS_FILE, 0600); if (m) m->dev = FS_DEV_PMEM; }
 
+    if (strcmp(d->parent->name, "task")) {
+        static const char* const mp[] = { "uid_map", "gid_map", "setgroups" };
+        for (int k = 0; k < 3; k++) {
+            b = (sb_t){ mem, 0, cap };
+            b.len = (uint32_t)ns_idmap_text(p, k, mem, (int)cap);
+            put(d, mp[k], &b);
+            fs_node_t* mn = fs_child(d, mp[k]);
+            if (mn) mn->mode = 0644;
+        }
+        ensure(d, "fdinfo", FS_DIR, 0555);        // chromium chroots into it
+        if (!fs_child(d, "oom_score_adj")) {      // chromium zygote writes it, content doesn't matter
+            b = (sb_t){ mem, 0, cap };
+            sb_puts(&b, "0\n");
+            put(d, "oom_score_adj", &b); put(d, "oom_score", &b);
+            fs_node_t* on = fs_child(d, "oom_score_adj");
+            if (on) on->mode = 0644;
+        }
+        fs_node_t* nd = ensure(d, "ns", FS_DIR, 0555);
+        for (int k = 0; nd && k < 6; k++) {
+            char tg[40] = "";
+            strcpy(tg, ns_type_name(k)); strcat(tg, ":[");
+            char num[12]; utoa(ns_ino(p, k), num, 10);
+            strcat(tg, num); strcat(tg, "]");
+            fs_node_t* ol = fs_child(nd, ns_type_name(k));
+            if (ol && (ol->type != FS_LINK || strcmp(ol->data, tg))) { remove_tree(ol); ol = NULL; }
+            if (!ol) fs_symlink(nd, ns_type_name(k), tg);
+        }
+    }
+
     /* task/<tid>/ for every thread of the group, htop reads the main one from there */
     if (strcmp(d->parent->name, "task")) {
         fs_node_t* t = ensure(d, "task", FS_DIR, 0555);
@@ -205,15 +289,15 @@ static void fill_pid_dir(fs_node_t* d, proc_t* p, char* mem, uint32_t cap) {
         fs_node_t* c = t->child;
         while (c) {
             fs_node_t* next = c->next;
-            proc_t* q = proc_by_pid(atoi(c->name));
+            proc_t* q = find(atoi(c->name));
             if (!q || q->tgid != p->tgid) remove_tree(c);
             c = next;
         }
         for (int i = 0; i < proc_count(); i++) {
             proc_t* q = proc_at(i);
-            if (!q || q->tgid != p->tgid) continue;
+            if (!q || q->tgid != p->tgid || !vpid_of(q)) continue;
             char name[12];
-            itoa(q->pid, name, 10);
+            itoa(vpid_of(q), name, 10);
             fs_node_t* td = ensure(t, name, FS_DIR, 0555);
             if (td) fill_pid_dir(td, q, mem, cap);
         }
@@ -325,7 +409,8 @@ static void fill_globals(char* mem, uint32_t cap) {
     if (!nd) return;
     static const char hx[] = "0123456789abcdef";
     b = (sb_t){ mem, 0, cap };
-    for (int i = -1; i < net_ifcount(); i++) {
+    int nif = vw && vw->netns ? 0 : net_ifcount();
+    for (int i = -1; i < nif; i++) {
         uint8_t a6[A6_MAX][16], pl[A6_MAX], sc[A6_MAX];
         const char* name = "lo"; const uint8_t* mac; uint32_t ip, mask, gw, rx, tx;
         if (i >= 0) net_ifinfo(i, &name, &mac, &ip, &mask, &gw, &rx, &tx);
@@ -361,7 +446,7 @@ static void fill_globals(char* mem, uint32_t cap) {
     b = (sb_t){ mem, 0, cap };
     sb_puts(&b, "Inter-|   Receive                                                |  Transmit\n"
                 " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
-    for (int i = -1; i < net_ifcount(); i++) {
+    for (int i = -1; i < nif; i++) {
         const char* name = "lo"; const uint8_t* mac; uint32_t ip, mask, gw, rx = 0, tx = 0;
         if (i >= 0) net_ifinfo(i, &name, &mac, &ip, &mask, &gw, &rx, &tx);
         sb_puts(&b, "  "); sb_puts(&b, name); sb_puts(&b, ": 0 ");
@@ -375,13 +460,41 @@ static void fill_globals(char* mem, uint32_t cap) {
         sb_puts(&b, "0\t2147483647\n");
         put(sn, "ping_group_range", &b);
     }
+    sn = ensure(proc_root, "sys", FS_DIR, 0555);
+    if (sn && (sn = ensure(sn, "fs", FS_DIR, 0555)) && (sn = ensure(sn, "inotify", FS_DIR, 0555))) {
+        b = (sb_t){ mem, 0, cap };
+        sb_puts(&b, "8192\n");
+        put(sn, "max_user_watches", &b);
+        b = (sb_t){ mem, 0, cap };
+        sb_puts(&b, "128\n");
+        put(sn, "max_user_instances", &b);
+        b = (sb_t){ mem, 0, cap };
+        sb_puts(&b, "16384\n");
+        put(sn, "max_queued_events", &b);
+    }
+    sn = ensure(proc_root, "sys", FS_DIR, 0555);
+    if (sn && (sn = ensure(sn, "kernel", FS_DIR, 0555))) {
+        static const char* const kn[] = { "overflowuid", "overflowgid" };
+        for (int k = 0; k < 2; k++) {
+            b = (sb_t){ mem, 0, cap };
+            sb_puts(&b, "65534\n");
+            put(sn, kn[k], &b);
+        }
+        b = (sb_t){ mem, 0, cap };
+        sb_puts(&b, "65536\n");
+        put(sn, "pid_max", &b);
+        b = (sb_t){ mem, 0, cap };
+        sb_puts(&b, "1\n");
+        put(sn, "unprivileged_userns_clone", &b);
+    }
 }
 
 /* ---------------- refresh ---------------- */
 
 void procfs_refresh(void) {
     uint32_t f = irq_save();
-    proc_root = fs_resolve(fs_root(), "/proc");
+    vw = proc_current();
+    proc_root = fs_peek(fs_root(), "proc", true);   // not fs_resolve: in a private mount ns that gives the shadow dir
     if (!proc_root) proc_root = fs_create(fs_root(), "/proc", FS_DIR);
     if (!proc_root) { irq_restore(f); return; }
 
@@ -394,7 +507,7 @@ void procfs_refresh(void) {
     while (c) {
         fs_node_t* next = c->next;
         if (c->type == FS_DIR && is_pid_name(c->name)) {
-            proc_t* p = proc_by_pid(atoi(c->name));
+            proc_t* p = find(atoi(c->name));
             if (!p || p->is_thread) remove_tree(c);     // threads live in task/ only
         }
         c = next;
@@ -402,9 +515,9 @@ void procfs_refresh(void) {
 
     for (int i = 0; i < proc_count(); i++) {
         proc_t* p = proc_at(i);
-        if (!p || p->is_thread) continue;
+        if (!p || p->is_thread || !vpid_of(p)) continue;
         char name[12];
-        itoa(p->pid, name, 10);
+        itoa(vpid_of(p), name, 10);
         fs_node_t* d = ensure(proc_root, name, FS_DIR, 0555);
         if (d) fill_pid_dir(d, p, mem, cap);
     }
@@ -415,6 +528,16 @@ void procfs_refresh(void) {
     if (me) {
         fs_node_t* d = ensure(proc_root, "self", FS_DIR, 0555);
         if (d) fill_pid_dir(d, me, mem, cap);
+        fs_node_t* fd = d ? ensure(d, "fd", FS_DIR, 0555) : NULL;   // chromium lists it to close fds
+        if (fd) {
+            while (fd->child) remove_tree(fd->child);
+            for (int i = 0; i < MAX_FDS; i++) {
+                if (!me->sh->fds[i]) continue;
+                char nm[12];
+                itoa(i, nm, 10);
+                fs_create(fd, nm, FS_FILE);
+            }
+        }
     } else if (self) {
         remove_tree(self);
     }
@@ -438,9 +561,18 @@ void procfs_refresh(void) {
                 kfree(pb.buf);
             }
         }
+        if (sd) {
+            static char tb[6000];
+            sb_t tp = { tb, lat_dump(tb, sizeof(tb)), sizeof(tb) };
+            put(sd, "lat", &tp);
+            tp.len = heap_report(tb, sizeof(tb));
+            put(sd, "heap", &tp);
+        }
         if (sd) sd->mode = 0555;
         fs_node_t* pn = sd ? fs_child(sd, "prof") : NULL;
         if (pn) pn->mode = 0666;
+        if (sd && (pn = fs_child(sd, "lat"))) pn->mode = 0666;
+        if (sd && (pn = fs_child(sd, "heap"))) pn->mode = 0666;
     }
     irq_restore(f);
 }

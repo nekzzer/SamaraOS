@@ -25,6 +25,11 @@ struct cpu {
     int      apic_id;
     volatile int online;
     int      bkl;          /* this cpu holds the big lock */
+    uint64_t slf;          /* irq flags of the sched lock while this cpu holds it */
+    int      sl;
+    int      sc;           /* syscall nr the bkl was taken for, -1 otherwise (prof) */
+    uint64_t bkl_t0;       /* prof: when it was taken */
+    void*    bkl_ra;
     int      in_idle;      /* parked in hlt */
     struct task* cur;
     struct task* idle;

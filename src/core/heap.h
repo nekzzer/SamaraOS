@@ -13,5 +13,7 @@ size_t heap_used(void);
 size_t heap_total(void);
 size_t heap_big_used(void);
 size_t heap_big_total(void);
+void  heap_cmd(const char* s, uint32_t n);      /* "check" */
+int   heap_report(char* buf, int cap);
 
 #endif

@@ -1,0 +1,4 @@
+#!/bin/sh
+# wine from /glibc. first run makes the prefix, takes ~4 min, be patient
+export WINEPREFIX=${WINEPREFIX:-/root/.wine}
+exec glibc-run env WINEPREFIX=$WINEPREFIX wine "$@"

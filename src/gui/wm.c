@@ -1,3 +1,4 @@
+#include "core/lat.h"
 #include "boot/acpi.h"
 #include "gui/wm.h"
 #include "drivers/fbdev.h"
@@ -1014,6 +1015,8 @@ static const menu_entry_t menu_entries[] = {
     { "Settings",     NULL, 17 },
     { "XTerm",        NULL, 12 },
     { "Foot",         NULL, 13 },
+    { "Chromium",     NULL, 18 },
+    { "Firefox",      NULL, 19 },
     { "Web Browser",  NULL,  1 },
     { "Music Player", NULL,  2 },
     { "Paint",        NULL,  3 },
@@ -1119,6 +1122,8 @@ static void menu_run(int action) {
         case 15: if (shell_launch_detached("/usr/bin/sysmon") < 0) wm_open_info(W / 2 - 150, H / 2 - 60, 300, 120, "Monitor", "sysmon not found"); break;
         case 16: if (shell_launch_detached("/usr/bin/pkg") < 0) wm_open_info(W / 2 - 150, H / 2 - 60, 300, 120, "Packages", "pkg not found"); break;
         case 17: if (shell_launch_detached("/usr/bin/settings") < 0) wm_open_info(W / 2 - 150, H / 2 - 60, 300, 120, "Settings", "settings not found"); break;
+        case 18: if (shell_launch_detached("chromium-samara") < 0) wm_open_info(W / 2 - 150, H / 2 - 60, 300, 120, "Chromium", "chromium not installed"); break;
+        case 19: if (shell_launch_detached("firefox-samara") < 0) wm_open_info(W / 2 - 150, H / 2 - 60, 300, 120, "Firefox", "firefox not installed"); break;
         case 13: if (shell_launch_detached("foot") < 0) wm_open_info(W / 2 - 150, H / 2 - 60, 300, 120, "Foot", "foot not installed"); break;
     }
 }
@@ -2408,6 +2413,7 @@ void wm_run(void) {
         collect_damage(now);
         prev_mx = mx; prev_my = my;
         uint64_t T2 = tsc(), T3 = T2, T4 = T2;
+        bool pres = n_dmg > 0 || mx != cur_x || my != cur_y;
         if (g_wm_stats) for (int i = 0; i < n_dmg; i++) { st_rects++; st_px += (uint32_t)r_area(dmg[i]); }
 
         if (db_on) {
@@ -2447,6 +2453,14 @@ void wm_run(void) {
             if (hide) sw_show_cursor(mx, my);
         }
         first_frame_done = true;
+        if (pres) {
+            static uint64_t last_pres;
+            uint64_t tn = lat_now();
+            lat_add(LAT_WM_FRAME, lat_us(tsc() - T0));
+            if (last_pres && tn - last_pres < 250000) lat_add(LAT_WM_GAP, (uint32_t)(tn - last_pres));
+            last_pres = tn;
+            lat_presented();
+        }
         if (g_wm_stats) {
             uint64_t T5 = tsc();
             st_in += T1 - T0; st_tick += T2 - T1; st_comp += T3 - T2; st_pres += T4 - T3; st_cur += T5 - T4;

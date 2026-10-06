@@ -36,6 +36,9 @@ static char *const user_env[] = {
     "XDG_RUNTIME_DIR=/run/user/0",    /* samara-wl */
     "WAYLAND_DISPLAY=wayland-0",
     "DISPLAY=:0",
+    "MESA_VK_WSI_DEBUG=sw",           /* venus dmabuf wsi shows black, copy through shm */
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus",
+    "SDL_VIDEODRIVER=wayland,x11",    /* sdl games over xwayland die on a write to a ro page, native wl works */
     NULL,
 };
 

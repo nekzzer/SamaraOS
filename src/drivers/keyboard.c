@@ -1,3 +1,4 @@
+#include "core/lat.h"
 #include "core/task.h"
 #include "drivers/keyboard.h"
 #include "core/io.h"
@@ -101,6 +102,7 @@ static int buf_pop(char* out) {
 }
 
 static void kbd_byte(uint8_t sc) {
+    lat_input();
 
     if (sc == 0xE0) { ext = true; return; }
 

@@ -140,6 +140,13 @@ void pt_cont_group(proc_t* p) {
     for (int i = 0; i < proc_count(); i++) {
         proc_t* q = proc_at(i);
         if (!q || q->tgid != p->tgid || !q->pt_job || q->pt_state != 1) continue;
+        if (q->tracer) {                    /* seized while group-stopped: tracer restarts it, not us */
+            q->pt_job = false;
+            q->pt_rep = false;
+            q->pt_stopsig = 5;
+            q->pt_event = 128;
+            continue;
+        }
         q->pt_inj = 0;
         q->pt_state = 2;
         ready_task_of(q);
@@ -157,7 +164,7 @@ static void get_regs(proc_t* p, uint64_t* u) {
     u[11] = r->rcx; u[12] = r->rdx; u[13] = r->rsi; u[14] = r->rdi;
     u[15] = p->pt_entry ? r->rax : p->pt_orig;
     u[16] = r->rip; u[17] = 0x33; u[18] = r->rflags; u[19] = r->rsp; u[20] = 0x2b;   // linux selectors, gdb checks cs
-    u[21] = p->tls_base; u[22] = 0;
+    u[21] = p->tls_base; u[22] = p->gs_base;
     u[23] = u[24] = u[25] = u[26] = 0;
     if (p->pt_tf) u[18] &= ~0x100ul;
 }

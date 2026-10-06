@@ -15,6 +15,7 @@ uint64_t pf_swapin, pf_anon, pf_cow, pf_file, pf_kern, tlb_ipis, tlb_rounds, uwi
 static struct { uint64_t rip; uint32_t n; } ktab[HN];
 static struct { uint64_t rip; uint32_t n; char name[12]; } utab[HN];
 static struct { uint64_t rip; uint32_t n; } htab[2048];     // rips of cpus that hold the bkl
+static struct { void* ra; int sc; char name[12]; uint64_t n, cyc; } btab[256];
 static uint32_t n_idle, n_user, n_kern, n_lost;
 static uint64_t sc_n[512], sc_cyc[512];
 
@@ -58,6 +59,14 @@ void prof_nmi(struct regs* r) {
     prof_sample(r->rip, u, !u && *(uint8_t*)(r->rip - 1) == 0xF4, nm);   // right after hlt = parked
 }
 
+void prof_hold(void* ra, int sc, const char* name, uint64_t cyc) {
+    uint32_t h = ((uint64_t)ra * 31 + sc * 7 + name[0] * 131 + name[1]) % 256;
+    for (int i = 0; i < 256; i++, h = (h + 1) % 256) {
+        if (!btab[h].n) { btab[h].ra = ra; btab[h].sc = sc; strncpy(btab[h].name, name, 11); }
+        if (btab[h].ra == ra && btab[h].sc == sc && !strncmp(btab[h].name, name, 11)) { btab[h].n++; btab[h].cyc += cyc; return; }
+    }
+}
+
 void prof_sys(int nr, uint64_t cyc) {
     if (nr < 0 || nr >= 512) return;
     sc_n[nr]++;
@@ -77,6 +86,7 @@ void prof_cmd(const char* s, uint32_t n) {
         memset(ktab, 0, sizeof(ktab));
         memset(utab, 0, sizeof(utab));
         memset(htab, 0, sizeof(htab));
+        memset(btab, 0, sizeof(btab));
         memset(sc_n, 0, sizeof(sc_n));
         memset(sc_cyc, 0, sizeof(sc_cyc));
         n_idle = n_user = n_kern = n_lost = 0;
@@ -109,6 +119,11 @@ int prof_dump(char* buf, int cap) {
     for (int i = 0; i < 512 && p < end; i++) {
         if (!sc_n[i]) continue;
         p = ps(p, "Y "); p = pn(p, i, 10); *p++ = ' '; p = pn(p, sc_n[i], 10); *p++ = ' '; p = pn(p, sc_cyc[i], 10); *p++ = '\n';
+    }
+    for (int i = 0; i < 256 && p < end; i++) {
+        if (!btab[i].n) continue;
+        p = ps(p, "B "); p = pn(p, (uint64_t)btab[i].ra, 16); *p++ = ' '; p = pn(p, btab[i].sc + 1, 10); *p++ = ' '; p = ps(p, btab[i].name);
+        *p++ = ' '; p = pn(p, btab[i].n, 10); *p++ = ' '; p = pn(p, btab[i].cyc, 10); *p++ = '\n';
     }
     for (int i = 0; i < HN && p < end; i++) {
         if (!utab[i].n) continue;

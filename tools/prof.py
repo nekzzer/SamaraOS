@@ -37,6 +37,12 @@ for k, v in ks.most_common(40):
 print('while holding bkl:')
 ht = sum(hs.values()) or 1
 for k, v in hs.most_common(20): print('  %5.1f%% %6d %s' % (100.0 * v / ht, v, k))
+bs = [l.split() for l in log if l.startswith('B ') and len(l.split()) == 6]
+print('bkl hold by taker (Mcyc, n, avg cyc):')
+for p in sorted(bs, key=lambda x: -int(x[5]))[:18]:
+    a = int(p[1], 16); i = bisect.bisect_right(addrs, a) - 1
+    sc = int(p[2]) - 1
+    print('  %8.1f %8d %9d  %-14s %-12s sc=%s' % (int(p[5]) / 1e6, int(p[4]), int(p[5]) // int(p[4]), syms[i][1] if i >= 0 else '?', p[3], sysn.get(sc, sc) if sc >= 0 else '-'))
 print('user samples by proc:')
 for k, v in sorted(us.items(), key=lambda x: -x[1])[:12]: print('  %6d %s' % (v, k))
 print('syscalls by time (Mcycles):')

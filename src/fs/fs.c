@@ -39,7 +39,7 @@ void fs_init(void) {
     fs_node_t* dev = node_new("dev", FS_DIR, root_);
     link_child(root_, dev);
     static const struct { const char* name; uint8_t dev; } devs[] = {
-        { "null", FS_DEV_NULL }, { "zero", FS_DEV_ZERO }, { "tty", FS_DEV_TTY },
+        { "null", FS_DEV_NULL }, { "zero", FS_DEV_ZERO }, { "full", FS_DEV_ZERO }, { "tty", FS_DEV_TTY },
         { "console", FS_DEV_TTY }, { "random", FS_DEV_RANDOM }, { "urandom", FS_DEV_RANDOM },
         { "fb0", FS_DEV_FB }, { "input-all", FS_DEV_INPUT }, { "ptmx", FS_DEV_PTMX },
         { "input-kbd", FS_DEV_EVKBD }, { "input-mouse", FS_DEV_EVMOUSE },
@@ -85,6 +85,11 @@ void (*fs_dirty_hook)(int mount_id);
 
 void fs_touch(fs_node_t* n) {
     if (n && n->pc) pc_changed(n);
+    fs_dirty(n);
+}
+
+/* mmap writeback already has the current bytes in the cache. */
+void fs_dirty(fs_node_t* n) {
     for (; n; n = n->parent)
         if (n->mount_id) {
             if (mnt_ro_id(n->mount_id) || n->mount_id >= 16) return;
@@ -105,9 +110,126 @@ static fs_node_t* find_child(fs_node_t* dir, const char* name) {
 
 /* walks path; a symlink in the middle (or at the end with follow) is
    replaced by its target + the rest, 8 levels deep at most */
+/* bind/mount aliases, one set per mount namespace (ns.c numbers them, 0 = initial) */
+#define NBT 768
+static struct { fs_node_t *src, *dst; uint8_t ns; } bt[NBT];
+extern int proc_mntns(void);
+extern fs_node_t* proc_root(void);
+
+static fs_node_t* alias_of(fs_node_t* n, int ns) {
+    for (int i = 0; i < NBT; i++)
+        if (bt[i].dst == n && bt[i].ns == ns) return bt[i].src;
+    return n;
+}
+
+int fs_bind_ns(fs_node_t* src, fs_node_t* dst, int ns) {
+    int fr = -1;
+    for (int i = 0; i < NBT; i++) {
+        if (bt[i].dst == dst && bt[i].ns == ns) { bt[i].src = src; return 0; }
+        if (!bt[i].dst && fr < 0) fr = i;
+    }
+    if (fr < 0) return -1;
+    bt[fr].src = src; bt[fr].dst = dst; bt[fr].ns = (uint8_t)ns;
+    dst->bnd = 1;
+    return 0;
+}
+
+fs_node_t* fs_alias(fs_node_t* n) { return n->bnd ? alias_of(n, proc_mntns()) : n; }
+
+int fs_bind(fs_node_t* src, fs_node_t* dst) { return fs_bind_ns(src, dst, proc_mntns()); }
+
+void fs_unbind(fs_node_t* dst, int ns) {
+    for (int i = 0; i < NBT; i++)
+        if (bt[i].dst == dst && bt[i].ns == ns) bt[i].dst = NULL;
+}
+
+void fs_bind_copy(int from, int to) {
+    for (int i = 0; i < NBT; i++)
+        if (bt[i].dst && bt[i].ns == from) fs_bind_ns(bt[i].src, bt[i].dst, to);
+}
+
+/* ns is gone: give back its aliases, targets that were private tmpfs are returned to the caller one by one */
+fs_node_t* fs_bind_drop(int ns, int* from) {
+    for (int i = *from; i < NBT; i++) {
+        if (!bt[i].dst || bt[i].ns != ns) continue;
+        fs_node_t* t = bt[i].src;
+        bt[i].dst = NULL;
+        *from = i + 1;
+        return t;
+    }
+    return NULL;
+}
+
+fs_node_t* fs_new_file(const char* name) { return node_new(name, FS_FILE, NULL); }
+fs_node_t* fs_new_dir(const char* name, fs_node_t* parent) { return node_new(name, FS_DIR, parent); }
+
+/* mountpoint lookup for a new mount in a private namespace: the last name is not
+   followed through its alias, and a dir that is only an alias of foreign tree gets
+   a private copy of its first level so the mount doesn't land in the real tree */
+static fs_node_t* mp_walk(fs_node_t* cwd, const char* path, bool cp, fs_node_t* d0) {
+    int ns = proc_mntns();
+    fs_node_t* rt = proc_root();
+    if (!rt) rt = root_;
+    fs_node_t* cur = path[0] == '/' ? rt : cwd;
+    fs_node_t* dent = NULL;                 /* last alias dentry we went through */
+    if (d0 && path[0] != '/') { dent = d0; cur = alias_of(d0, ns); }
+    char part[FS_NAME_MAX];
+    const char* p = path;
+    for (;;) {
+        while (*p == '/') p++;
+        if (!*p) return dent && cur == alias_of(dent, ns) ? dent : cur;
+        int k = 0;
+        while (*p && *p != '/' && k < FS_NAME_MAX - 1) part[k++] = *p++;
+        part[k] = 0;
+        bool last = true;
+        for (const char* q = p; *q; q++) if (*q != '/') last = false;
+        if (!strcmp(part, ".")) continue;
+        if (!strcmp(part, "..")) { if (cur != rt && cur->parent) cur = cur->parent; continue; }
+        fs_node_t* nx = find_child(cur, part);
+        if (!nx) return NULL;
+        if (nx->hl) nx = nx->hl;
+        if (last) {
+            if (nx->type == FS_LINK) return fs_resolve(cwd, path);
+            /* cur is a bare alias target: copy it up first */
+            if (cp && dent && cur == alias_of(dent, ns) && dent->type == FS_DIR && !cur->mode_shadow) {
+                fs_node_t* sh = node_new(dent->name, FS_DIR, dent->parent);
+                sh->mode_shadow = 1;
+                sh->mode = cur->mode;
+                for (fs_node_t* c = cur->child; c; c = c->next) {
+                    if (c->hl) continue;
+                    fs_node_t* s = node_new(c->name, c->type, sh);
+                    s->mode = c->mode;
+                    s->mode_shadow = 1;
+                    link_child(sh, s);
+                    fs_bind_ns(alias_of(c, ns), s, ns);
+                }
+                fs_bind_ns(sh, dent, ns);
+                nx = find_child(sh, part);
+                if (!nx) nx = node_new(part, FS_DIR, sh);
+            }
+            return nx;
+        }
+        if (nx->type == FS_LINK) {
+            fs_node_t* t = fs_resolve(cur, part);
+            if (!t) return NULL;
+            cur = t; dent = NULL;
+            continue;
+        }
+        fs_node_t* a = nx->bnd ? alias_of(nx, ns) : nx;
+        if (a != nx) dent = nx;
+        cur = a;
+    }
+}
+
+
+fs_node_t* fs_mp(fs_node_t* cwd, const char* path) { return mp_walk(cwd, path, true, NULL); }
+fs_node_t* fs_dent(fs_node_t* cwd, const char* path, fs_node_t* d0, bool cp) { return mp_walk(cwd, path, cp, d0); }
+
 static fs_node_t* resolve(fs_node_t* cwd, const char* path, bool follow, int depth, bool dent) {
     if (!path || !*path) return cwd;
-    fs_node_t* cur = (path[0] == '/') ? root_ : cwd;
+    fs_node_t* rt = proc_root();
+    if (!rt) rt = root_;
+    fs_node_t* cur = (path[0] == '/') ? rt : cwd;
     char part[FS_NAME_MAX];
     int pi = 0;
     for (const char* p = (path[0] == '/') ? path + 1 : path; ; p++) {
@@ -115,8 +237,10 @@ static fs_node_t* resolve(fs_node_t* cwd, const char* path, bool follow, int dep
             if (pi > 0) {
                 part[pi] = 0;
                 fs_node_t* dir = cur;
-                cur = find_child(cur, part);
+                if (cur == rt && !strcmp(part, "..")) cur = dir;
+                else cur = find_child(cur, part);
                 if (!cur) return NULL;
+                if (cur->bnd) cur = alias_of(cur, proc_mntns());
                 pi = 0;
                 const char* rest = p;
                 while (*rest == '/') rest++;
@@ -376,14 +500,55 @@ int fs_append(fs_node_t* f, const char* data, size_t len) {
     return (int)len;
 }
 
+/* mountinfo lines for a private ns, one per alias */
+int fs_bt_info(int ns, char* out, int cap) {
+    char l[320], p[256], t[12];
+    strcpy(out, "1 0 0:1 / / rw - rootfs rootfs rw\n");
+    int n = strlen(out);
+    for (int i = 0; i < NBT; i++) {
+        if (!bt[i].dst || bt[i].ns != ns) continue;
+        fs_path(bt[i].dst, p, sizeof(p));
+        utoa(100 + i, t, 10);
+        strcpy(l, t); strcat(l, " 1 0:"); strcat(l, t); strcat(l, " / ");
+        strcat(l, p); strcat(l, " rw,relatime - tmpfs none rw\n");
+        int k = strlen(l);
+        if (n + k >= cap) break;
+        memcpy(out + n, l, k);
+        n += k;
+    }
+    out[n] = 0;
+    return n;
+}
+
 void fs_path(fs_node_t* n, char* out, size_t cap) {
     if (!n) { if (cap) out[0] = 0; return; }
-    if (n == root_) { strncpy(out, "/", cap); out[cap-1]=0; return; }
+    fs_node_t* rt = proc_root();           /* chrooted: paths start at its root */
+    fs_node_t* a = n;
+    while (a && a != rt) a = a->parent;
     char tmp[256] = {0};
     fs_node_t* parts[64];
-    int np = 0;
-    for (fs_node_t* c = n; c && c != root_ && np < 64; c = c->parent) parts[np++] = c;
-    int pos = 0;
+    int np = 0, pos = 0;
+    fs_node_t* top = NULL;
+    if (!a && proc_mntns()) {
+        /* outside of our root, but maybe bound in under it (pivot_root's oldroot) */
+        for (fs_node_t* c = n; c && !top; c = c->parent)
+            for (int i = NBT - 1; i >= 0 && !top; i--) {
+                if (bt[i].ns != proc_mntns() || !bt[i].dst || bt[i].src != c || bt[i].dst == c) continue;
+                fs_node_t* d = bt[i].dst;
+                while (d && d != rt) d = d->parent;
+                if (!d) continue;
+                top = c;
+                fs_path(bt[i].dst, tmp, sizeof(tmp));
+                pos = strlen(tmp);
+                if (pos == 1) pos = 0;
+                for (fs_node_t* q = n; q && q != c && np < 64; q = q->parent) parts[np++] = q;
+            }
+    }
+    if (!top) {
+        if (!a) rt = root_;
+        if (n == rt) { strncpy(out, "/", cap); out[cap-1]=0; return; }
+        for (fs_node_t* c = n; c && c != rt && np < 64; c = c->parent) parts[np++] = c;
+    } else if (!np && !pos) { strcpy(out, "/"); return; }
     for (int i = np - 1; i >= 0; i--) {
         tmp[pos++] = '/';
         for (const char* s = parts[i]->name; *s && pos < (int)sizeof(tmp) - 1; s++) tmp[pos++] = *s;

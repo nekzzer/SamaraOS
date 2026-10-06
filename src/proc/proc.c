@@ -39,8 +39,10 @@ static void klog_num(uint64_t v, int base) { char b[24]; utoa(v, b, base); klog(
 /* ---------------- lookup ---------------- */
 
 proc_t* proc_current(void) { return task_current()->proc; }
+fs_node_t* proc_root(void) { proc_t* p = task_current()->proc; return p ? p->sh->root : NULL; }
 int     proc_pid(proc_t* p) { return p ? p->pid : 0; }
 uint64_t proc_tls_base(proc_t* p) { return p->tls_base; }
+uint64_t proc_gs_base(proc_t* p) { return p->gs_base; }
 int     proc_count(void) { return MAX_PROCS; }
 proc_t* proc_at(int i) { return (i >= 0 && i < MAX_PROCS && procs[i].state != P_FREE) ? &procs[i] : NULL; }
 
@@ -63,10 +65,19 @@ static proc_t* alloc_proc(void) {
         p->state = P_ALIVE;
         p->pid = next_pid++;
         p->tgid = p->pid;
+        p->vpid[0] = p->pid;
         p->sh = &p->shd;
         p->task = -1;
         p->start_ms = pit_uptime_ms();
         p->sh->umask = 022;
+        for (int k = 0; k < 16; k++) p->sh->rl[k][0] = p->sh->rl[k][1] = ~0ull;
+        p->sh->rl[3][0] = USER_STACK_MAX;
+        p->sh->rl[4][0] = 0;
+        p->sh->rl[7][0] = p->sh->rl[7][1] = MAX_FDS;
+        p->sh->rl[8][0] = p->sh->rl[8][1] = 8 << 20;
+        p->sh->rl[12][0] = p->sh->rl[12][1] = 819200;
+        p->sh->rl[13][0] = p->sh->rl[13][1] = 0;
+        p->sh->rl[14][0] = p->sh->rl[14][1] = 0;
         return p;
     }
     return NULL;
@@ -580,6 +591,8 @@ void futex_wake_addr(uint64_t pd, uint64_t addr, int n) {
    the current one right before it switches away for good. */
 static void thread_kill(proc_t* q) {
     uring_exit(q);
+    ns_exit(q);
+    sc_put(q->sf); q->sf = NULL;
     if (q->clear_child_tid && q->pd) {
         uint32_t z = 0;
         vmm_copy_to(q->pd, q->clear_child_tid, &z, 4);
@@ -587,11 +600,7 @@ static void thread_kill(proc_t* q) {
     }
     futex_forget(q);
     task_t* t = task_at(q->task);
-    if (t && t->proc == q) {
-        t->proc = NULL;
-        t->cr3 = 0;
-        t->state = T_DEAD;
-    }
+    if (t && t->proc == q) task_kill(t);
     proc_t* tr = q->tracer ? proc_by_pid(q->tracer) : NULL;
     if (tr && tr->state == P_ALIVE && tr->sh != q->sh) {     // strace -f wants to wait4 the dead thread
         q->state = P_ZOMBIE;
@@ -602,9 +611,14 @@ static void thread_kill(proc_t* q) {
 /* Release everything of a process that is not running right now, or of the
    current one right before it switches away for good. Takes all threads of
    the group down with it. */
+static int down_pid;
+void acpi_poweroff(void);
+void acpi_reboot(void);
 static void teardown(proc_t* p, int status) {
     p = leader_of(p);
     uring_exit(p);
+    ns_exit(p);
+    sc_put(p->sf); p->sf = NULL;
     proc_t* cur = proc_current();
     bool cur_in = cur && cur->sh == p->sh;
     for (int i = 0; i < MAX_PROCS; i++) {
@@ -620,11 +634,7 @@ static void teardown(proc_t* p, int status) {
     }
     flk_exit(p->sh);
     task_t* t = task_at(p->task);
-    if (t && t->proc == p) {
-        t->proc = NULL;
-        t->cr3 = 0;
-        t->state = T_DEAD;
-    }
+    if (t && t->proc == p) task_kill(t);
     if (p->pd) {
         if (cur_in || (t && t == task_current())) task_set_cr3(0);
         /* A vfork child still running on our space inherits it. */
@@ -646,10 +656,11 @@ static void teardown(proc_t* p, int status) {
         if (c->state == P_ZOMBIE && !c->kernel_waited) c->state = P_FREE;
     }
     p->exit_status = status;
+    if (p->pid == down_pid) { if ((status & 0xff) == 7 || (status >> 8) == 7) acpi_reboot(); else acpi_poweroff(); }
     free_or_zombify(p);
     if (p->state == P_ZOMBIE && p->ppid) {
         proc_t* parent = proc_by_pid(p->ppid);
-        if (parent && parent->state == P_ALIVE && parent->sh->sa[17].handler > 1)
+        if (parent && parent->state == P_ALIVE && (parent->sh->sa[17].handler > 1 || (parent->sig_mask & SIGBIT(17))))
             parent->sig_pending |= SIGBIT(17);                  /* SIGCHLD */
     }
     if (tty_fg_pgrp() == p->pgid && p->kernel_waited) tty_set_fg_pgrp(0);
@@ -725,6 +736,15 @@ static int send_sig(proc_t* p, int sig, bool exact) {
     if (sig == 0) return 0;
     if (sig < 0 || sig >= NSIG_MAX) return -EINVAL;
     if (sig == 18) pt_cont_group(p);
+    if (sig == 18 && p->pid == 1 && !down_pid) {          // runit-init 0/6 pokes pid 1 with SIGCONT
+        proc_t* me = proc_current();
+        if (me && me->pid != 1 && fs_resolve(fs_root(), "/etc/runit/stopit")) {
+            static char* av[] = { "sh", "-c", "/etc/runit/3; sync; "
+                "[ -e /etc/runit/reboot ] && [ ! -x /etc/runit/reboot ] && exit 7; exit 0", NULL };
+            static char* ev[] = { "PATH=/usr/bin:/usr/sbin:/bin:/sbin", NULL };
+            down_pid = proc_spawn_detached("/bin/sh", av, ev);
+        }
+    }
     if (sig != 9) {
         uint64_t h = p->sh->sa[sig].handler;
         proc_t* d = p->is_thread || exact ? p : pick_thread(p, sig);
@@ -793,7 +813,12 @@ bool proc_handle_fault(uint64_t addr, uint64_t err) {
         if (vmm_cow(p->pd, addr)) { pf_cow++; return true; }   /* fork's cow */
         if (bkl && (vmm_pte(p->pd, addr) & PTE_COW) && mem_oom() && vmm_cow(p->pd, addr)) return true;
     }
-    if (err & 1) return false;                           /* protection faults are real */
+    if (err & 1) {
+        /* other thread did the cow a moment ago, retry (firefox pool threads) */
+        uint64_t q = vmm_pte(p->pd, addr);
+        if ((err & 2) && (q & PTE_P) && (q & PTE_US) && (q & PTE_RW)) return true;
+        return false;                                    /* protection faults are real */
+    }
     /* lazy anon page: frame now. PROT_NONE (no US) and writes to read-only
        ones stay faults, java counts on those SIGSEGVs */
     uint64_t pte = vmm_pte(p->pd, addr & ~(PAGE_SIZE - 1));
@@ -809,7 +834,9 @@ bool proc_handle_fault(uint64_t addr, uint64_t err) {
         pf_anon++;
         return vmm_fault_in(p->pd, addr) || (bkl && mem_oom() && vmm_fault_in(p->pd, addr));
     }
-    if (addr < USER_STACK_TOP - USER_STACK_MAX || addr >= USER_STACK_TOP) return false;
+    uint64_t sl = p->sh->rl[3][0];
+    if (sl > USER_STACK_MAX) sl = USER_STACK_MAX;
+    if (addr < USER_STACK_TOP - sl || addr >= USER_STACK_TOP) return false;
     return vmm_alloc_range(p->pd, addr & ~(PAGE_SIZE - 1), PAGE_SIZE, true) == 0;
 }
 
@@ -842,8 +869,18 @@ void proc_fault_kill(const char* what, int sig, uint64_t eip, uint64_t addr) {
 
 /* ---------------- fork / exec / wait ---------------- */
 
-static int do_fork(regs_t* r, bool share) {
+static bool nproc_full(proc_t* p) {
+    uint64_t lim = p->sh->rl[6][0];
+    if (lim >= MAX_PROCS) return false;
+    uint64_t n = 0;
+    for (int i = 0; i < MAX_PROCS; i++) if (procs[i].state == P_ALIVE) n++;
+    return n >= lim;
+}
+
+static bool uword_ok(uint64_t a);
+static int do_fork(regs_t* r, bool share, uint64_t stk, uint64_t ctid) {
     proc_t* parent = proc_current();
+    if (nproc_full(parent)) return -EAGAIN;
     proc_t* c = alloc_proc();
     if (!c) return -EAGAIN;
     c->vfork_shared = share;
@@ -855,8 +892,11 @@ static int do_fork(regs_t* r, bool share) {
     c->sh->brk_start = parent->sh->brk_start;
     c->sh->brk = parent->sh->brk;
     c->tls_base = parent->tls_base;
+    c->gs_base = parent->gs_base;
     c->sh->cwd = parent->sh->cwd;
+    c->sh->root = parent->sh->root;
     c->sh->umask = parent->sh->umask;
+    memcpy(c->sh->rl, parent->sh->rl, sizeof(c->sh->rl));
     c->tty_detached = parent->tty_detached;
     c->ctty = parent->ctty;
     c->sig_mask = parent->sig_mask;         /* alarms are not inherited */
@@ -873,7 +913,15 @@ static int do_fork(regs_t* r, bool share) {
     }
     regs_t child = *r;
     child.rax = 0;
+    // clone's new stack goes in before the task can run. it was patched in after start_task:
+    // with the scheduler off the bkl another cpu ran posix_spawn's child on the parent's
+    // stack first (gcc died at random, rip=0 / #SS in musl's child())
+    if (stk) child.rsp = stk;
+    ns_fork(parent, c);
+    c->capx = parent->capx; memcpy(c->cap, parent->cap, sizeof(c->cap));
+    c->nnp = parent->nnp; c->sc_mode = parent->sc_mode; c->sf = sc_dup(parent->sf);
     pt_child(parent, c, share ? 2 : 1);
+    if (ctid) { int v = ns_gpid(c, c->pid); if (uword_ok(ctid) && PTE_WR(vmm_pte(c->pd, ctid))) vmm_copy_to(c->pd, ctid, &v, 4); }
     int e = start_task(c, &child);
     if (e < 0) {
         for (int i = 0; i < MAX_FDS; i++) { file_close(c->sh->fds[i]); c->sh->fds[i] = NULL; }
@@ -890,8 +938,8 @@ static int do_fork(regs_t* r, bool share) {
     return pid;
 }
 
-int proc_fork(regs_t* r)  { return do_fork(r, false); }
-int proc_vfork(regs_t* r) { return do_fork(r, true); }
+int proc_fork(regs_t* r)  { return do_fork(r, false, 0, 0); }
+int proc_vfork(regs_t* r) { return do_fork(r, true, 0, 0); }
 
 #define CLONE_VM       0x100
 #define CLONE_VFORK    0x4000
@@ -913,17 +961,17 @@ int proc_clone(regs_t* r) {
     uint64_t fl = r->rdi, stk = r->rsi, ptid = r->rdx, ctid = r->r10, tls = r->r8;
     proc_t* parent = proc_current();
     if (!(fl & CLONE_THREAD)) {
-        int pid = proc_fork(r);
+        parent->nsfl = fl & 0x7E020000;                 /* CLONE_NEW*, ns_fork picks it up */
+        int pid = do_fork(r, false, stk, (fl & CLONE_CHILD_SETTID) ? ctid : 0);
         if (pid <= 0) return pid;
         proc_t* ch = proc_by_pid(pid);
-        task_t* t = ch ? task_at(ch->task) : NULL;
-        if (t && stk) ((regs_t*)t->rsp)->rsp = stk;
-        if (fl & CLONE_PARENT_SETTID) put_tid(parent->pd, ptid, pid);
-        if ((fl & CLONE_CHILD_SETTID) && ch) put_tid(ch->pd, ctid, pid);
+        if (ch && (fl & 0x200)) ch->fsp = true;
+        if (fl & CLONE_PARENT_SETTID) put_tid(parent->pd, ptid, ns_gpid(parent, pid));
         return pid;
     }
     if (!(fl & CLONE_VM)) return -EINVAL;
     proc_t* l = leader_of(parent);
+    if (nproc_full(parent)) return -EAGAIN;
     proc_t* c = alloc_proc();
     if (!c) return -EAGAIN;
     c->is_thread = true;
@@ -937,6 +985,7 @@ int proc_clone(regs_t* r) {
     c->ctty = parent->ctty;
     c->sig_mask = parent->sig_mask;
     c->tls_base = parent->tls_base;
+    c->gs_base = parent->gs_base;
     memcpy(c->name, parent->name, sizeof(c->name));
     memcpy(c->exe, parent->exe, sizeof(c->exe));
     memcpy(c->cmdline, parent->cmdline, sizeof(c->cmdline));
@@ -944,12 +993,15 @@ int proc_clone(regs_t* r) {
     if (fl & CLONE_SETTLS) {
         c->tls_base = tls;                  /* x86_64: the value itself, not a user_desc */
     }
-    if (fl & CLONE_PARENT_SETTID) put_tid(c->pd, ptid, c->pid);
-    if (fl & CLONE_CHILD_SETTID) put_tid(c->pd, ctid, c->pid);
+    ns_fork(parent, c);
+    if (fl & CLONE_PARENT_SETTID) put_tid(c->pd, ptid, ns_gpid(c, c->pid));
+    if (fl & CLONE_CHILD_SETTID) put_tid(c->pd, ctid, ns_gpid(c, c->pid));
     if ((fl & CLONE_CHILD_CLEARTID) && uword_ok(ctid)) c->clear_child_tid = ctid;
     regs_t child = *r;
     child.rax = 0;
     if (stk) child.rsp = stk;
+    c->capx = parent->capx; memcpy(c->cap, parent->cap, sizeof(c->cap));
+    c->nnp = parent->nnp; c->sc_mode = parent->sc_mode; c->sf = sc_dup(parent->sf);
     pt_child(parent, c, 3);
     int e = start_task(c, &child);
     if (e < 0) { c->state = P_FREE; return e; }
@@ -1005,6 +1057,29 @@ int futex_op(uint64_t uaddr, int op, uint32_t val, uint64_t tmo, uint64_t uaddr2
         }
         spin_unlock(&fbl[b], f);
         return k;
+    }
+    case 6: case 8: {                                   /* LOCK_PI, TRYLOCK_PI: plain owner-tid lock, no boosting */
+        volatile uint32_t* w = (volatile uint32_t*)uaddr;
+        uint32_t me = p->pid, extra = 0;
+        for (;;) {
+            uint32_t cur = *w;
+            if (!(cur & 0x3FFFFFFF)) {
+                if (__sync_bool_compare_and_swap(w, cur, me | (cur & 0x80000000) | extra)) return 0;
+                continue;
+            }
+            if ((cur & 0x3FFFFFFF) == me) return -35;            /* EDEADLK */
+            if (cmd == 8) return -EAGAIN;
+            extra = 0x80000000;                                   /* once we slept, unlock must come through the syscall */
+            if (!(cur & 0x80000000) && !__sync_bool_compare_and_swap(w, cur, cur | 0x80000000)) continue;
+            int e = futex_op(uaddr, 0, cur | 0x80000000, 0xFFFFFFFFu, 0, 0);
+            if (e == -EINTR) return e;
+        }
+    }
+    case 7: {                                           /* UNLOCK_PI */
+        *(volatile uint32_t*)uaddr = 0;
+        __sync_synchronize();
+        futex_op(uaddr, 1, 1, 0, 0, 0);
+        return 0;
     }
     case 3: case 4: {                                   /* REQUEUE, CMP_REQUEUE: tmo = val2 */
         if (!uword_ok(uaddr2)) return -EFAULT;
@@ -1064,7 +1139,9 @@ int proc_execve(regs_t* r, const char* path, char* const argv[], char* const env
     else vmm_destroy_space(old);
     p->sh->brk_start = p->sh->brk = brk;
     p->tls_base = 0;
+    p->gs_base = 0;
     wrmsr_fs(0);
+    wrmsr_ugs(0);
     memcpy(p->name, name, sizeof(p->name));
     memcpy(p->exe, exe, sizeof(p->exe));
     memcpy(p->cmdline, cmdline, sizeof(p->cmdline));
@@ -1098,7 +1175,7 @@ int proc_wait(int pid, int* status, int options) {
             int pst;
             if (pt_wait_report(c, me, options, &pst)) {
                 if (status) *status = pst;
-                return c->pid;
+                return me->pidns ? ns_pid_view(me, c) : c->pid;
             }
             if (c->state == P_ZOMBIE && !mine) {
                 if (status) *status = c->exit_status;
@@ -1106,11 +1183,11 @@ int proc_wait(int pid, int* status, int options) {
                 c->tracer = 0;
                 proc_t* par = c->ppid ? proc_by_pid(c->ppid) : NULL;
                 if (c->is_thread || !par || par->state != P_ALIVE) c->state = P_FREE;
-                return cp;
+                return me->pidns ? ns_pid_view(me, c) : cp;
             }
             if (c->state == P_ZOMBIE) {
                 if (status) *status = c->exit_status;
-                int cp = c->pid;
+                int cp = me->pidns ? ns_pid_view(me, c) : c->pid;
                 c->state = P_FREE;
                 return cp;
             }
@@ -1118,7 +1195,7 @@ int proc_wait(int pid, int* status, int options) {
         if (!have) return -ECHILD;
         if (options & 1 /*WNOHANG*/) return 0;
         if (proc_interrupted()) return -EINTR;
-        task_yield();
+        task_sleep_ms(1);        // was task_yield, waiting shells ate a whole cpu
     }
 }
 

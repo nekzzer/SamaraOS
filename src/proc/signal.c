@@ -158,6 +158,12 @@ have:;
         *(uint64_t*)(si + 6) = p->sq_val;
         p->sq_sig = 0;
     }
+    if (sig == 31 && p->sys_sig) {                   /* seccomp trap: errno, code SYS_SECCOMP, call addr, nr, arch */
+        si[1] = (uint32_t)p->sys_err; si[2] = 1;
+        *(uint64_t*)(si + 4) = p->sys_ip;
+        si[6] = (uint32_t)p->sys_nr; si[7] = 0xC000003E;
+        p->sys_sig = false;
+    }
     if (sig == p->fault_sig) {                       /* from a cpu fault: what and where */
         si[2] = p->fault_trap == 14 ? ((p->fault_err & 1) ? 2 : 1)    /* SEGV_ACCERR / MAPERR */
               : 1;                                                    /* FPE_INTDIV, ILL_ILLOPC */
@@ -247,6 +253,7 @@ int proc_sigaction(int sig, const uint64_t* act, uint64_t* oact) {
         if (sig == 9 || sig == 19) return -EINVAL;
         p->sh->sa[sig].handler = act[0];
         p->sh->sa[sig].flags = (uint32_t)act[1]; p->sh->sa[sig].restorer = act[2];
+        if (act[0] == 0) p->sh->sa[sig].flags &= ~4u;       // DFL with SA_SIGINFO left over: chromium's seccomp trap refuses to install over that
         p->sh->sa[sig].mask = act[3] & ~UNBLOCKABLE;
         if (act[0] <= 1) p->sig_pending &= ~SIGBIT(sig);   /* now DFL/IGN: drop */
     }
@@ -283,5 +290,6 @@ void proc_check_alarm(proc_t* p, bool from_irq) {
     if (!p || !p->alarm_at || (int32_t)(pit_uptime_ms() - p->alarm_at) < 0) return;
     if (from_irq && p->sh->sa[14].handler <= 1) return;
     p->alarm_at = p->alarm_interval ? pit_uptime_ms() + p->alarm_interval : 0;
+    if (p->alarm_at) proc_timer_hint(p->alarm_at);
     proc_send_signal(p, 14);                         /* SIGALRM */
 }

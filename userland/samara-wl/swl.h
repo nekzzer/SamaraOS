@@ -7,14 +7,15 @@
 #include <xkbcommon/xkbcommon.h>
 
 /* uwin (syscall 500), see src/gui/uwin.h */
-enum { OP_OPEN = 1, OP_PRESENT, OP_EVENT, OP_CLOSE, OP_TITLE = 8, OP_SCREEN = 10 };
+enum { OP_OPEN = 1, OP_PRESENT, OP_EVENT, OP_CLOSE, OP_TITLE = 8, OP_SCREEN = 10, OP_LAT = 17, OP_SCANOUT = 18, OP_PRESENT_RECT = 19 };
 enum { EV_CLOSE = 5, EV_WHEEL = 6, EV_RESIZE = 8, EV_RAWKEY, EV_PENTER, EV_PLEAVE, EV_PMOVE, EV_PBTN, EV_FOCUS };
 #define F_WL 4
 typedef struct { int32_t w, h, scale, flags; uint64_t title; } uopen_t;
 typedef struct { int32_t type, a, b, c; } uev_t;
 
 struct pool { int refs, fd; void *data; int size; };
-struct buf { struct wl_resource *res; struct pool *pool; int off, w, h, stride; uint32_t fmt; };
+struct buf { struct wl_resource *res; struct pool *pool; int off, w, h, stride; uint32_t fmt;
+    void *img; unsigned tex; struct surf *hold; /* dmabuf: egl image, its texture, surface still showing it */ };
 
 struct frame { struct wl_resource *res; struct wl_list link; };
 
@@ -41,6 +42,9 @@ struct surf {
     int xwin;                          /* x11 window id, 0 if none */
     bool grab, sub_sync;
     struct wl_listener bl;             /* pending buffer destroyed */
+    unsigned tex;                      /* gl: shm copy */
+    int tw, th;
+    struct buf *cur;                   /* gl: dmabuf we sample from, released on the next commit */
 };
 enum { R_NONE, R_TOP, R_POPUP, R_SUB, R_X, R_XOR };
 
@@ -50,6 +54,11 @@ struct tl {
     int h;                             /* uwin handle, -1 = not open yet */
     int cw, ch;                        /* window client size */
     uint32_t *pix;
+    int dx0, dy0, dx1, dy1;             /* composed pixels not sent to the kernel yet */
+    unsigned fbo, ftex;                /* gl target */
+    void *sbo, *simg;                  /* fullscreen: gbm bo the kernel scans out, its egl image */
+    int sfd;
+    bool scan;
     char title[160];
     uint32_t cfg;                      /* last configure serial */
     bool configured, focus, dead;
@@ -63,8 +72,11 @@ extern struct wl_display *dpy;
 extern struct wl_list tls;
 extern int scr_w, scr_h;
 extern struct tl *kfocus;
+extern bool gpu;
 
 uint32_t now_ms(void);
+extern uint64_t in_us;                  /* first input event not answered by a commit yet */
+uint64_t now_us(void);
 uint32_t next_serial(void);
 long sm(long op, long a, long b, long c);
 
@@ -81,6 +93,19 @@ void tl_open(struct tl *t);
 void tl_destroy(struct tl *t);
 void surf_unmap(struct surf *s);
 struct surf *pick(struct tl *t, int x, int y, int *lx, int *ly);
+
+/* gpu.c */
+void gpu_init(void);
+void gpu_tl_alloc(struct tl *t);
+void gpu_tl_free(struct tl *t);
+void gpu_begin(struct tl *t, int x0, int y0, int x1, int y1);
+void gpu_quad(struct surf *s, int ax, int ay);
+void gpu_end(struct tl *t, int x0, int y0, int x1, int y1);
+void gpu_commit(struct surf *s, struct buf *b);
+void gpu_surf_free(struct surf *s);
+extern const struct wl_buffer_interface buf_impl;
+void buf_free(struct wl_resource *r);
+void gpu_buf_free(struct buf *b);
 
 /* seat.c */
 void seat_init(void);

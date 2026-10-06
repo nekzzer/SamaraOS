@@ -18,6 +18,7 @@ void     gfx_target_back(void);               /* subsequent draws -> back buffer
 void     gfx_target_front(void);              /* subsequent draws -> real FB */
 void     gfx_present(void);                   /* memcpy back -> front */
 void     gfx_present_rect(int x, int y, int w, int h); /* partial back -> front */
+bool     gfx_db(void);
 int      gfx_w(void);
 /* The real (front) framebuffer, bypassing any back buffer. NULL if no gfx. */
 uint8_t* gfx_front_fb(int* pitch_bytes, int* bpp);

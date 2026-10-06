@@ -154,7 +154,7 @@ void wq_sleep(wq_w_t* w, uint32_t ms) {
     bool go = !w->fired;
     if (go) {
         t->wake_ms = pit_uptime_ms() + ms;
-        t->state = T_BLOCKED;
+        go = __sync_bool_compare_and_swap(&t->state, T_READY, T_BLOCKED);   // not over a T_DEAD from task_kill
     }
     unlock();
     while (go && t->state == T_BLOCKED) task_yield();

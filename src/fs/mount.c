@@ -8,6 +8,8 @@
 #include "core/clock.h"
 #include "boot/pit.h"
 
+#define ENOMEM 12
+#define EPERM 1
 #define EBUSY 16
 #define ENOTBLK 15
 #define ENODEV 19
@@ -222,7 +224,51 @@ static bool pseudo_type(const char* t) {
     return false;
 }
 
+static int mount_real(fs_node_t* src, fs_node_t* dst, const char* type, uint64_t flags, const char* data);
+extern int proc_mntns(void);
+
+// mounts in a private mount namespace never touch the real tree: an alias
+// of the mountpoint to the source or to a fresh private node
+static int mount_ns(fs_node_t* src, fs_node_t* dst, const char* type, uint64_t flags, const char* data) {
+    if (flags & 32) {                                        /* remount: the target's own mount if it has one */
+        fs_node_t* t = fs_alias(dst);
+        mnt_t* e = find_at(t);
+        if (e && t != fs_root()) { e->ro = (flags & 1) != 0; }
+        return 0;
+    }
+    if (flags & 4096) {
+        if (!src) return 0;
+        return fs_bind(src, dst) < 0 ? -ENOSPC : 0;
+    }
+    if (flags & 8192) return -EINVAL;
+    if (!type) return -EINVAL;
+    const char* real = !strcmp(type, "proc") ? "/proc" : !strcmp(type, "sysfs") ? "/sys" :
+                       !strcmp(type, "devpts") ? "/dev/pts" : !strcmp(type, "devtmpfs") ? "/dev" : NULL;
+    if (real) {
+        fs_node_t* t = fs_peek(fs_root(), real + 1, true);
+        return t ? (fs_bind(t, dst) < 0 ? -ENOSPC : 0) : -ENODEV;
+    }
+    if (!strcmp(type, "tmpfs") || !strcmp(type, "ramfs") || pseudo_type(type)) {
+        fs_node_t* f = fs_new_dir(dst->name, dst->parent);
+        if (!f) return -ENOMEM;
+        f->mode = dst->mode;
+        f->mode_shadow = 2;
+        if (!pseudo_type(type)) {
+            int r = mount_real(src, f, type, flags, data);
+            if (r < 0) return r;
+        }
+        return fs_bind(f, dst) < 0 ? -ENOSPC : 0;
+    }
+    return -EPERM;
+}
+
 int mnt_mount(fs_node_t* src, fs_node_t* dst, const char* type, uint64_t flags, const char* data) {
+    if (flags & 0x1C0000) return 0;                          /* private/slave/shared/unbindable: nothing to propagate */
+    if (proc_mntns()) return mount_ns(src, dst, type, flags, data);
+    return mount_real(src, dst, type, flags, data);
+}
+
+static int mount_real(fs_node_t* src, fs_node_t* dst, const char* type, uint64_t flags, const char* data) {
     if (dst->type != FS_DIR) return -ENOTDIR;
     if (flags & 32) {                                        /* remount */
         mnt_t* e = find_at(dst);
@@ -236,7 +282,8 @@ int mnt_mount(fs_node_t* src, fs_node_t* dst, const char* type, uint64_t flags, 
         e->ro = (flags & 1) || t.ro;
         return 0;
     }
-    if (flags & (4096 | 8192)) return -EINVAL;     /* bind, move, shared..: no */
+    if (flags & 4096) return src && src->type == FS_DIR ? fs_bind(src, dst) : -EINVAL;   /* bind: only a lookup alias, for chroot */
+    if (flags & 8192) return -EINVAL;     /* move, shared..: no */
     if (!type) type = "auto";
     if (!strcmp(type, "tmpfs") || !strcmp(type, "ramfs")) {
         if (dst->mount_id || find_at(dst)) return -EBUSY;

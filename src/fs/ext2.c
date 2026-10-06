@@ -658,6 +658,11 @@ static int sync_vol(ev_t* v) {
 
     bool ft = v->incompat & 2;
     int err = 0;
+    // one buffer for all dirs: kmalloc_big+kfree per dir was ~1.5s of every sync (1700 dirs),
+    // the whole box stood still on each fsync from xbps
+    char* dbuf = NULL;
+    uint32_t dcap = 0, acap = 0;
+    fs_node_t** arr = NULL;
     for (uint32_t i = 0; i < v->ne; i++) {      /* one bad file used to stop the whole sync, forever */
         if (!(i & 63)) bkl_yield(this_cpu());
         ent_t* e = &v->E[i];
@@ -667,10 +672,21 @@ static int sync_vol(ev_t* v) {
             /* children backwards: link_child prepends, this keeps the disk order */
             uint32_t cnt = 0, bytes = 0;
             for (fs_node_t* c = n->child; c; c = c->next) { cnt++; bytes += (uint32_t)strlen(c->name) + 12; }
-            fs_node_t** arr = kmalloc(cnt * sizeof(fs_node_t*) + 4);
-            db_t db = { kmalloc_big(bytes * 2 + v->bs * 2 + 64), 0, 0 };
-            if (!arr || !db.buf) { if (arr) kfree(arr); if (db.buf) kfree(db.buf); err = -1; break; }
-            memset(db.buf, 0, bytes * 2 + v->bs * 2 + 64);
+            uint32_t need = bytes * 2 + v->bs * 2 + 64;
+            if (need > dcap) {
+                if (dbuf) kfree(dbuf);
+                dcap = need * 2;
+                dbuf = kmalloc_big(dcap);
+                if (!dbuf) { dcap = 0; err = -1; break; }
+            }
+            if (cnt + 1 > acap) {
+                if (arr) kfree(arr);
+                acap = cnt * 2 + 64;
+                arr = kmalloc(acap * sizeof(fs_node_t*));
+                if (!arr) { acap = 0; err = -1; break; }
+            }
+            db_t db = { dbuf, 0, 0 };
+            memset(db.buf, 0, need);
             cnt = 0;
             for (fs_node_t* c = n->child; c; c = c->next) arr[cnt++] = c;
             uint32_t pino = e->ino;
@@ -686,17 +702,15 @@ static int sync_vol(ev_t* v) {
                 dir_add(v, &db, v->E[ce].ino, c->name, ft ? t : 0);
                 if (c->type == FS_DIR) links++;
             }
-            kfree(arr);
             uint32_t end = ((db.len + v->bs - 1) / v->bs) * v->bs;
             wr16((uint8_t*)db.buf + db.last + 4, (uint16_t)(end - db.last));
             db.len = end;
             uint32_t h = fnv((uint8_t*)db.buf, db.len);
             e = &v->E[i];
             if (h != e->h) {
-                if (put_blocks(v, (int)i, db.buf, db.len) < 0) { err = -1; kfree(db.buf); klog("ext2: dir not written: "); klog(n->name); klog("\r\n"); continue; }
+                if (put_blocks(v, (int)i, db.buf, db.len) < 0) { err = -1; klog("ext2: dir not written: "); klog(n->name); klog("\r\n"); continue; }
                 v->E[i].h = h;
             }
-            kfree(db.buf);
             e = &v->E[i];
             size = e->nb * v->bs;
         } else if (n->type == FS_LINK && n->size < 60) {
@@ -737,6 +751,8 @@ static int sync_vol(ev_t* v) {
             i2e[e->ino] = (int32_t)i;
         }
     }
+    if (dbuf) kfree(dbuf);
+    if (arr) kfree(arr);
     // if (err) klog("ext2: disk full\r\n");   said disk full for any failure, misleading
 
     /* the descriptors must still say what they said at mount, or we'd write

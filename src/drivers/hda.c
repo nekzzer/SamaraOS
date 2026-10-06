@@ -3,6 +3,7 @@
 #include "core/vmm.h"
 #include "core/io.h"
 #include "core/string.h"
+#include "boot/apic.h"
 
 #define GCAP    0x00
 #define GCTL    0x08
@@ -40,16 +41,23 @@ static void w8(int r, uint8_t v)   { *(volatile uint8_t*)(mmio + r) = v; }
 static void w16(int r, uint16_t v) { *(volatile uint16_t*)(mmio + r) = v; }
 static void w32(int r, uint32_t v) { *(volatile uint32_t*)(mmio + r) = v; }
 
-static void udelay(int us) { for (int i = 0; i < us; i++) (void)inb(0x80); }
+// tsc, not port 0x80: every inb was a vmexit and udelay(1) took way more than 1us under kvm
+static void udelay(int us) {
+    uint64_t t = tsc_us();
+    for (int n = 0; tsc_us() - t < (uint64_t)us && n < us * 1000; n++) __asm__ volatile ("pause");   // no tsc yet: bounded anyway
+}
 
+// codec answers in a few us on qemu. the old loop was 200k port reads under the bkl:
+// pipewire reconfiguring the stream froze the whole desktop (typing lagged)
 static uint32_t cmd(int nid, uint32_t verb) {
     wp = (wp + 1) & 255;
     corb[wp] = ((uint32_t)cad << 28) | ((uint32_t)nid << 20) | verb;
     uint16_t old = r16(RIRBWP) & 255;
     w16(CORBWP, wp);
-    for (int i = 0; i < 200000; i++) {
+    uint64_t t = tsc_us();
+    for (int n = 0; tsc_us() - t < 2000 && n < 2000000; n++) {
         if ((r16(RIRBWP) & 255) != old) { w8(0x5D, 5); return (uint32_t)rirb[r16(RIRBWP) & 255]; }
-        udelay(1);
+        __asm__ volatile ("pause");
     }
     return 0xFFFFFFFF;
 }
@@ -244,8 +252,12 @@ void hda_setup(uint32_t rate, uint32_t buf, uint32_t per) {
     w32(sd + 0x18, (uint32_t)bp);
     w32(sd + 0x1C, (uint32_t)(bp >> 32));
     w8(sd + 3, 0x1C);              // clear sts
-    cmd(dac, 0x20000 | fmt);
-    cmd(dac, 0x70600 | (1 << 4));
+    static uint16_t last_fmt = 0xFFFF;
+    if (fmt != last_fmt) {          // pipewire re-prepares a lot, the codec already knows
+        cmd(dac, 0x20000 | fmt);
+        cmd(dac, 0x70600 | (1 << 4));
+        last_fmt = fmt;
+    }
 }
 
 int hda_vol_max(void) { return vol_steps; }
@@ -255,6 +267,7 @@ void hda_vol_get(int* l, int* r, int* sw) { *l = vol[0]; *r = vol[1]; *sw = vsw;
 void hda_vol_set(int l, int r, int sw) {
     if (l > vol_steps) l = vol_steps;
     if (r > vol_steps) r = vol_steps;
+    if (l == vol[0] && r == vol[1] && sw == vsw) return;
     vol[0] = l < 0 ? 0 : l;
     vol[1] = r < 0 ? 0 : r;
     vsw = sw;

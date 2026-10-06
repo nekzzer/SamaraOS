@@ -46,7 +46,17 @@ static void fire(proc_t* l, struct ptimer* t, int id) {
     raise_sig(tg, t->signo, t->notify == 4);
 }
 
+// earliest deadline of any alarm / posix timer, so the tick doesn't walk every proc each ms
+static uint32_t tm_next;
+static int tm_any;
+
+void proc_timer_hint(uint32_t at) {
+    if (!tm_any || (int32_t)(at - tm_next) < 0) { tm_next = at; tm_any = 1; }
+}
+
 void proc_timers_tick(uint32_t now) {
+    if (!tm_any || (int32_t)(now - tm_next) < 0) return;
+    tm_any = 0;
     for (int i = 0; i < proc_count(); i++) {
         proc_t* p = proc_at(i);
         if (!p || p->state != P_ALIVE) continue;
@@ -62,6 +72,14 @@ void proc_timers_tick(uint32_t now) {
             } else t->armed = false;
             fire(p, t, k);
         }
+    }
+    for (int i = 0; i < proc_count(); i++) {
+        proc_t* p = proc_at(i);
+        if (!p || p->state != P_ALIVE) continue;
+        if (p->alarm_at) proc_timer_hint(p->alarm_at);
+        if (p->is_thread) continue;
+        for (int k = 0; k < 16; k++)
+            if (p->sh->tm[k].used && p->sh->tm[k].armed) proc_timer_hint(p->sh->tm[k].at);
     }
 }
 
@@ -113,6 +131,7 @@ static int itimer(int which, const int64_t* nv, int64_t* ov) {
         uint32_t i = ts_ms(a), v = ts_ms(b);
         *at = v ? (which ? v : now + v) : 0;
         *iv = v ? i : 0;
+        if (v && !which) proc_timer_hint(*at);
     }
     return 0;
 }
@@ -169,6 +188,7 @@ int64_t sys_timer(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
             }
             t->armed = v != 0;
             t->at = now + v;
+            if (v) proc_timer_hint(t->at);
             t->iv = v ? i : 0;
             t->over = 0;
             return 0;

@@ -294,7 +294,10 @@ void gfx_present(void) {
         );
         if (tot) bkl_yield(this_cpu());   // other cpus starved during a full present
     }
+    if (on_virtio) drm_console_dirty(0, 0, fb_w, fb_h);
 }
+
+bool gfx_db(void) { return back_buf != NULL; }
 
 void gfx_present_rect(int x, int y, int w, int h) {
     if (!back_buf || !real_fb) return;
@@ -312,6 +315,7 @@ void gfx_present_rect(int x, int y, int w, int h) {
                back_buf + (y + yy) * fb_pitch_bytes + x * bpp,
                (size_t)row_bytes);
     }
+    if (on_virtio) drm_console_dirty(x, y, w, h);
 }
 
 /* ---------- Drawing primitives ---------- */

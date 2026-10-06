@@ -742,7 +742,9 @@ int net_init(void) {
     if (dns) {
         char rc[64] = "nameserver ";
         p = ipstr(rc + 11, dns);
-        memcpy(p, "\nnameserver 1.1.1.1\n", 21);
+        /* musl races nameservers; a public fallback can return NXDOMAIN first. */
+        *p++ = '\n';
+        *p = 0;
         /* netd can beat userland_install, which writes the default one. wait for it */
         fs_node_t* n = NULL;
         for (int i = 0; i < 300 && !(n = fs_resolve(fs_root(), "/etc/resolv.conf")); i++) task_sleep_ms(10);

@@ -1,0 +1,17 @@
+#!/bin/sh
+# chromium on samara-wl. CR_SW=1 forces software gl (no virgl), CR_X11=1 goes through xwayland
+export HOME=${HOME:-/root}
+export XDG_RUNTIME_DIR=/run/user/0
+export WAYLAND_DISPLAY=wayland-0
+export DISPLAY=:0
+mkdir -p /root/.cr-samara/Default
+# native title bar, kernel wm draws the frame. prefs rewritten every time, old window_placement made the window never show up
+echo '{"browser":{"custom_chrome_frame":false}}' > /root/.cr-samara/Default/Preferences
+rm -f /root/.cr-samara/Singleton*
+fl="--no-sandbox --disable-gpu-sandbox --no-zygote --disable-dev-shm-usage --user-data-dir=/root/.cr-samara
+ --no-first-run --no-default-browser-check --disable-features=Translate,MediaRouter --password-store=basic --disable-breakpad --disable-sync --test-type --disable-session-crashed-bubble --hide-crash-restore-bubble"
+[ -n "$CR_X11" ] && fl="$fl --ozone-platform=x11" || fl="$fl --ozone-platform=wayland"
+[ -n "$CR_SW" ] && fl="$fl --disable-gpu" || fl="$fl --use-gl=angle --use-angle=${CR_ANGLE:-gl-egl} --ignore-gpu-blocklist --enable-gpu-rasterization"
+# not /usr/bin/chromium, its /etc/chromium/default slaps --disable-gpu on everything
+export CHROME_WRAPPER=/usr/lib/chromium/chromium CHROME_DESKTOP=chromium.desktop
+exec /usr/lib/chromium/chromium $fl "$@"

@@ -412,7 +412,8 @@ void xwm_start(void) {
         snprintf(a, sizeof a, "%d", wl[1]);
         snprintf(b, sizeof b, "%d", wm[1]);
         setenv("WAYLAND_SOCKET", a, 1);
-        execlp("Xwayland", "Xwayland", ":0", "-rootless", "-wm", b, "-shm", "-noreset", (char *)NULL);
+        if (!gpu) execlp("Xwayland", "Xwayland", ":0", "-rootless", "-wm", b, "-shm", "-noreset", (char *)NULL);
+        execlp("Xwayland", "Xwayland", ":0", "-rootless", "-wm", b, "-noreset", (char *)NULL);
         _exit(1);
     }
     close(wl[1]); close(wm[1]);

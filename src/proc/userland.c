@@ -269,14 +269,48 @@ int userland_install(void) {
              "    SV=/etc/runit/runsvdir/default\n"
              "    mkdir -p /run/lock /run/runit /var/log/socklog $SV /etc/sv/dropbear\n"
              "    rm -f $SV/agetty-*\n"
+             "    [ -x /usr/bin/dbus-uuidgen ] && dbus-uuidgen --ensure\n"
              "    printf '#!/bin/sh\\nexec dropbear -F -B -r %s -p 0.0.0.0:22 2>&1\\n' $K > /etc/sv/dropbear/run\n"
              "    chmod 755 /etc/sv/dropbear/run\n"
-             "    for s in dropbear crond; do [ -d /etc/sv/$s ] && ln -sf /etc/sv/$s $SV/; done\n"
+             "    for s in dbus dropbear crond; do [ -d /etc/sv/$s ] && ln -sf /etc/sv/$s $SV/; done\n"
              "    mkdir -p /run/runit/runsvdir\n"
              "    ln -sfn $SV /run/runit/runsvdir/current\n"
              "    exec runsvdir -P /run/runit/runsvdir/current\n"
              "fi\n"
              "dropbear -B -r $K -p 0.0.0.0:22\n");
+    /* session bus + audio, samara-wl runs this when the desktop comes up (needs
+       xbps-install dbus pipewire wireplumber). no udev here so the alsa sink is static */
+    put_text("/etc/samara-session",
+             "#!/bin/sh\n"
+             "export XDG_RUNTIME_DIR=/run/user/0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus\n"
+             "[ -x /usr/bin/dbus-daemon ] || exit 0\n"
+             "rm -f /run/user/0/bus\n"
+             "dbus-daemon --session --address=$DBUS_SESSION_BUS_ADDRESS --fork --nopidfile\n"
+             "[ -x /usr/bin/pipewire ] || exit 0\n"
+             "pipewire >/dev/null 2>&1 &\n"
+             "while [ ! -S /run/user/0/pipewire-0 ]; do sleep 1; done\n"
+             "wireplumber >/dev/null 2>&1 &\n"
+             "pipewire-pulse >/dev/null 2>&1 &\n");
+    mkdir_p("/etc/pipewire/pipewire.conf.d");
+    put_text("/etc/pipewire/pipewire.conf.d/10-samara.conf",
+             "context.objects = [\n"
+             "    { factory = adapter\n"
+             "      args = {\n"
+             "        factory.name = api.alsa.pcm.sink\n"
+             "        node.name = \"alsa_output.samara\"\n"
+             "        node.description = \"Samara HDA\"\n"
+             "        media.class = Audio/Sink\n"
+             "        api.alsa.path = \"hw:0,0\"\n"
+             "        audio.format = \"S16LE\"\n"
+             "        audio.rate = 48000\n"
+             "        audio.channels = 2\n"
+             "        audio.position = [ FL FR ]\n"
+             "        api.alsa.use-chmap = false\n"
+             "        session.suspend-timeout-seconds = 0\n"
+             "        node.pause-on-idle = false\n"
+             "      }\n"
+             "    }\n"
+             "]\n");
     fs_node_t* rc = fs_resolve(fs_root(), "/etc/rc");
     if (rc) rc->mode = 0755;
     put_text("/etc/group", "root:x:0:\n");
@@ -325,7 +359,7 @@ int userland_install(void) {
     if (!fs_resolve_nf(fs_root(), "/sys/class/graphics/fb0"))
         fs_symlink(fs_resolve(fs_root(), "/sys/class/graphics"), "fb0", "../../devices/platform/vesa-framebuffer.0/graphics/fb0");
     put_text("/etc/hosts", "127.0.0.1\tlocalhost\n10.0.2.15\tsamara\n10.0.2.2\thost gateway\n");
-    put_text("/etc/resolv.conf", "nameserver 10.0.2.3\nnameserver 1.1.1.1\n");
+    put_text("/etc/resolv.conf", "nameserver 10.0.2.3\n");
     put_text("/etc/services", "http\t80/tcp\nhttps\t443/tcp\ndomain\t53/udp\n");
     put_text("/etc/shells", "/bin/sh\n/bin/ash\n/usr/bin/bash\n");
     put_text("/etc/motd", "");                    /* login shells show samarafetch instead */
